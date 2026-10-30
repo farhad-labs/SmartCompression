@@ -1,0 +1,12 @@
+[package]
+name = "sc-precomp-sys"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+# precomp's brunsli code calls the Brotli API; this is the one brotli (1.2.0) linked into the program.
+sc-brotli-sys = { path = "../sc-brotli-sys" }
+
+[build-dependencies]
+cc = "1"

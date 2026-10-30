@@ -1,0 +1,9 @@
+[package]
+name = "uharc-lifted"
+version = "0.6.0"
+edition = "2021"
+description = "UHARC 0.6b codec engine, lifted from UHARC.EXE machine code"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"

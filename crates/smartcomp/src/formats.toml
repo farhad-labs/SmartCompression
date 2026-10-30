@@ -1,0 +1,632 @@
+# Format signatures for magic-byte detection (ported from compfar-rs/tools.default.toml).
+# Highest priority wins, then the longest signature. Refiners in detect.rs split families.
+
+[[format]]
+name = "riff"
+priority = 100
+magic = [{ offset = 0, bytes = "52 49 46 46" }]
+
+[[format]]
+name = "ebml"
+priority = 100
+magic = [{ offset = 0, bytes = "1A 45 DF A3" }]
+
+[[format]]
+name = "ftyp"
+priority = 100
+magic = [{ offset = 4, bytes = "66 74 79 70" }]
+
+[[format]]
+name = "cafebabe"
+priority = 100
+magic = [{ offset = 0, bytes = "CA FE BA BE" }]
+
+[[format]]
+name = "jpeg"
+priority = 100
+magic = [{ offset = 0, bytes = "FF D8 FF" }]
+
+[[format]]
+name = "png"
+priority = 100
+magic = [{ offset = 0, bytes = "89 50 4E 47 0D 0A 1A 0A" }]
+
+[[format]]
+name = "gif"
+priority = 100
+magic = [{ offset = 0, bytes = "47 49 46 38" }]
+
+[[format]]
+name = "bmp"
+priority = 100
+magic = [{ offset = 0, bytes = "42 4D", priority = 30 }]
+
+[[format]]
+name = "tiff"
+priority = 100
+magic = [{ offset = 0, bytes = "49 49 2A 00" }, { offset = 0, bytes = "4D 4D 00 2A" }]
+
+[[format]]
+name = "ico"
+priority = 100
+magic = [{ offset = 0, bytes = "00 00 01 00", priority = 30 }]
+
+[[format]]
+name = "psd"
+priority = 100
+magic = [{ offset = 0, bytes = "38 42 50 53" }]
+
+[[format]]
+name = "jp2"
+priority = 100
+magic = [{ offset = 0, bytes = "00 00 00 0C 6A 50 20 20 0D 0A 87 0A" }]
+
+[[format]]
+name = "jxl"
+priority = 100
+magic = [{ offset = 0, bytes = "FF 0A", priority = 40 }]
+
+[[format]]
+name = "dds"
+priority = 100
+magic = [{ offset = 0, bytes = "44 44 53 20" }]
+
+[[format]]
+name = "exr"
+priority = 100
+magic = [{ offset = 0, bytes = "76 2F 31 01" }]
+
+[[format]]
+name = "xcf"
+priority = 100
+magic = [{ offset = 0, bytes = "67 69 6D 70 20 78 63 66" }]
+
+[[format]]
+name = "mp3"
+priority = 100
+magic = [{ offset = 0, bytes = "49 44 33" }, { offset = 0, bytes = "FF E0", mask = "FF E0", priority = 10 }]
+
+[[format]]
+name = "flac"
+priority = 100
+magic = [{ offset = 0, bytes = "66 4C 61 43" }]
+
+[[format]]
+name = "ogg"
+priority = 100
+magic = [{ offset = 0, bytes = "4F 67 67 53" }]
+
+[[format]]
+name = "aiff"
+priority = 100
+magic = [{ offset = 8, bytes = "41 49 46 46" }]
+
+[[format]]
+name = "midi"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 54 68 64" }]
+
+[[format]]
+name = "asf"
+priority = 100
+magic = [{ offset = 0, bytes = "30 26 B2 75 8E 66 CF 11" }]
+
+[[format]]
+name = "amr"
+priority = 100
+magic = [{ offset = 0, bytes = "23 21 41 4D 52" }]
+
+[[format]]
+name = "ape"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 41 43 20" }]
+
+[[format]]
+name = "wv"
+priority = 100
+magic = [{ offset = 0, bytes = "77 76 70 6B" }]
+
+[[format]]
+name = "au"
+priority = 100
+magic = [{ offset = 0, bytes = "2E 73 6E 64" }]
+
+[[format]]
+name = "flv"
+priority = 100
+magic = [{ offset = 0, bytes = "46 4C 56 01" }]
+
+[[format]]
+name = "mpg"
+priority = 100
+magic = [{ offset = 0, bytes = "00 00 01 BA" }]
+
+[[format]]
+name = "swf"
+priority = 100
+magic = [{ offset = 0, bytes = "46 57 53" }, { offset = 0, bytes = "43 57 53" }, { offset = 0, bytes = "5A 57 53" }]
+
+[[format]]
+name = "zip"
+priority = 100
+magic = [{ offset = 0, bytes = "50 4B 03 04", priority = 90 }]
+
+[[format]]
+name = "7z"
+priority = 100
+magic = [{ offset = 0, bytes = "37 7A BC AF 27 1C" }]
+
+[[format]]
+name = "rar"
+priority = 100
+magic = [{ offset = 0, bytes = "52 61 72 21 1A 07" }]
+
+[[format]]
+name = "gz"
+priority = 100
+magic = [{ offset = 0, bytes = "1F 8B 08" }]
+
+[[format]]
+name = "bz2"
+priority = 100
+magic = [{ offset = 0, bytes = "42 5A 68" }]
+
+[[format]]
+name = "xz"
+priority = 100
+magic = [{ offset = 0, bytes = "FD 37 7A 58 5A 00" }]
+
+[[format]]
+name = "zstd"
+priority = 100
+magic = [{ offset = 0, bytes = "28 B5 2F FD" }]
+
+[[format]]
+name = "tar"
+priority = 100
+magic = [{ offset = 257, bytes = "75 73 74 61 72" }]
+
+[[format]]
+name = "lz4"
+priority = 100
+magic = [{ offset = 0, bytes = "04 22 4D 18" }]
+
+[[format]]
+name = "cab"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 53 43 46" }]
+
+[[format]]
+name = "arj"
+priority = 100
+magic = [{ offset = 0, bytes = "60 EA", priority = 60 }]
+
+[[format]]
+name = "lzh"
+priority = 100
+magic = [{ offset = 2, bytes = "2D 6C 68", priority = 60 }]
+
+[[format]]
+name = "z"
+priority = 100
+magic = [{ offset = 0, bytes = "1F 9D", priority = 60 }]
+
+[[format]]
+name = "lzip"
+priority = 100
+magic = [{ offset = 0, bytes = "4C 5A 49 50" }]
+
+[[format]]
+name = "zpaq"
+priority = 100
+magic = [{ offset = 0, bytes = "7A 50 51" }]
+
+[[format]]
+name = "ar"
+priority = 100
+magic = [{ offset = 0, bytes = "21 3C 61 72 63 68 3E 0A" }]
+
+[[format]]
+name = "rpm"
+priority = 100
+magic = [{ offset = 0, bytes = "ED AB EE DB" }]
+
+[[format]]
+name = "iso"
+priority = 100
+magic = [{ offset = 32769, bytes = "43 44 30 30 31" }]
+
+[[format]]
+name = "wim"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 53 57 49 4D 00 00 00" }]
+
+[[format]]
+name = "squashfs"
+priority = 100
+magic = [{ offset = 0, bytes = "68 73 71 73" }]
+
+[[format]]
+name = "xar"
+priority = 100
+magic = [{ offset = 0, bytes = "78 61 72 21" }]
+
+[[format]]
+name = "crx"
+priority = 100
+magic = [{ offset = 0, bytes = "43 72 32 34" }]
+
+[[format]]
+name = "pdf"
+priority = 100
+magic = [{ offset = 0, bytes = "25 50 44 46" }]
+
+[[format]]
+name = "rtf"
+priority = 100
+magic = [{ offset = 0, bytes = "7B 5C 72 74 66" }]
+
+[[format]]
+name = "ole"
+priority = 100
+magic = [{ offset = 0, bytes = "D0 CF 11 E0 A1 B1 1A E1" }]
+
+[[format]]
+name = "ps"
+priority = 100
+magic = [{ offset = 0, bytes = "25 21 50 53" }]
+
+[[format]]
+name = "djvu"
+priority = 100
+magic = [{ offset = 0, bytes = "41 54 26 54 46 4F 52 4D" }]
+
+[[format]]
+name = "chm"
+priority = 100
+magic = [{ offset = 0, bytes = "49 54 53 46" }]
+
+[[format]]
+name = "mobi"
+priority = 100
+magic = [{ offset = 60, bytes = "42 4F 4F 4B 4D 4F 42 49" }]
+
+[[format]]
+name = "xml"
+priority = 100
+magic = [{ offset = 0, bytes = "3C 3F 78 6D 6C", priority = 60 }]
+
+[[format]]
+name = "html"
+priority = 100
+magic = [{ offset = 0, bytes = "3C 21 44 4F 43 54 59 50 45", priority = 60 }, { offset = 0, bytes = "3C 68 74 6D 6C", priority = 60 }]
+
+[[format]]
+name = "exe"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 5A", priority = 50 }]
+
+[[format]]
+name = "elf"
+priority = 100
+magic = [{ offset = 0, bytes = "7F 45 4C 46" }]
+
+[[format]]
+name = "macho"
+priority = 100
+magic = [{ offset = 0, bytes = "CE FA ED FE" }, { offset = 0, bytes = "CF FA ED FE" }, { offset = 0, bytes = "FE ED FA CE" }, { offset = 0, bytes = "FE ED FA CF" }]
+
+[[format]]
+name = "dex"
+priority = 100
+magic = [{ offset = 0, bytes = "64 65 78 0A" }]
+
+[[format]]
+name = "wasm"
+priority = 100
+magic = [{ offset = 0, bytes = "00 61 73 6D" }]
+
+[[format]]
+name = "lnk"
+priority = 100
+magic = [{ offset = 0, bytes = "4C 00 00 00 01 14 02 00" }]
+
+[[format]]
+name = "sqlite"
+priority = 100
+magic = [{ offset = 0, bytes = "53 51 4C 69 74 65 20 66 6F 72 6D 61 74 20 33 00" }]
+
+[[format]]
+name = "pcap"
+priority = 100
+magic = [{ offset = 0, bytes = "D4 C3 B2 A1" }, { offset = 0, bytes = "A1 B2 C3 D4" }, { offset = 0, bytes = "4D 3C B2 A1" }, { offset = 0, bytes = "A1 B2 3C 4D" }]
+
+[[format]]
+name = "pcapng"
+priority = 100
+magic = [{ offset = 0, bytes = "0A 0D 0D 0A" }]
+
+[[format]]
+name = "parquet"
+priority = 100
+magic = [{ offset = 0, bytes = "50 41 52 31" }]
+
+[[format]]
+name = "hdf5"
+priority = 100
+magic = [{ offset = 0, bytes = "89 48 44 46 0D 0A 1A 0A" }]
+
+[[format]]
+name = "npy"
+priority = 100
+magic = [{ offset = 0, bytes = "93 4E 55 4D 50 59" }]
+
+[[format]]
+name = "mdb"
+priority = 100
+magic = [{ offset = 0, bytes = "00 01 00 00 53 74 61 6E 64 61 72 64 20 4A 65 74 20 44 42" }]
+
+[[format]]
+name = "ttf"
+priority = 100
+magic = [{ offset = 0, bytes = "00 01 00 00" }]
+
+[[format]]
+name = "otf"
+priority = 100
+magic = [{ offset = 0, bytes = "4F 54 54 4F" }]
+
+[[format]]
+name = "woff"
+priority = 100
+magic = [{ offset = 0, bytes = "77 4F 46 46" }]
+
+[[format]]
+name = "woff2"
+priority = 100
+magic = [{ offset = 0, bytes = "77 4F 46 32" }]
+
+[[format]]
+name = "ttc"
+priority = 100
+magic = [{ offset = 0, bytes = "74 74 63 66" }]
+
+[[format]]
+name = "vhd"
+priority = 100
+magic = [{ offset = 0, bytes = "63 6F 6E 65 63 74 69 78" }]
+
+[[format]]
+name = "qcow2"
+priority = 100
+magic = [{ offset = 0, bytes = "51 46 49 FB" }]
+
+[[format]]
+name = "vmdk"
+priority = 100
+magic = [{ offset = 0, bytes = "4B 44 4D 56" }]
+
+[[format]]
+name = "vdi"
+priority = 100
+magic = [{ offset = 0, bytes = "3C 3C 3C 20 4F 72 61 63 6C 65 20 56 4D" }]
+
+[[format]]
+name = "hdr"
+priority = 50
+magic = [{ offset = 0, bytes = "23 3F 52 41 44 49 41 4E 43 45 0A" }]
+
+[[format]]
+name = "svg"
+priority = 50
+magic = [{ offset = 0, bytes = "3C 73 76 67" }]
+
+[[format]]
+name = "eps"
+priority = 50
+magic = [{ offset = 0, bytes = "C5 D0 D3 C6" }]
+
+[[format]]
+name = "fbx"
+priority = 50
+magic = [{ offset = 0, bytes = "4B 61 79 64 61 72 61 20 46 42 58 20 42 69 6E 61 72 79 20 20" }]
+
+[[format]]
+name = "glb"
+priority = 50
+magic = [{ offset = 0, bytes = "67 6C 54 46" }]
+
+[[format]]
+name = "opus"
+priority = 100
+magic = [{ offset = 28, bytes = "4F 70 75 73 48 65 61 64", priority = 110 }]
+
+[[format]]
+name = "aac"
+priority = 100
+magic = [{ offset = 0, bytes = "FF F1", priority = 50 }, { offset = 0, bytes = "FF F9", priority = 50 }, { offset = 0, bytes = "FF F0", priority = 50 }, { offset = 0, bytes = "FF F8", priority = 50 }]
+
+[[format]]
+name = "wma"
+priority = 100
+magic = [{ offset = 0, bytes = "30 26 B2 75 8E 66 CF 11 A6 D9 00 AA 00 62 CE 6C" }]
+
+[[format]]
+name = "m4v"
+priority = 100
+magic = [{ offset = 4, bytes = "66 74 79 70 4D 34 56", priority = 110 }]
+
+[[format]]
+name = "ts"
+priority = 50
+magic = [{ offset = 0, bytes = "47 40", mask = "FF E0", priority = 50 }]
+
+[[format]]
+name = "rm"
+priority = 100
+magic = [{ offset = 0, bytes = "2E 52 4D 46" }]
+
+[[format]]
+name = "mxf"
+priority = 100
+magic = [{ offset = 0, bytes = "06 0E 2B 34 02 05 01 01 0D 01 02" }]
+
+[[format]]
+name = "bik"
+priority = 100
+magic = [{ offset = 0, bytes = "42 49 4B" }]
+
+[[format]]
+name = "ivf"
+priority = 100
+magic = [{ offset = 0, bytes = "44 4B 49 46" }]
+
+[[format]]
+name = "y4m"
+priority = 50
+magic = [{ offset = 0, bytes = "59 55 56 34 4D 50 45 47 32" }]
+
+[[format]]
+name = "cpio"
+priority = 100
+magic = [{ offset = 0, bytes = "30 37 30 37 30 31" }, { offset = 0, bytes = "30 37 30 37 30 32" }]
+
+[[format]]
+name = "deb"
+priority = 100
+magic = [{ offset = 0, bytes = "21 3C 61 72 63 68 3E 0A" }]
+
+[[format]]
+name = "vhdx"
+priority = 100
+magic = [{ offset = 0, bytes = "76 68 64 78 66 69 6C 65" }]
+
+[[format]]
+name = "qcow"
+priority = 100
+magic = [{ offset = 0, bytes = "51 46 49 FB" }]
+
+[[format]]
+name = "lzma"
+priority = 100
+magic = [{ offset = 0, bytes = "5D 00 00" }]
+
+[[format]]
+name = "lzo"
+priority = 100
+magic = [{ offset = 0, bytes = "89 4C 5A 4F 00 0D 0A 1A 0A" }]
+
+[[format]]
+name = "compress"
+priority = 100
+magic = [{ offset = 0, bytes = "1F 9D" }]
+
+[[format]]
+name = "sit"
+priority = 100
+magic = [{ offset = 0, bytes = "53 74 75 66 66 49 74" }]
+
+[[format]]
+name = "sitx"
+priority = 100
+magic = [{ offset = 0, bytes = "53 74 75 66 66 49 74 21" }]
+
+[[format]]
+name = "doc"
+priority = 50
+magic = [{ offset = 0, bytes = "D0 CF 11 E0 A1 B1 1A E1" }]
+
+[[format]]
+name = "lit"
+priority = 100
+magic = [{ offset = 0, bytes = "49 54 4F 4C 49 54 44 54" }]
+
+[[format]]
+name = "luac"
+priority = 50
+magic = [{ offset = 0, bytes = "1B 4C 75 61" }]
+
+[[format]]
+name = "pdb"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 69 63 72 6F 73 6F 66 74 20 43 2F 43 2B 2B 20 4D 53 46 20 37 2E 30 30 0D 0A 1A 44 53 00 00 00" }]
+
+[[format]]
+name = "obj"
+priority = 50
+magic = [{ offset = 0, bytes = "4C 01" }, { offset = 0, bytes = "64 86" }]
+
+[[format]]
+name = "json"
+priority = 50
+magic = [{ offset = 0, bytes = "7B 22" }]
+
+[[format]]
+name = "yaml"
+priority = 50
+magic = [{ offset = 0, bytes = "2D 2D 2D 0A" }]
+
+[[format]]
+name = "accdb"
+priority = 100
+magic = [{ offset = 0, bytes = "00 01 00 00 53 74 61 6E 64 61 72 64 20 41 43 45 20 44 42" }]
+
+[[format]]
+name = "nc"
+priority = 100
+magic = [{ offset = 0, bytes = "43 44 46 01" }, { offset = 0, bytes = "43 44 46 02" }]
+
+[[format]]
+name = "mat"
+priority = 100
+magic = [{ offset = 0, bytes = "4D 41 54 4C 41 42" }]
+
+[[format]]
+name = "dcm"
+priority = 100
+magic = [{ offset = 128, bytes = "44 49 43 4D" }]
+
+[[format]]
+name = "las"
+priority = 100
+magic = [{ offset = 0, bytes = "4C 41 53 46" }]
+
+[[format]]
+name = "fits"
+priority = 100
+magic = [{ offset = 0, bytes = "53 49 4D 50 4C 45 20 20 3D" }]
+
+[[format]]
+name = "nrg"
+priority = 50
+magic = [{ offset = 0, bytes = "4E 45 52 4F" }]
+
+[[format]]
+name = "cso"
+priority = 100
+magic = [{ offset = 0, bytes = "43 49 53 4F" }]
+
+[[format]]
+name = "wbfs"
+priority = 100
+magic = [{ offset = 0, bytes = "57 42 46 53" }]
+
+[[format]]
+name = "gba"
+priority = 100
+magic = [{ offset = 0, bytes = "24 FF AE 51 69 9A A2 21" }]
+
+[[format]]
+name = "nes"
+priority = 100
+magic = [{ offset = 0, bytes = "4E 45 53 1A" }]
+
+[[format]]
+name = "pak"
+priority = 50
+magic = [{ offset = 0, bytes = "50 41 43 4B" }]
+
+[[format]]
+name = "wad"
+priority = 50
+magic = [{ offset = 0, bytes = "49 57 41 44" }, { offset = 0, bytes = "50 57 41 44" }]

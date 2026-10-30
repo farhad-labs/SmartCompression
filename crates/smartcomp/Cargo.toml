@@ -1,0 +1,34 @@
+[package]
+name = "smartcomp"
+version = "0.1.0"
+edition = "2021"
+description = "Smart per-file archiver: magic-byte detection + sample-probed codec choice"
+license-file = "../../LICENSE"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+argon2 = "0.5"
+blake3 = "1"
+lepton_jpeg = { path = "../../third_party/lepton_jpeg/lib" }
+packmp3 = { path = "../../third_party/packmp3" }
+indicatif = "0.17"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+rayon = "1"
+rpassword = "7"
+sc-brotli-sys = { path = "../sc-brotli-sys" }
+sc-lzma-sys = { path = "../sc-lzma-sys" }
+sc-precomp-sys = { path = "../sc-precomp-sys" }
+sc-nanozip-sys = { path = "../sc-nanozip-sys" }
+sc-uharc = { path = "../sc-uharc" }
+sc-zstd-sys = { path = "../sc-zstd-sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+toml = "0.8"
+walkdir = "2"
+
+
+[dev-dependencies]
+flate2 = "1"

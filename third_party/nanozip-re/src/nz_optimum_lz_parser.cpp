@@ -1,0 +1,1272 @@
+// nz_optimum_lz_parser.cpp -- the `-co` optimal parser (FUN_0806f8e0), the
+// DAT_08183620 == 0 path (which is what `-t1` takes: the async secondary finder
+// is never created). It turns a block's bytes into the decision list the
+// original's parser picks; NzOptimumLzDecoder::EncodeBlock then codes that list
+// into the payload (that half is already byte-exact, see the RunBlock template).
+//
+// Shape, straight from the decompile:
+//   * per chunk of at most 0x8000 bytes: append to the window, rebuild the
+//     256-byte rolling hash, clear a 0x120-entry node array;
+//   * forward DP over positions. At each node the four rep offsets are probed
+//     first (a 2-byte compare, then a byte-wise extension); only when all four
+//     miss is the bt4 match finder (FUN_08073ca0) consulted, followed by the
+//     long-range rolling-hash probe. Each candidate relaxes the nodes at
+//     pos+len, pos+len-1, ... pos+2; the literal relaxes pos+1;
+//   * a match of 0x20 bytes or more, or one reaching past the 0x120-node
+//     horizon, is taken immediately and ends the DP;
+//   * the chain is then reversed through the back-pointers and emitted.
+//
+// Prices are read from the live model cells through the cost table and kept in
+// lazily filled caches inside mem_ (literal at 0x296a0, rep-select at 0x3e200,
+// length at 0x39c08, distance class at 0x3d848). Pricing never writes a coding
+// probability, so it is safe to run against the model the coder will advance.
+#include "nz_optimum_lz.h"
+#include "nz_optimum_lz_tables.h"
+#include "nz_cm.h"
+#include "nz_env.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <cstring>
+
+// DAT_08172900, the stretch table: a plain global, declared the way
+// nz_optimum_lz.cpp declares it.
+extern "C" {}
+extern std::int16_t kLzModelInterpolation[256];
+
+// NZOPT_CHECK_LRCACHE=1: rebuild the long-range hash at every flush start even
+// when a recorded value is at hand, and abort if the two ever differ.
+static bool kCheckLr() {
+    static const bool v = NZ_ENV("NZOPT_CHECK_LRCACHE") != nullptr;
+    return v;
+}
+
+namespace nzr {
+namespace optimum {
+
+namespace {
+
+// FUN_080749a0: the bit-cost table (0x400 bytes of .bss, built on first use).
+// cost(bit, p) = T[((p >> 2) ^ -(bit ^ 1)) - bit & 0x3ff].
+const std::uint8_t* CostTable() {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint8_t t[0x400];
+        Holder() : t{} {
+        int i6 = 0x118;
+        unsigned b = 0;
+        for (;;) {
+            i6 -= 0x1c;
+            std::uint32_t i2 = 1u << b, i1 = i2 * 2u;
+            std::uint32_t u4 = i2 * 0x1cu + (static_cast<std::uint32_t>(i6) << b);
+            for (;;) {
+                const std::uint32_t u5 = u4 >> b;
+                t[i2] = (u5 < 0x100u) ? static_cast<std::uint8_t>(u5) : 0xffu;
+                if (i1 == i2 + 1u) break;
+                ++i2;
+                u4 -= 0x1cu;
+            }
+            ++b;
+            if (i6 == 0) break;
+        }
+        t[0] = t[1];   // the tail assignment of FUN_080749a0
+        }
+    } holder;
+    return holder.t;
+}
+inline std::uint32_t Cost(const std::uint8_t* T, std::uint32_t bit, std::uint32_t prob) {
+    return T[(((prob >> 2) ^ (0u - (bit ^ 1u))) - bit) & 0x3ffu];
+}
+inline std::uint32_t Bias(std::uint32_t p) { return p + ((p < 0x800u) ? 1u : 0u); }
+
+inline std::uint8_t  Rd8 (const std::uint8_t* m, std::size_t o) { return m[o]; }
+inline void          Wr8 (std::uint8_t* m, std::size_t o, std::uint8_t v) { m[o] = v; }
+inline std::uint16_t Rd16(const std::uint8_t* m, std::size_t o) { std::uint16_t v; std::memcpy(&v, m + o, 2); return v; }
+inline void          Wr16(std::uint8_t* m, std::size_t o, std::uint16_t v) { std::memcpy(m + o, &v, 2); }
+inline std::int32_t  Rd32(const std::uint8_t* m, std::size_t o) { std::int32_t v; std::memcpy(&v, m + o, 4); return v; }
+inline int Stretch(std::uint8_t s) { return kLzModelInterpolation[s]; }
+inline std::uint32_t Load16(const std::uint8_t* p) { std::uint16_t v; std::memcpy(&v, p, 2); return v; }
+inline std::uint32_t Load32(const std::uint8_t* p) { std::uint32_t v; std::memcpy(&v, p, 4); return v; }
+// The ring is read with SIGNED positions: a position just before the cursor is
+// negative and lands in the 256-byte prefix mirror (the decoder's RingAt).
+inline std::uint8_t At(const std::uint8_t* b, std::uint32_t p) { return b[static_cast<std::int32_t>(p)]; }
+// First i in [from, lim) where a[i] != b[i], or lim: the byte scans of the
+// finder and the rep matches, 8 bytes at a time (issue #2 item 10). Reads only
+// a[from..lim) and b[from..lim), the bytes the one-byte loops read.
+inline std::uint32_t MatchFwd(const std::uint8_t* a, const std::uint8_t* b, std::uint32_t from, std::uint32_t lim) {
+    std::uint32_t i = from;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (lim - i >= 8u) {
+        std::uint64_t x, y;
+        std::memcpy(&x, a + i, 8); std::memcpy(&y, b + i, 8);
+        if (x != y) return i + (static_cast<std::uint32_t>(__builtin_ctzll(x ^ y)) >> 3);
+        i += 8u;
+    }
+#endif
+    while (i < lim && a[i] == b[i]) ++i;
+    return i;
+}
+inline std::uint32_t BitLen1(std::uint32_t v) {   // 31 - clz(v), 0 for v == 0
+    return v != 0u ? 31u - static_cast<std::uint32_t>(__builtin_clz(v)) : 0u;
+}
+
+// One relaxation candidate the DP considers at a position.
+struct Cand { std::uint32_t len; std::uint32_t src; };
+
+}  // namespace
+
+// The finder object (FUN_08082e50 + the slot-10 config FUN_0806f440) and the
+// 256-byte rolling hash (FUN_08059b20), which live past mem_ in the original.
+struct NzOptimumLzDecoder::ParserState {
+    // finder
+    std::uint32_t shift = 0, winsize = 0, maskA = 0, headmask = 0;
+    std::uint32_t treemask = 0, treesize = 0;
+    std::vector<std::uint32_t> head, cache, tree;
+    // long-range rolling hash
+    std::vector<std::uint32_t> lr;
+    std::uint32_t lrmask = 0, lrhash = 0;
+    // The rolling hash's value at each position a flush has already walked, so
+    // the next flush (which starts at the coder's cursor, BEHIND where the last
+    // one's lookahead rolled to) need not rebuild it from 256 bytes: a flush
+    // every few bytes made that rebuild 8 % of a -co encode. The hash is a pure
+    // function of the 256 ring bytes at the position, and the walk's rolling is
+    // exact (h*K + b[p+256] - b[p]*K^256 == the rebuilt value, mod 2^32), so a
+    // recorded value IS the rebuilt one while those bytes stand -- hence a
+    // generation, bumped wherever the hash is rebuilt from scratch (a block
+    // start, a window feed). NZOPT_CHECK_LRCACHE=1 rebuilds anyway and aborts
+    // on a difference.
+    struct LrSeen { std::uint32_t pos1 = 0, gen = 0, hash = 0; };
+    std::vector<LrSeen> lrseen = std::vector<LrSeen>(4096u);
+    LrSeen lrlast;   // the last value recorded: a flush after a long match rolls on from it
+    std::uint32_t lrgen = 1;
+    // a flush's candidate list and its backtracking chain, kept here so their
+    // capacity outlives the call (built fresh, they were ~2 allocations a byte)
+    std::vector<Cand> cands_buf;
+    std::vector<std::uint32_t> chain_buf;
+    bool ready = false;
+    // the block being parsed, and how much of it has been handed to the coder
+    const std::uint8_t* block = nullptr;      // the whole block
+    const std::uint8_t* src = nullptr;        // the chunk being parsed
+    std::uint32_t size = 0, consumed = 0, pos0 = 0;
+    bool staged = false;                      // the coder staged this chunk itself
+    std::uint32_t rep0[4] = {1, 1, 1, 1};
+    std::uint8_t hist0 = 0xff;
+    std::uint16_t ctx0 = 0;
+    bool started = false;
+
+    void Init(std::uint32_t W, std::uint32_t blocksize) {
+        if (ready) return;
+        const std::uint32_t u2 = ((W < 0x400u) ? 0u : (W - 0x400u)) + 0x3ffu;
+        const std::uint32_t b1 = BitLen1(u2);
+        shift = b1 + 1u;
+        winsize = W;
+        maskA = (1u << shift) - 1u;
+        const std::uint32_t b2 = (shift < 0x14u) ? 0x10u : (b1 - 0x13u) + 0x10u;
+        headmask = (1u << b2) - 1u;
+        head.assign(static_cast<std::size_t>(headmask) + 1u, 0u);
+        cache.assign(0x10000u * 4u, 0u);
+        // slot 10: the tree buffer is three times the BLOCK size, not the window
+        // (a -m4m archive has a 64 KB window and a 1 MB block, and the original's
+        // tree is 3 MB). FUN_0806f440 derives the mask and the size from that byte
+        // count exactly as below. Sizing it from the window made positions past
+        // 24576 collide onto tree slots the original keeps apart.
+        const std::uint32_t tsz = blocksize * 3u;
+        treemask = ((1u << (BitLen1(tsz) + 1u)) - 1u) >> 2u;
+        treesize = tsz >> 2u;
+        tree.assign(treesize + 2u, 0u);
+        // FUN_08059b20 takes a bit count and allocates 2^bits slots. Read out of
+        // the running binary at -m4m, BOTH finders -- the sampler's (window 1 MB)
+        // and the parser's (window 64 KB) -- carry mask 0x7ffff, so the table is
+        // not sized from the window at all; its bit count comes from a field of
+        // the codec object this port does not model. 2^19 is what the -co encoder
+        // runs with, and the table only decides how often two 256-byte regions
+        // collide onto one slot, so a table of the wrong size answers with far
+        // matches the original never sees.
+        const std::uint32_t bits = 19u;
+        lr.assign(static_cast<std::size_t>(1u) << bits, 0u);
+        lrmask = (1u << bits) - 1u;
+        ready = true;
+    }
+
+    // FUN_08082fa0: bulk-insert positions into the hash head and the 2-byte
+    // 4-slot cache (the binary tree is NOT touched) -- used over the bytes a
+    // chosen match consumed.
+    void Skip(const std::uint8_t* base, std::uint32_t from, std::uint32_t n) {
+        if (n == 0u) return;
+        const std::uint8_t* p = base + from;
+        if (n > 0x402000u) { p += (n - 0x400000u); from += (n - 0x400000u); n = 0x400000u; }
+        else {
+            for (; n > 0x2000u; --n) {
+                const std::uint32_t w = Load32(p);
+                ++p;
+                head[((w >> 19u) ^ w) & headmask] = (~maskA & w) | from;
+                ++from;
+            }
+        }
+        for (std::uint32_t k = 0; k < n; ++k) {
+            const std::uint32_t w = Load32(p + k);
+            const std::uint32_t at = k + from;
+            head[((w >> 19u) ^ w) & headmask] = (~maskA & w) | at;
+            cache[static_cast<std::size_t>(w & 0xffffu) * 4u] =
+                (static_cast<std::uint32_t>(p[k + 2u]) << shift) + at;
+        }
+    }
+
+    // FUN_08073ca0: the 2-byte 4-slot cache probes, then the bt4 tree descent.
+    void Find(const std::uint8_t* base, std::uint32_t cur, std::uint32_t cend,
+              std::uint32_t maxlen, std::vector<Cand>& outc, std::uint32_t depth) {
+        const std::uint32_t w = Load32(base + cur);
+        const std::uint32_t hidx = ((w >> 19u) ^ w) & headmask;
+        std::uint32_t chain = head[hidx];
+        const std::uint32_t tagv = static_cast<std::uint32_t>(base[cur + 2u]) << shift;
+        std::uint32_t* const cs = &cache[static_cast<std::size_t>(w & 0xffffu) * 4u];
+        std::uint32_t bestlen = 1;
+        const auto valid = [&](std::uint32_t p) { return cend <= p || p < cur; };
+        bool got3 = false;
+        if (cs[0] != 0u) {
+            const std::uint32_t cp = cs[0] & maskA;
+            if (Load16(base + cur) == Load16(base + cp) && valid(cp)) {
+                if (maxlen < 2u) { bestlen = 1; }
+                else {
+                    outc.push_back({2u, cp});
+                    bestlen = 2;
+                    if ((~maskA & cs[0]) == tagv) {
+                        if (base[cp + 2u] == base[cur + 2u] && maxlen > 2u) {
+                            outc.push_back({3u, cp});
+                            bestlen = 3; got3 = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!got3) {
+            for (int k = 1; k < 4; ++k) {
+                const std::uint32_t e = cs[k];
+                if (e == 0u) break;
+                if ((~maskA & e) == tagv) {
+                    const std::uint32_t cp = maskA & e;
+                    if (base[cp + 2u] == base[cur + 2u] && Load16(base + cur) == Load16(base + cp) &&
+                        valid(cp) && maxlen > 2u) {
+                        outc.push_back({3u, cp});
+                        bestlen = 3;
+                        break;
+                    }
+                }
+            }
+        }
+        if (bestlen >= maxlen) return;
+        // refresh the cache and the head, then walk the tree
+        cs[3] = cs[2]; cs[2] = cs[1]; cs[1] = cs[0]; cs[0] = tagv + cur;
+        head[hidx] = cur | (~maskA & w);
+        std::uint32_t ti = (cur * 2u) & treemask;
+        if (treesize <= ti) ti -= treesize;
+        std::uint32_t* gt = &tree[ti];        // the "greater" side link
+        std::uint32_t* ls = &tree[ti] + 1;    // the "less" side link
+        std::uint32_t lg = 0, ll = 0;         // matched prefix on each side
+        while (chain != 0u && --depth != 0u) {
+            const std::uint32_t cp = maskA & chain;
+            if (cp >= winsize || !valid(cp)) break;
+            std::uint32_t ci = (cp * 2u) & treemask;
+            std::uint32_t* ch = (ci < treesize) ? &tree[ci] : &tree[ci - treesize];
+            std::uint32_t k = std::min(lg, ll);
+            std::uint32_t lim = (cp + maxlen <= winsize) ? maxlen : (winsize - cp);
+            if (lim <= k) { *ls = ch[0]; *gt = ch[1]; return; }
+            if (base[cur + k] == base[cp + k]) {
+                const std::int32_t pre = static_cast<std::int32_t>(k) - 1;
+                // the original abandons the walk here when four or more bytes
+                // already matched but the chain entry's tag does not
+                if (pre > 2 && ((cp ^ chain) != (~maskA & w))) return;
+                std::uint32_t j = k;
+                j = MatchFwd(base + cur, base + cp, k + 1u, lim);   // k matched; lim > k
+                if (bestlen < j) {
+                    bool ok = true;
+                    for (std::int32_t q = pre; q >= 0; --q) if (base[cur + q] != base[cp + q]) { ok = false; break; }
+                    if (!ok) { *ls = ch[0]; *gt = ch[1]; return; }
+                    outc.push_back({j, cp});
+                    bestlen = j;
+                    if (lim == j) { *ls = ch[0]; *gt = ch[1]; return; }
+                }
+                if (base[cp + j] < base[cur + j]) { *gt = chain; gt = ch + 1; chain = ch[1]; lg = j; }
+                else { *ls = chain; chain = ch[0]; ls = ch; ll = j; }
+            } else if (base[cp + k] < base[cur + k]) {
+                *gt = chain; gt = ch + 1; chain = ch[1]; lg = k;
+            } else {
+                *ls = chain; chain = ch[0]; ls = ch; ll = k;
+            }
+        }
+        *gt = 0; *ls = 0;
+    }
+};
+
+namespace {
+// DAT_08171d40: c * K^256, what leaves the 256-byte rolling window.
+const std::uint32_t* LrOut() {
+    // Built once and thread-safe (a C++11 function-local static): the workers
+    // of a parallel `a` reach this concurrently, and a plain `static bool` let a
+    // second thread read the table while the first was still writing it.
+    static const struct Holder {
+        std::uint32_t t[256];
+        Holder() : t{} {
+        std::uint32_t k = 1;
+        for (int i = 0; i < 0x100; ++i) k *= 0x104070bu;
+        std::uint32_t v = 0;
+        for (int i = 0; i < 256; ++i) { t[i] = v; v += k; }
+        }
+    } holder;
+    return holder.t;
+}
+// FUN_08074360: the price of a brand-new distance -- five slot-tree bits, one
+// or two tier-1 bits, the align bits and the high bits -- cached per distance
+// class at 0x3d848 (a class covers a bit length and the two bits under its top
+// one; the cache is filled by whichever length bucket asked first).
+std::uint32_t PriceDistance(std::uint8_t* mem, const std::uint8_t* T,
+                            const std::uint8_t* D4D0, std::uint32_t D, std::uint32_t len,
+                            bool use_cache) {
+    const std::uint32_t bl = BitLen1(D);
+    const std::uint32_t sh = (bl > 2u) ? (bl - 2u) : 0u;
+    const std::size_t cls = (((D >> sh) & 3u) * 0x20u + bl) & 0x7fu;
+    const std::size_t cell = 0x3d848u + cls * 2u;
+    if (use_cache) {
+        const std::uint16_t cached = Rd16(mem, cell);
+        if (cached != 0u) return cached;
+    }
+    const std::uint32_t v = len - 2u;
+    const std::uint32_t bucket = D4D0[(v > 0xfu) ? 0xfu : v];
+    std::uint32_t acc = 0;
+    // the five slot bits, MSB first, of slot ^ 0x1f
+    std::uint32_t tp = 1;
+    std::uint32_t bits = (~bl) << 27u;
+    for (int i = 0; i < 5; ++i) {
+        const std::size_t c1 = 0x39f40u + static_cast<std::size_t>(tp + bucket * 0x20u) * 2u;
+        const std::uint32_t cell1 = Rd16(mem, c1);
+        const std::uint32_t i2 = static_cast<std::uint32_t>(
+            ((static_cast<std::int32_t>(Stretch(static_cast<std::uint8_t>(cell1 >> 8))) + 0x800) >> 8)) + 0x140u + tp * 0x11u;
+        const std::size_t c2 = 0x39f40u + static_cast<std::size_t>(i2) * 2u;
+        const std::uint32_t comb = ((cell1 >> 4u) + 2u +
+            ((static_cast<std::uint32_t>(Rd16(mem, c2 + 2u)) + 1u + static_cast<std::uint32_t>(Rd16(mem, c2))) >> 5u) * 3u) >> 2u;
+        const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
+        acc += Cost(T, bit, Bias(comb));
+        tp = bit + tp * 2u;
+    }
+    // tier 1
+    const std::uint32_t n1 = (bl < 2u) ? 1u : 2u;
+    {
+        std::uint32_t t1 = 1;
+        // the two tier-1 bits are the TOP of D (the leading one and the bit
+        // under it), not its low pair: the shift is 0x20 - bl once bl reaches 3
+        std::uint32_t b1 = D << ((0x20u - ((bl > 1u) ? bl : 1u)) & 0x1fu);
+        for (std::uint32_t i = 0; i < n1; ++i) {
+            const std::uint32_t bit = (b1 >> 31u) & 1u; b1 <<= 1u;
+            const std::size_t c = 0x39f40u + static_cast<std::size_t>(t1 + 0xf80u + bl * 0x60u) * 2u;
+            acc += Cost(T, bit, Rd16(mem, c) >> 4u);
+            t1 = bit + t1 * 2u;
+        }
+    }
+    if (bl > 2u) {
+        const std::uint32_t n2 = (bl < 6u) ? (bl - 2u) : 4u;
+        std::uint32_t t2 = 1, d = D;
+        for (std::uint32_t i = 0; i < n2; ++i) {
+            const std::uint32_t bit = d & 1u; d >>= 1u;
+            const std::size_t c = 0x3f700u + static_cast<std::size_t>(t2) * 2u;   // the align table
+            acc += Cost(T, bit, Rd16(mem, c) >> 4u);
+            t2 = bit + t2 * 2u;
+        }
+        if (bl > 6u) {
+            const std::uint32_t n3 = bl - 6u;
+            std::uint32_t b3 = D << ((0x1cu - n3) & 0x1fu);
+            for (std::uint32_t i = 0; i < n3; ++i) {
+                const std::uint32_t bit = (b3 >> 31u) & 1u; b3 <<= 1u;
+                const std::size_t c = 0x39f40u + static_cast<std::size_t>(i + 0x380u + n3 * 0x60u) * 2u;
+                acc += Cost(T, bit, Rd16(mem, c) >> 4u);
+            }
+        }
+    }
+    if (const char* dc = NZ_ENV("NZOPT_DCLS")) {
+        if (cls == static_cast<std::size_t>(std::atoi(dc)))
+            std::fprintf(stderr, "[DF] cls=%zu D=%u len=%u bucket=%u acc=%u cached=%d\n",
+                         cls, D, len, bucket, acc, (int)use_cache);
+    }
+    Wr16(mem, cell, static_cast<std::uint16_t>(acc));
+    return acc;
+}
+
+// The rep-select price for a0 (0..3 = rep slot, 4 = a brand-new distance),
+// cached at 0x3e200 by (history, match mask, slot). The value excludes the
+// dispatch bit, which the caller adds.
+std::uint32_t SelDelta(std::uint8_t* mem, const std::uint8_t* T, std::uint8_t hist,
+                       std::uint32_t mm, std::uint32_t a0, bool use_cache) {
+    const std::uint32_t ti = (hist & 0xfu) + (mm & 7u) * 0x10u;
+    const std::size_t off = 0x3d980u + static_cast<std::size_t>(ti) * 16u;
+    const std::uint32_t sg = (a0 >= 4u) ? 0u : (a0 + 1u);
+    const std::size_t ci = (hist & 7u) + (mm & 7u) * 8u + static_cast<std::size_t>(sg) * 0x40u;
+    if (use_cache) {
+        const std::uint8_t cv = Rd8(mem, 0x3e200 + ci);
+        if (cv != 0xffu) return cv;
+    }
+    // b1 says new-distance (1) or rep (0), and each path prices it with its own
+    // polarity -- the rep site costs a zero here, the finder site a one
+    std::uint32_t px = Cost(T, (a0 >= 4u) ? 1u : 0u, Bias(Rd16(mem, off) >> 4u));
+    if (a0 < 4u) {
+        std::uint32_t tp = ti * 8u + 1u;
+        int left = 3;
+        for (;;) {
+            const std::uint32_t at = tp;
+            const bool last = (static_cast<int>(a0) - 3 + left) == 0;
+            ++tp;
+            px += Cost(T, last ? 1u : 0u, Bias(Rd16(mem, 0x3d980u + static_cast<std::size_t>(at) * 2u) >> 4u));
+            --left;
+            if (last || left == 0) break;
+        }
+    }
+    Wr8(mem, 0x3e200 + ci, static_cast<std::uint8_t>((px < 0xfeu) ? px : 0xfeu));
+    return px;
+}
+
+// The length price, cached at 0x39c08 by (len-2, is-rep0). A length whose
+// v = len-2 reaches 0xff prices at zero: the original skips the whole block
+// rather than clamping, so very long matches look free.
+std::uint32_t LenCost(std::uint8_t* mem, const std::uint8_t* T, std::uint32_t L,
+                      std::uint32_t a0, bool use_cache) {
+    const std::uint32_t v = L - 2u;
+    if (v >= 0xffu) return 0u;
+    const std::size_t li = (a0 == 0u ? 1u : 0u) + static_cast<std::size_t>(v) * 2u;
+    if (use_cache) {
+        const std::uint8_t lc = Rd8(mem, 0x39c08 + li);
+        if (lc != 0u) return lc;
+    }
+    std::uint32_t acc = 0;
+    std::uint32_t idx = (a0 == 0u ? 1u : 0u) << 4u;
+    std::uint32_t vv = v, nb = 0;
+    for (;;) {
+        vv >>= 1u;
+        const std::uint32_t cellp = Rd16(mem, 0x396c0u + static_cast<std::size_t>(idx) * 2u) >> 4u;
+        ++idx; ++nb;
+        acc += Cost(T, (vv != 0u) ? 1u : 0u, cellp);
+        if (vv == 0u) break;
+    }
+    const std::uint32_t rowb = (nb - 1u) << 5u;
+    std::uint32_t persisted = (a0 == 4u) ? 3u : 1u;
+    const std::uint32_t nbits = (nb < 5u) ? ((nb - 1u) ? (nb - 1u) : 1u) : 4u;
+    const std::uint32_t raws = (nb < 5u) ? 0u : (nb - 5u);
+    // past four bits the original shifts by 0x21 - nb, not 0x20 - nbits: a
+    // length that needs six or more raw bits reads them one place over
+    std::uint32_t bits = v << (((nb < 5u) ? (0x20u - nbits) : (0x21u - nb)) & 0x1fu);
+    for (std::uint32_t i = 0; i < nbits; ++i) {
+        const std::uint32_t bit = (bits >> 31u) & 1u; bits <<= 1u;
+        const std::size_t c2 = 0x396c0u + static_cast<std::size_t>(persisted + rowb + 0x60u) * 2u;
+        acc += Cost(T, bit, Rd16(mem, c2) >> 4u);
+        persisted = bit + persisted * 2u;
+    }
+    if (raws != 0u) acc += raws * 0x1cu;
+    Wr8(mem, 0x39c08 + li, static_cast<std::uint8_t>((acc < 0xffu) ? acc : 0xffu));
+    return acc;
+}
+
+// The cost of coding `lit` with the models as they stand -- the decoder's
+// literal loop with the updates removed and the bit costs summed instead.
+std::uint32_t PriceLiteral(const std::uint8_t* mem, const std::uint8_t* T,
+                           std::uint32_t ctxWord, std::uint8_t hist, std::uint8_t lit,
+                           std::uint32_t mm, std::uint8_t predB, std::uint8_t am2,
+                           std::uint32_t remain) {
+    int ctxA = 0x130 + static_cast<int>(ctxWord & 0xffu) * 0x100;
+    int ctxB = 0x10450 + static_cast<int>(am2) * 0x100;
+    const std::uint32_t seed = static_cast<std::uint32_t>(predB) + 0x100u;
+    std::uint32_t ctxD = (remain & 3u) * 0x10u + 1u + (mm & 7u) * 0x40u + ((seed >> 6u) & 2u);
+    std::uint32_t ctxC = 1;
+    std::uint16_t m84 = static_cast<std::uint16_t>(seed);
+    std::uint8_t subc = 0, scale = 0, confid = 0, shiftreg = 1, m8e = 0;
+    std::uint16_t treeC = 1;
+    if ((hist & 1u) == 0u) {
+        m8e = static_cast<std::uint8_t>(ctxWord >> 8u);
+        ctxC = 0x202u + (static_cast<std::uint32_t>(m8e) >> 7u);
+        treeC = static_cast<std::uint16_t>(ctxC);
+    }
+    std::uint32_t cost = 0;
+    for (int k = 0; k < 8; ++k) {
+        const std::uint8_t sA = Rd8(mem, ctxA), sB = Rd8(mem, ctxB);
+        const std::uint8_t sC = Rd8(mem, 0x10140 + ctxC), sD = Rd8(mem, 0x20460 + ctxD);
+        const int wRow = 0x60 + static_cast<int>((((ctxD >> 6u) & 3u) + (ctxC >> 8u) * 4u) * 0x10u);
+        const std::int32_t dot = Stretch(sA) * Rd32(mem, wRow) + Stretch(sB) * Rd32(mem, wRow + 4) +
+                                 Stretch(sC) * Rd32(mem, wRow + 8) + Stretch(sD) * Rd32(mem, wRow + 12);
+        std::int32_t ps = (dot >> 16) + 0x800;
+        std::uint32_t p = (ps < 0) ? 0u : static_cast<std::uint32_t>(ps);
+        p = ((p < 0xfffu) ? p : 0xfffu) * 0xbu;
+        const std::uint32_t frac = p & 0xfffu;
+        const std::size_t a2 = 0x20670u + static_cast<std::size_t>(confid + ctxC * 2u) * 24u +
+                               static_cast<std::size_t>(p >> 12u) * 2u;
+        const std::uint32_t mix = (static_cast<std::uint32_t>(Rd16(mem, a2)) * (0x1000u - frac) +
+                                   frac * static_cast<std::uint32_t>(Rd16(mem, a2 + 2u))) >> 16u;
+        const std::uint32_t pf = Bias(mix);
+        const std::uint32_t bit = (static_cast<std::uint32_t>(lit) >> (7 - k)) & 1u;
+        cost += Cost(T, bit, pf);
+        if (k == 7) break;
+        confid = (0xa01u < (bit * 0x1000u - pf) + 0x500u) ? 1u : 0u;
+        shiftreg = static_cast<std::uint8_t>(bit + shiftreg * 2u);
+        m84 = static_cast<std::uint16_t>(m84 << 1u);
+        subc = static_cast<std::uint8_t>(subc + 1u);
+        std::uint32_t step;
+        if (subc == 4u) { step = (static_cast<std::uint32_t>(shiftreg) * 0xfu - scale) - 0xe1u; }
+        else { step = (bit + 1u) << ((subc & 3u) - 1u); scale = static_cast<std::uint8_t>(scale + step); }
+        ctxA += static_cast<int>(step); ctxB += static_cast<int>(step);
+        ctxD = static_cast<std::uint16_t>(((static_cast<std::uint32_t>(m84) >> 6u) & 2u) +
+                                          static_cast<std::uint32_t>(subc >> 1u) * 4u + (ctxD & 0xfff0u) +
+                                          (((static_cast<std::uint32_t>(m84) >> 8u) == shiftreg) ? 1u : 0u));
+        const std::uint16_t oldC = treeC;
+        std::uint16_t tmp = static_cast<std::uint16_t>((oldC & 0xff00u) | shiftreg);
+        treeC = tmp;
+        if (oldC < 0x200u) { ctxC = tmp; }
+        else {
+            std::uint16_t c = static_cast<std::uint16_t>(static_cast<std::uint32_t>(shiftreg) + 0x100u);
+            treeC = c;
+            if (bit == (oldC & 1u)) {
+                m8e = static_cast<std::uint8_t>(m8e * 2u);
+                const std::int16_t se = static_cast<std::int16_t>(static_cast<std::int8_t>(shiftreg));
+                const std::uint32_t hi = (static_cast<std::uint16_t>(~se) >> 15u) * (static_cast<std::uint32_t>(shiftreg) * 2u);
+                c = static_cast<std::uint16_t>(hi + 0x200u + (static_cast<std::uint32_t>(m8e) >> 7u));
+                treeC = c;
+            }
+            ctxC = c;
+        }
+    }
+    return cost;
+}
+
+}  // namespace
+
+std::uint32_t NzOptimumLzDecoder::PriceBit(std::uint32_t bit, std::uint32_t pf) {
+    return Cost(CostTable(), bit, pf);
+}
+
+// The literal price is the cost the coder actually paid, summed bit by bit while
+// coding, exactly as the original accumulates it -- not a second transcription of
+// the mixer that could drift from the coder's own.
+void NzOptimumLzDecoder::StoreLiteralCost(std::uint32_t ctxLow, std::uint8_t lit, std::uint32_t cost) {
+    std::uint8_t* const mem = mem_.data();
+    const std::size_t lci = static_cast<std::size_t>(ctxLow & 0xffu) * 0x100u + lit;
+    Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((cost < 0xfeu) ? cost : 0xfeu));
+}
+
+// Coding a symbol measures its real cost, and the original writes that cost
+// straight back into the price cache it priced from. Recomputing each component
+// against the model as it stands just before the decision is coded gives the same
+// number, because the coder reads every cell before it updates it.
+void NzOptimumLzDecoder::RefreshMatchPrices(const OptimumDecision& d, std::uint32_t mm,
+                                            std::uint8_t hist) {
+    if (d.is_literal) return;               // the coder stores its own measured cost
+    std::uint8_t* const mem = mem_.data();
+    const std::uint8_t* const T = CostTable();
+    const std::uint32_t a0 = (d.sg == 0u) ? 4u : (d.sg - 1u);
+    SelDelta(mem, T, hist, mm, a0, false);
+    if (d.len >= 2u) LenCost(mem, T, d.len, a0, false);
+    if (a0 == 4u && d.dist != 0u)
+        PriceDistance(mem, T, OptimumDat081724d0(), d.dist - 1u, d.len, false);
+}
+
+// FUN_0806f530's tail: after the ring feed, hand the appended span to the finder.
+// A span that fills the window (or comes within a chunk of it) is inserted as the
+// whole window from position zero; otherwise it is inserted where it landed, split
+// in two when it wrapped past the ring end.
+void NzOptimumLzDecoder::EnableParser() {
+    if (!parser_) parser_ = std::make_shared<ParserState>();
+    parser_->Init(ring_.capacity, blocksize_);
+}
+
+void NzOptimumLzDecoder::FeedFinder(std::uint32_t cursor_before, std::uint32_t len) {
+    // Only the encoding side needs the finder, and it costs several megabytes, so
+    // a plain decode does not build one. NZOPT_PARSECHK / NZOPT_RECODE turn it on
+    // so their re-parse sees the same window history the original's parser does.
+    if (!parser_) {
+        if (NZ_ENV("NZOPT_PARSECHK") == nullptr && NZ_ENV("NZOPT_RECODE") == nullptr) return;
+        parser_ = std::make_shared<ParserState>();
+    }
+    ParserState& F = *parser_;
+    F.Init(ring_.capacity, blocksize_);
+    const std::uint32_t cap = ring_.capacity;
+    if (cap == 0u || len == 0u) return;
+    std::uint32_t n = len, from = cursor_before;
+    if (cap <= len + 0x8000u) { n = (len < cap) ? len : cap; from = 0; }
+    if (NZ_ENV("NZOPT_TRACE_FEED"))
+        std::fprintf(stderr, "[FEED] len=%u cursor_before=%u cursor_after=%u -> from=%u n=%u\n",
+                     len, cursor_before, ring_.cursor, from, n);
+    std::uint8_t* const base = ring_.Base();
+    // FUN_0806f530 also keeps the LONG-RANGE index current over the fed bytes:
+    // it recomputes the 256-byte rolling hash at the start of each fed span,
+    // then walks the span storing `tag | (pos >> 8)` at every position that is a
+    // multiple of 256 (with the hash of the 256 bytes STARTING there, before
+    // rolling on) and rolling the hash one byte per position. A span that
+    // wraps the ring is two spans. param15's encoder reads this table, and only
+    // this table -- it never writes it -- so a block fed here without these
+    // stores is a block param15 can never match into.
+    const std::uint32_t* const LRO = LrOut();
+    auto lr_span = [&](std::uint32_t at, std::uint32_t cnt) {
+        ++F.lrgen;
+        std::uint32_t h = 0;
+        for (std::uint32_t i = 0; i < 0x100u; ++i) h = h * 0x104070bu + base[at + i];
+        F.lrhash = h;
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            const std::uint32_t pos = at + i;
+            if ((pos & 0xffu) == 0u) F.lr[h & F.lrmask] = (h & 0xffc00000u) + (pos >> 8u);
+            h = h * 0x104070bu + base[pos + 0x100u] - LRO[base[pos]];
+            F.lrhash = h;
+        }
+    };
+    if (from < ring_.cursor) {
+        F.Skip(base, from, n);
+        lr_span(from, n);
+    } else {
+        const std::uint32_t tail = cap - from;
+        if (tail >= n) { F.Skip(base, from, n); lr_span(from, n); }
+        else { F.Skip(base, from, tail); lr_span(from, tail); F.Skip(base, 0u, n - tail); lr_span(0u, n - tail); }
+    }
+    window_reset_pending_ = false;
+}
+
+// The pieces the param15 ENCODER borrows from this engine: the ring it reads
+// its sources from and the long-range index the window feed maintains.
+std::uint32_t* NzOptimumLzDecoder::ParserArena() { return parser_ ? parser_->tree.data() : nullptr; }
+std::size_t NzOptimumLzDecoder::ParserArenaWords() const { return parser_ ? parser_->tree.size() : 0u; }
+
+const std::uint32_t* NzOptimumLzDecoder::LongRangeTable() const { return parser_ ? parser_->lr.data() : nullptr; }
+std::uint32_t NzOptimumLzDecoder::LongRangeMask() const { return parser_ ? parser_->lrmask : 0u; }
+
+bool NzOptimumLzDecoder::ChunkExhausted() const {
+    return !parser_ || parser_->consumed >= parser_->size;
+}
+
+void NzOptimumLzDecoder::BeginChunk(std::uint32_t off, std::uint32_t len,
+                                    std::uint32_t ring_pos, bool reset_reps) {
+    if (!parser_) return;
+    ParserState& F = *parser_;
+    F.src = F.block + off;
+    F.size = len;
+    F.consumed = 0;
+    F.pos0 = ring_pos;
+    F.staged = true;
+    // the coder has already made headroom for exactly this span
+    std::uint8_t* const b0 = ring_.Base();
+    std::memcpy(b0 + ring_pos, F.src, len);
+    const std::uint32_t cap = ring_.capacity;
+    if (reset_reps) F.rep0[0] = F.rep0[1] = F.rep0[2] = F.rep0[3] = 1;
+    const std::uint32_t e0 = ring_pos + len;
+    for (int k = 0; k < 4; ++k) {
+        std::uint32_t p = ring_pos - (F.rep0[k] + 1u);
+        if (ring_pos < F.rep0[k] + 1u) p += cap;
+        if (cap <= p || (p < e0 && ring_pos <= p)) F.rep0[k] = 1;
+    }
+    std::uint32_t lrh = 0;
+    for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[ring_pos + i];
+    F.lrhash = lrh;
+    ++F.lrgen;
+}
+
+void NzOptimumLzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
+    if (!parser_) parser_ = std::make_shared<ParserState>();
+    ParserState& F = *parser_;
+    F.Init(ring_.capacity, blocksize_);
+    F.block = data; F.src = data; F.size = size; F.consumed = 0;
+    F.started = false; F.staged = false; F.pos0 = 0;
+    F.rep0[0] = F.rep0[1] = F.rep0[2] = F.rep0[3] = 1;
+    F.hist0 = 0xff; F.ctx0 = 0;
+}
+
+// One flush of the DP, from the ring and the models as they stand right now.
+bool NzOptimumLzDecoder::ParseNextFlush(std::vector<OptimumDecision>& out) {
+    if (!parser_) return false;
+    ParserState& F = *parser_;
+    if (F.consumed >= F.size) return false;
+
+    const std::uint8_t* const T = CostTable();
+    const std::uint32_t* const LRO = LrOut();
+    std::uint8_t* const mem = mem_.data();
+    const std::uint32_t cap = ring_.capacity;
+    const std::uint8_t* const D380 = OptimumDat08172380();
+    const std::uint8_t* const D4D0 = OptimumDat081724d0();
+    const bool trace = (NZ_ENV("NZOPT_TRACE_PARSE") != nullptr);
+
+    struct Node {
+        std::uint16_t tag = 0, price = 0, back = 0, len = 0, ctx = 0;
+        std::uint8_t hist = 0;
+        std::uint8_t sg = 0;            // 0 = new distance, 1..4 = rep0..rep3
+        std::uint32_t dist = 0;
+        std::uint32_t rep[4] = {0, 0, 0, 0};
+    };
+    // Six extra slots: the lookahead below reads up to node ni+6, and the
+    // original reads the stack locals that follow its array there.
+    //
+    // The array has to arrive CLEAR (an untouched node must not carry this
+    // chunk's tag), but this runs once per handful of input bytes, so only what
+    // the last call dirtied is cleared -- everything above it is still Node{}.
+    constexpr std::uint32_t kNodes = 0x120u + 8u;
+    static thread_local std::vector<Node> nodes;
+    static thread_local std::uint32_t nodes_dirty = 0;
+    if (nodes.size() != kNodes) nodes.assign(kNodes, Node{});
+    else if (nodes_dirty != 0u) std::fill_n(nodes.begin(), nodes_dirty, Node{});
+    nodes_dirty = kNodes;              // pessimistic until the parse has ended
+    std::uint32_t dirty_hi = 0;        // the highest node this call writes
+
+    std::uint32_t* const rep0 = F.rep0;
+    std::uint8_t& hist0 = F.hist0;
+    std::uint16_t& ctx0 = F.ctx0;
+    if (!F.started && !F.staged) {
+        F.started = true;
+        // the coder will call EnsureHeadroom for the same span, so doing it here
+        // first keeps the two in step; the whole block goes into the window up
+        // front, the way the original appends the chunk before parsing it
+        ring_.EnsureHeadroom(F.size);
+        F.pos0 = ring_.cursor;
+        std::memcpy(ring_.Base() + F.pos0, F.src, F.size);
+        std::uint8_t* const b0 = ring_.Base();
+        const std::uint32_t e0 = F.pos0 + F.size;
+        for (int k = 0; k < 4; ++k) {
+            std::uint32_t p = F.pos0 - (rep0[k] + 1u);
+            if (F.pos0 < rep0[k] + 1u) p += cap;
+            if (cap <= p || (p < e0 && F.pos0 <= p)) rep0[k] = 1;
+        }
+        std::uint32_t lrh = 0;
+        for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[F.pos0 + i];
+        F.lrhash = lrh;
+        ++F.lrgen;
+    }
+    {
+        std::uint8_t* const base = ring_.Base();
+        const std::uint32_t chunk = F.size;
+        const std::uint32_t pos0 = F.pos0;
+        const std::uint32_t cend = pos0 + chunk;
+        const std::uint32_t emitted = F.consumed;
+        {
+            // The long-range hash is rebuilt from the 256 bytes at the position
+            // this flush starts from (0x0807289f: it reads the ring descriptor's
+            // own cursor, which the coder has already advanced past everything
+            // emitted so far), and then rolls forward one byte per node below.
+            {
+                const std::uint32_t at = pos0 + emitted;
+                const auto seen = F.lrseen[at & 4095u];
+                const auto& last = F.lrlast;
+                if (seen.pos1 == at + 1u && seen.gen == F.lrgen && !kCheckLr()) {
+                    F.lrhash = seen.hash;
+                } else if (last.gen == F.lrgen && last.pos1 != 0u && last.pos1 - 1u <= at &&
+                           at - (last.pos1 - 1u) < 0x100u && !kCheckLr()) {
+                    // past a long match: roll on from the last walked position
+                    std::uint32_t h = last.hash;
+                    for (std::uint32_t q = last.pos1 - 1u; q < at; ++q)
+                        h = h * 0x104070bu + base[q + 0x100u] - LRO[base[q]];
+                    F.lrhash = h;
+                } else {
+                    std::uint32_t lrh = 0;
+                    for (std::uint32_t i = 0; i < 0x100u; ++i)
+                        lrh = lrh * 0x104070bu + base[at + i];
+                    if (seen.pos1 == at + 1u && seen.gen == F.lrgen && seen.hash != lrh) {
+                        std::fprintf(stderr, "[lrcache] MISMATCH at %u: recorded %08x rebuilt %08x\n", at, seen.hash, lrh);
+                        std::abort();
+                    }
+                    if (kCheckLr() && last.gen == F.lrgen && last.pos1 != 0u && last.pos1 - 1u <= at &&
+                        at - (last.pos1 - 1u) < 0x100u) {
+                        std::uint32_t h = last.hash;
+                        for (std::uint32_t q = last.pos1 - 1u; q < at; ++q)
+                            h = h * 0x104070bu + base[q + 0x100u] - LRO[base[q]];
+                        if (h != lrh) {
+                            std::fprintf(stderr, "[lrcache] ROLL MISMATCH at %u from %u: %08x rebuilt %08x\n", at, last.pos1 - 1u, h, lrh);
+                            std::abort();
+                        }
+                    }
+                    F.lrhash = lrh;
+                }
+            }
+            const std::uint32_t remain0 = chunk - emitted;
+            nodes[0].price = 0; nodes[0].hist = hist0; nodes[0].ctx = ctx0;
+            for (int k = 0; k < 4; ++k) nodes[0].rep[k] = rep0[k];
+            std::uint32_t front = 1;       // uStack_230f4: furthest relaxed node
+            std::uint32_t ni = 0;          // uStack_230d8
+            bool flushed = false;
+            std::uint32_t endnode = 0;
+
+            while (true) {
+                Node& nd = nodes[ni];
+                const std::uint32_t cur = pos0 + emitted + ni;
+                const std::uint32_t remain = chunk - emitted - ni;
+                // ---- the dispatch context, exactly as the decoder builds it
+                if (nd.rep[0] >= cap) return false;   // a rep can never point outside the window
+                std::uint32_t pr = cur - (nd.rep[0] + 1u);
+                if (cur < nd.rep[0] + 1u) pr += cap;
+                std::uint32_t predpos = pr;
+                { const std::uint32_t bc = pr - 4u; if (bc < cend && cur <= bc) predpos = cur - 1u; }
+                const std::uint8_t predB = At(base, predpos);
+                const std::uint32_t mm =
+                    ((At(base, predpos - 1u) == At(base, cur - 1u)) ? 1u : 0u) |
+                    ((At(base, predpos - 2u) == At(base, cur - 2u)) ? 2u : 0u) |
+                    ((At(base, predpos - 3u) == At(base, cur - 3u)) ? 4u : 0u) |
+                    ((At(base, predpos - 4u) == At(base, cur - 4u)) ? 8u : 0u);
+                const std::uint8_t am2 = At(base, cur - 2u);
+                const std::uint32_t dispIdx = (mm & 7u) + static_cast<std::uint32_t>(predB) * 8u;
+
+                // ---- the dispatch probability (shared by the literal and match costs)
+                const std::uint8_t dstate = Rd8(mem, 0x3e380 + dispIdx);
+                const std::uint32_t apmRow = (mm & 0xfu) + static_cast<std::uint32_t>(D380[nd.hist]) * 8u;
+                const std::uint32_t apmIn = static_cast<std::uint32_t>(Stretch(dstate) * 4 + 0x2000);
+                const std::uint32_t dfrac = apmIn & 0xfffu;
+                const std::size_t dcell = 0x3eb90u + apmRow * 10u + (apmIn >> 12u) * 2u;
+                const std::uint32_t dlo = Rd16(mem, dcell), dhi = Rd16(mem, dcell + 2u);
+                const std::uint32_t dmix = (static_cast<std::uint32_t>(dstate) * 16u + 2u +
+                                            ((dlo * (0x1000u - dfrac) + dfrac * dhi) >> 16u) * 3u) >> 2u;
+                const std::uint32_t dmatch = Cost(T, 0u, Bias(dmix));   // dispatch bit 0 = match
+                const std::uint32_t dlit   = Cost(T, 1u, Bias(dmix));   // dispatch bit 1 = literal
+
+                // ---- the rep-select price for a slot (0..3 = rep, 4 = new distance)
+                auto SelPrice = [&](std::uint32_t slot) -> std::uint32_t {
+                    return dmatch + SelDelta(mem, T, nd.hist, mm, slot, true);
+                };
+                // ---- the length price, cached at 0x39c08 by (len-2, is-rep0)
+                auto LenPrice = [&](std::uint32_t L, std::uint32_t slot) -> std::uint32_t {
+                    return LenCost(mem, T, L, slot, true);
+                };
+                // ---- write one relaxed node; false means the existing path is
+                // cheaper, which ends the whole relaxation
+                auto Update = [&](std::uint32_t L, std::uint32_t slot, std::uint32_t dist,
+                                  const std::uint32_t* nr, std::uint32_t price) -> bool {
+                    Node& tg = nodes[ni + L];
+                    if (ni + L > dirty_hi) dirty_hi = ni + L;
+                    // the first writer keeps a tie, as the decompile compares
+                    if (tg.tag == static_cast<std::uint16_t>(chunk) && price >= tg.price) return false;
+                    tg.tag = static_cast<std::uint16_t>(chunk);
+                    tg.price = static_cast<std::uint16_t>(price);
+                    tg.back = static_cast<std::uint16_t>(ni);
+                    tg.len = static_cast<std::uint16_t>(L);
+                    tg.sg = static_cast<std::uint8_t>(slot == 4u ? 0u : slot + 1u);
+                    tg.dist = dist;
+                    tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                    const std::uint32_t sp = (cur >= dist) ? (cur - dist) : (cur + cap - dist);
+                    tg.ctx = static_cast<std::uint16_t>(At(base, sp + L) * 0x100u + At(base, cur + L - 1u));
+                    for (int k = 0; k < 4; ++k) tg.rep[k] = nr[k];
+                    return true;
+                };
+
+                // ---- the four rep offsets
+                std::uint32_t best = 1;
+                // The finder's threshold is NOT the longest rep match found: the
+                // original keeps a separate counter that starts at 2 and rises to
+                // the longest length a rep relaxation actually WROTE. A rep that
+                // matched long but lost every comparison leaves it at 2, and the
+                // finder then gets to price its own candidates.
+                std::uint32_t thrv = 2;
+                bool took_long = false;
+                for (std::uint32_t i = 0; i < 4u && !took_long; ++i) {
+                    const std::uint32_t r = nd.rep[i];
+                    if (!(cur <= r || Load16(base + cur - r - 1u) == Load16(base + cur))) continue;
+                    std::uint32_t src = cur - (r + 1u);
+                    if (cur < r + 1u) src += cap;
+                    if (src >= cap) continue;
+                    const std::uint32_t avail = std::min<std::uint32_t>(cap - src, remain);
+                    if (avail == 0u) continue;
+                    const std::uint32_t len = MatchFwd(base + cur, base + src, 0u, avail);
+                    if (len <= best || len == 1u) { best = std::max(best, len); continue; }
+                    best = len;
+                    std::uint32_t nr[4];
+                    for (int k = 0; k < 4; ++k) nr[k] = nd.rep[k];
+                    for (std::uint32_t k = i; k > 0u; --k) nr[k] = nr[k - 1u];
+                    nr[0] = r;
+                    if (len < 0x20u && ni + len < 0x120u) {
+                        if (ni + len > front) front = ni + len;
+                        const std::uint32_t sel = SelPrice(i);
+                        for (std::uint32_t L = len; L >= 2u; --L) {
+                            if (!Update(L, i, r + 1u, nr, nd.price + sel + LenPrice(L, i))) break;
+                            if (L > thrv) thrv = L;
+                        }
+                    } else {
+                        Node& tg = nodes[ni + 1u];
+                        if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
+                        tg.tag = static_cast<std::uint16_t>(chunk);
+                        tg.back = static_cast<std::uint16_t>(ni);
+                        tg.len = static_cast<std::uint16_t>(len);
+                        tg.sg = static_cast<std::uint8_t>(i + 1u);
+                        tg.dist = r + 1u;
+                        tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                        // a match taken in one step still carries the context word
+                        // forward, and it is the only thing the next flush starts from
+                        {
+                            const std::uint32_t sp2 = (cur >= r + 1u) ? (cur - (r + 1u)) : (cur + cap - (r + 1u));
+                            tg.ctx = static_cast<std::uint16_t>(At(base, sp2 + len) * 0x100u + At(base, cur + len - 1u));
+                        }
+                        for (int k = 0; k < 4; ++k) tg.rep[k] = nr[k];
+                        front = ni + 1u;
+                        took_long = true;
+                    }
+                }
+                if (took_long) { endnode = front; break; }
+
+                // ---- the bt4 finder. Its candidates are appended in increasing
+                // length; the relaxation walks the LENGTH downward and switches to
+                // the shortest candidate that still reaches it (the nearest distance
+                // for that length), which is why each candidate is not relaxed on
+                // its own. The threshold starts at 2, so a 2-byte brand-new distance
+                // is never taken.
+                std::vector<Cand>& cands = F.cands_buf;
+                cands.clear();
+                if (NZ_ENV("NZOPT_PROBES")) std::fprintf(stderr, "[PR] %u %u\n", cur - pos0, remain);
+                // NZOPT_PROBE_STATE=<n>: write the whole finder -- head, tree,
+                // 2-byte cache and the ring -- to <NZOPT_PROBE_STATE_OUT>.<name>
+                // just before the n-th Find call of the run, counting every
+                // instance (the block-kind sampler's parses included, which is
+                // how the numbering lines up with a breakpoint on the original's
+                // FUN_08073ca0). Diffing the four against the original localises
+                // a divergence to the state or to the walk.
+                if (const char* fs = NZ_ENV("NZOPT_PROBE_STATE")) {
+                    static int nstate = 0;
+                    ++nstate;
+                    const char* bycur = NZ_ENV("NZOPT_PROBE_STATE_CUR");
+                    static bool once = false;
+                    if (bycur ? (!once && cur == static_cast<std::uint32_t>(std::atoi(bycur)) && (once = true))
+                              : (nstate == std::atoi(fs) && F.winsize == 0x10000u)) {
+                        auto wr = [&](const char* nm, const void* q, std::size_t nb) {
+                            char path[256];
+                            std::snprintf(path, sizeof path, "%s.%s",
+                                          NZ_ENV("NZOPT_PROBE_STATE_OUT") ? NZ_ENV("NZOPT_PROBE_STATE_OUT") : "state", nm);
+                            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(q, 1, nb, f); std::fclose(f); }
+                        };
+                        wr("head", F.head.data(), F.head.size() * 4u);
+                        wr("tree", F.tree.data(), F.tree.size() * 4u);
+                        wr("cache", F.cache.data(), F.cache.size() * 4u);
+                        wr("ring", base, ring_.storage.size());
+                        wr("lr", F.lr.data(), F.lr.size() * 4u);
+                        std::fprintf(stderr, "[STATE] cur=%u lrhash=%u lrmask=%u dumped\n", cur, F.lrhash, F.lrmask);
+                    }
+                }
+                F.Find(base, cur, cend, remain, cands, 0x10u);
+                // NZOPT_PROBE_TREE=1: the tree's answer alone, before the
+                // long-range index appends its own -- the shape a breakpoint on
+                // the return of the original's FUN_08073ca0 prints.
+                if (NZ_ENV("NZOPT_PROBE_TREE")) {
+                    // '@' = the stream's own finder (64 KB window), '#' = the
+                    // block-kind sampler's throwaway one (1 MB) -- two objects,
+                    // two trees, one call counter
+                    std::fprintf(stderr, "%c%u", F.winsize == 0x10000u ? '@' : '#', cur);
+                    for (const Cand& cc : cands)
+                        std::fprintf(stderr, " %u/%u", cc.len,
+                                     (cur >= cc.src) ? (cur - cc.src) : (cur + cap - cc.src));
+                    std::fprintf(stderr, "\n");
+                }
+                // NZOPT_PROBE_AT=<offset in the block>: dump the finder's answer at
+                // exactly one position, for diffing a single divergence against the
+                // original without a trace of the whole parse. NZOPT_PROBE_AT=all
+                // dumps every position instead, as "@<ring position> cs=<the four
+                // 2-byte cache slots> <len>/<distance>...", which is the form a
+                // breakpoint on the original's FUN_08073ca0 can be made to print.
+                static const char* const probe_at = NZ_ENV("NZOPT_PROBE_AT");
+                if (probe_at != nullptr && probe_at[0] != 'a' &&
+                    (cur - pos0) == static_cast<std::uint32_t>(std::atoi(probe_at))) {
+                    std::fprintf(stderr, "[PROBE] off=%u remain=%u thr=%u n=%zu:",
+                                 cur - pos0, remain, thrv, cands.size());
+                    for (const Cand& cc : cands)
+                        std::fprintf(stderr, " {len=%u dist=%u}", cc.len,
+                                     (cur >= cc.src) ? (cur - cc.src) : (cur + cap - cc.src));
+                    std::fprintf(stderr, "\n");
+                }
+                if (trace) {
+                    std::fprintf(stderr, "[C] rem=%u ni=%u n=%zu:", chunk - emitted, ni, cands.size());
+                    for (const Cand& cc : cands) std::fprintf(stderr, " {src=%u len=%u}", cc.src - pos0, cc.len);
+                    std::fprintf(stderr, "\n");
+                }
+                // ---- the long-range matcher (0x08072099 and 0x08072cfe). The
+                // bt4 walk above is capped at 16 chain steps, so a far source is
+                // out of its reach however long the match would be; this second
+                // index answers exactly that case. One slot per 256-byte window
+                // position, keyed by a rolling hash of the next 256 bytes and
+                // tagged with that hash's top ten bits, written only at
+                // positions that are a multiple of 256. Its candidate is
+                // appended after the tree's, and only when it is longer than
+                // everything the tree found -- the list stays sorted by length,
+                // so cands.back() is still the top.
+                {
+                    const std::uint32_t bestf = cands.empty() ? 0u : cands.back().len;
+                    F.lrseen[cur & 4095u] = {cur + 1u, F.lrgen, F.lrhash};
+                    const std::uint32_t lidx = F.lrhash & F.lrmask;
+                    const std::uint32_t prev = F.lr[lidx];
+                    const std::uint32_t tag = F.lrhash & 0xffc00000u;
+                    if ((cur & 0xffu) == 0u) F.lr[lidx] = tag + (cur >> 8u);
+                    if ((prev & 0xffc00000u) == tag) {
+                        const std::uint32_t lsrc = (prev & 0x3fffffu) << 8u;
+                        // avail = min(winsize - src, remain), both unsigned and
+                        // left to wrap exactly as the sbb/and/add does
+                        const std::uint32_t w = F.winsize - lsrc;
+                        const std::uint32_t avail = (remain < w) ? remain : w;
+                        // the compare runs BEFORE the count is checked, so an
+                        // avail of zero still answers 1 on a matching byte
+                        std::uint32_t a = 0;
+                        for (;;) {
+                            if (base[lsrc + a] != base[cur + a]) break;
+                            ++a;
+                            if (avail <= a) break;
+                        }
+                        if (bestf < a) cands.push_back({a, lsrc});
+                    }
+                    F.lrhash = F.lrhash * 0x104070bu + base[cur + 0x100u] - LRO[base[cur]];
+                    // ...and the rolled value is position cur + 1's: a flush is
+                    // often one node long, so the next one starts right there.
+                    F.lrseen[(cur + 1u) & 4095u] = {cur + 2u, F.lrgen, F.lrhash};
+                    F.lrlast = {cur + 2u, F.lrgen, F.lrhash};
+                }
+                if (probe_at != nullptr && probe_at[0] == 'a') {
+                    const std::uint32_t w16 = static_cast<std::uint32_t>(base[cur]) |
+                                              (static_cast<std::uint32_t>(base[cur + 1u]) << 8u);
+                    const std::uint32_t* const csd = &F.cache[static_cast<std::size_t>(w16) * 4u];
+                    std::fprintf(stderr, "@%u cs=%u,%u,%u,%u", cur,
+                                 csd[0] & F.maskA, csd[1] & F.maskA, csd[2] & F.maskA, csd[3] & F.maskA);
+                    for (const Cand& cc : cands)
+                        std::fprintf(stderr, " %u/%u", cc.len,
+                                     (cur >= cc.src) ? (cur - cc.src) : (cur + cap - cc.src));
+                    std::fprintf(stderr, "\n");
+                }
+                if (probe_at != nullptr && probe_at[0] != 'a' &&
+                    (cur - pos0) == static_cast<std::uint32_t>(std::atoi(probe_at))) {
+                    std::fprintf(stderr, "[PROBE+LR] n=%zu top={len=%u dist=%u}\n", cands.size(),
+                                 cands.empty() ? 0u : cands.back().len,
+                                 cands.empty() ? 0u : ((cur >= cands.back().src) ? (cur - cands.back().src)
+                                                                                 : (cur + cap - cands.back().src)));
+                }
+                const std::uint32_t thr = thrv;
+                if (!cands.empty() && cands.back().len > thr) {
+                    const std::uint32_t toplen = cands.back().len;
+                    const std::uint32_t topdist = (cur >= cands.back().src)
+                        ? (cur - cands.back().src) : (cur + cap - cands.back().src);
+                    if (topdist != 0u && topdist <= cap) {
+                        if (toplen >= 0x20u || ni + toplen >= 0x120u) {
+                            Node& tg = nodes[ni + 1u];
+                            if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
+                            tg.tag = static_cast<std::uint16_t>(chunk);
+                            tg.back = static_cast<std::uint16_t>(ni);
+                            tg.len = static_cast<std::uint16_t>(toplen);
+                            tg.sg = 0u;
+                            tg.dist = topdist;
+                            tg.hist = static_cast<std::uint8_t>(nd.hist * 2u);
+                            {
+                                const std::uint32_t sp2 = (cur >= topdist) ? (cur - topdist) : (cur + cap - topdist);
+                                tg.ctx = static_cast<std::uint16_t>(At(base, sp2 + toplen) * 0x100u + At(base, cur + toplen - 1u));
+                            }
+                            tg.rep[0] = topdist - 1u; tg.rep[1] = nd.rep[0];
+                            tg.rep[2] = nd.rep[1]; tg.rep[3] = nd.rep[2];
+                            front = ni + 1u;
+                            took_long = true;
+                        } else {
+                            if (ni + toplen > front) front = ni + toplen;
+                            const std::uint32_t sel = SelPrice(4u);
+                            // The whole length walk is skipped when the node the top
+                            // length reaches is already within twice the rep-select
+                            // price of this one: nothing shorter could improve on it.
+                            // The frontier and the rep-select cache are still updated,
+                            // but no distance is priced -- which is how the original's
+                            // distance-class cache stays empty where ours filled it.
+                            {
+                                const Node& tgt = nodes[ni + toplen];
+                                if (tgt.tag == static_cast<std::uint16_t>(chunk) &&
+                                    tgt.price <= nd.price + sel * 2u) goto walk_done;
+                            }
+                            if (trace) std::fprintf(stderr, "[W] rem=%u ni=%u best=%u thr=%u toplen=%u sel=%u\n",
+                                                    chunk - emitted, ni, best, thr, toplen, sel);
+                            // walk the length down, switching to the shortest
+                            // candidate that still reaches it (the nearest distance
+                            // for that length)
+                            std::size_t ci = cands.size() - 1u;
+                            std::uint32_t dprice = 0, lastsrc = 0xffffffffu;
+                            for (std::uint32_t L = toplen; L > thr; --L) {
+                                while (ci > 0u && L <= cands[ci - 1u].len) --ci;
+                                const Cand& c = cands[ci];
+                                const std::uint32_t dist = (cur >= c.src) ? (cur - c.src) : (cur + cap - c.src);
+                                if (dist == 0u || dist > cap) break;
+                                if (c.src != lastsrc) { dprice = PriceDistance(mem, T, D4D0, dist - 1u, L, true); lastsrc = c.src; }
+                                const std::uint32_t bp = nd.price + sel + dprice;
+                                const Node& tgc = nodes[ni + L];
+                                if (tgc.tag == static_cast<std::uint16_t>(chunk) && (dprice >> 3u) + bp >= tgc.price) {
+                                    if (trace) std::fprintf(stderr, "[B] rem=%u ni=%u L=%u dist=%u dp=%u bp=%u tgp=%u\n",
+                                                            chunk - emitted, ni, L, dist, dprice, bp, (unsigned)tgc.price);
+                                    break;
+                                }
+                                const std::uint32_t nr[4] = {dist - 1u, nd.rep[0], nd.rep[1], nd.rep[2]};
+                                const std::uint32_t px = bp + LenPrice(L, 4u);
+                                const bool okup = Update(L, 4u, dist, nr, px);
+                                if (trace) std::fprintf(stderr, "[W]   L=%u dist=%u sel=%u dp=%u px=%u -> %d\n", L, dist, sel, dprice, px, (int)okup);
+                                if (!okup) break;
+                            }
+                        }
+                    }
+                }
+                walk_done:
+                if (took_long) { endnode = front; break; }
+
+                // ---- the literal
+                {
+                    Node& tg = nodes[ni + 1u];
+                    if (ni + 1u > dirty_hi) dirty_hi = ni + 1u;
+                    const bool tagged = (tg.tag == static_cast<std::uint16_t>(chunk));
+                    // Before pricing anything the original looks six nodes ahead:
+                    // if any of them is already at most three units plus twice the
+                    // literal dispatch bit above this node, the literal cannot
+                    // matter and it is skipped outright.
+                    if (tagged) {
+                        std::uint32_t m = tg.price;
+                        for (std::uint32_t k = 2u; k <= 6u; ++k) {
+                            const Node& q = nodes[ni + k];
+                            if (q.tag == static_cast<std::uint16_t>(chunk) && q.price < m) m = q.price;
+                        }
+                        if (m <= nd.price + 3u + dlit * 2u) goto lit_done;
+                    }
+                    {
+                    const std::uint8_t lit = base[cur];
+                    const std::size_t lci = static_cast<std::size_t>(nd.ctx & 0xffu) * 0x100u + lit;
+                    std::uint32_t lp;
+                    const std::uint8_t lc = Rd8(mem, 0x296a0 + lci);
+                    if (lc == 0xffu) {
+                        lp = PriceLiteral(mem, T, nd.ctx, nd.hist, lit, mm, predB, am2, remain);
+                        const std::uint32_t d = lp;
+                        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>((d < 0xfeu) ? d : 0xfeu));
+                        lp += dlit;
+                    } else {
+                        lp = lc + dlit;
+                    }
+                    const std::uint32_t price = nd.price + lp;
+                    // A literal does not have to be CHEAPER to take the node: the
+                    // original keeps it when it lands within three units plus a
+                    // sixteenth of its own price, and pays for that by decaying the
+                    // cached literal price it just used.
+                    bool wr = !tagged;
+                    if (tagged && price <= tg.price + 3u + (lp >> 4u)) {
+                        const std::uint8_t cv = Rd8(mem, 0x296a0 + lci);
+                        Wr8(mem, 0x296a0 + lci, static_cast<std::uint8_t>(cv - (cv >> 5u)));
+                        wr = true;
+                    }
+                    if (wr) {
+                        tg.tag = static_cast<std::uint16_t>(chunk);
+                        tg.price = static_cast<std::uint16_t>(price);
+                        tg.back = static_cast<std::uint16_t>(ni);
+                        tg.len = 1u;
+                        tg.sg = 0xffu;    // literal
+                        tg.dist = 0u;
+                        tg.hist = static_cast<std::uint8_t>(nd.hist * 2u + 1u);
+                        tg.ctx = static_cast<std::uint16_t>(nd.ctx * 0x100u + lit);
+                        for (int k = 0; k < 4; ++k) tg.rep[k] = nd.rep[k];
+                        if (ni + 1u > front) front = ni + 1u;
+                    }
+                    }
+                }
+                lit_done:
+
+                // ---- advance
+                const std::uint32_t nx = ni + 1u;
+                if (nx == 0x100u) { endnode = front; break; }
+                if (front == nx || remain0 <= nx) { endnode = front; break; }
+                if (nodes[nx].price > 0xefffu) { endnode = front; break; }
+                ni = nx;
+            }
+            (void)flushed;
+            if (endnode == 0u) endnode = 1u;
+            nodes_dirty = std::min<std::uint32_t>(dirty_hi + 1u, kNodes);
+            if (const char* dc = NZ_ENV("NZOPT_DCLS")) {
+                static std::uint16_t last = 0xffffu;
+                const std::uint16_t v = Rd16(mem, 0x3d848u + static_cast<std::size_t>(std::atoi(dc)) * 2u);
+                if (v != last) { std::fprintf(stderr, "[DC] rem=%u cls=%u\n", chunk - emitted, v); last = v; }
+            }
+            if (NZ_ENV("NZOPT_FSUM")) {
+                auto hsh = [](const std::uint32_t* w, std::size_t n) {
+                    std::uint32_t h = 0x811c9dc5u;
+                    for (std::size_t k = 0; k < n; ++k) h = (h * 0x01000193u) ^ w[k];
+                    return h;
+                };
+                std::fprintf(stderr, "rem=%u H=%08x C=%08x\n", chunk - emitted,
+                             hsh(F.head.data(), F.head.size()),
+                             hsh(F.cache.data(), F.cache.size()));
+            }
+            if (const char* fd = NZ_ENV("NZOPT_DUMPFIND")) {
+                if ((chunk - emitted) == static_cast<std::uint32_t>(std::atoi(fd))) {
+                    const char* dir = NZ_ENV("NZOPT_DUMPDIR");
+                    std::string b = dir ? dir : "/tmp";
+                    auto wr = [&](const char* nm, const void* p2, std::size_t n) {
+                        std::FILE* f = std::fopen((b + "/mine." + nm).c_str(), "wb");
+                        if (f) { std::fwrite(p2, 1, n, f); std::fclose(f); }
+                    };
+                    wr("state", mem, mem_.size());
+                    wr("head", F.head.data(), F.head.size() * 4u);
+                    wr("cache", F.cache.data(), F.cache.size() * 4u);
+                    wr("tree", F.tree.data(), F.tree.size() * 4u);
+                    std::FILE* f = std::fopen((b + "/mine.meta").c_str(), "w");
+                    if (f) { std::fprintf(f, "shift=%u maskA=%#x headmask=%#x treemask=%#x treesize=%u pos0=%u cur0=%u\n",
+                                          F.shift, F.maskA, F.headmask, F.treemask, F.treesize, pos0, pos0 + emitted); std::fclose(f); }
+                }
+            }
+            const char* nodesenv = NZ_ENV("NZOPT_NODES");
+            if (nodesenv != nullptr && (chunk - emitted) == static_cast<std::uint32_t>(std::atoi(nodesenv))) {
+                std::fprintf(stderr, "[N] FLUSH front=%u end=%u rem=%u\n", front, endnode, chunk - emitted);
+                {
+                    std::string dc, lc2, rs;
+                    char b[64];
+                    for (int k = 0; k < 0x80; ++k) { std::uint16_t v = Rd16(mem, 0x3d848 + k*2); if (v) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); dc += b; } }
+                    for (int k = 0; k < 0x40; ++k) { std::uint8_t v = Rd8(mem, 0x39c08 + k); if (v) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); lc2 += b; } }
+                    for (int k = 0; k < 0x180; ++k) { std::uint8_t v = Rd8(mem, 0x3e200 + k); if (v != 0xff) { std::snprintf(b,sizeof b,"(%d,%u)",k,v); rs += b; } }
+                    std::fprintf(stderr, "[N] distcache=%s\n[N] lencache=%s\n[N] repsel=%s\n", dc.c_str(), lc2.c_str(), rs.c_str());
+                }
+                for (std::uint32_t k = 0; k < 48u; ++k) {
+                    const Node& n = nodes[k];
+                    if (n.tag == static_cast<std::uint16_t>(chunk) || k == 0u)
+                        std::fprintf(stderr, "[N]   node[%u] price=%u back=%u len=%u ctx=%04x hist=%02x sg=%u dist=%u rep=%u,%u,%u,%u\n",
+                                     k, n.price, n.back, n.len, n.ctx, n.hist, n.sg, n.dist, n.rep[0], n.rep[1], n.rep[2], n.rep[3]);
+                }
+            }
+
+            // ---- backtrack and emit
+            std::vector<std::uint32_t>& chain = F.chain_buf;
+            chain.clear();
+            for (std::uint32_t k = endnode; k != 0u; k = nodes[k].back) chain.push_back(k);
+            std::reverse(chain.begin(), chain.end());
+            std::uint32_t adv = 0;
+            for (std::uint32_t k : chain) {
+                const Node& n = nodes[k];
+                OptimumDecision d{};
+                if (n.sg == 0xffu) {
+                    d.is_literal = 1u;
+                    d.byte = base[pos0 + emitted + adv];
+                    adv += 1u;
+                } else {
+                    d.is_literal = 0u;
+                    d.sg = n.sg;
+                    d.len = n.len;
+                    d.dist = n.dist;
+                    adv += n.len;
+                }
+                out.push_back(d);
+                hist0 = n.hist;
+                ctx0 = n.ctx;
+                for (int j = 0; j < 4; ++j) rep0[j] = n.rep[j];
+            }
+            if (adv == 0u) return false;
+            if (trace) std::fprintf(stderr, "[PARSE] emitted=%u adv=%u chain=%zu end=%u\n", emitted, adv, chain.size(), endnode);
+            // The bytes a chosen match consumed are NOT fed to the finder. Its
+            // bulk insert only runs when data enters the window, and for a block
+            // handed over whole it never runs at all -- so a position swallowed by
+            // a long match is never inserted, and no later match can start there.
+            // Feeding them here made the hash head hold positions the original
+            // never sees, and the finder then answered with nearer sources.
+            F.consumed = emitted + adv;
+            if (F.consumed > chunk) return false;
+        }
+    }
+    return true;
+}
+
+// The frozen-model reference: parse a whole block without letting the coder
+// advance the models in between. Kept for comparison; the real encoder uses
+// EncodeBlockParsed, which interleaves the two the way the original does.
+bool NzOptimumLzDecoder::ParseBlock(const std::uint8_t* data, std::uint32_t size,
+                                    std::vector<OptimumDecision>& out) {
+    if (size == 0u) return true;
+    if (size > 0x8000u) return false;   // one chunk at a time for now
+    BeginParse(data, size);
+    while (parser_->consumed < size) {
+        if (!ParseNextFlush(out)) return false;
+    }
+    ring_.cursor = parser_->pos0 + size;
+    return true;
+}
+
+}  // namespace optimum
+}  // namespace nzr

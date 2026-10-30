@@ -1,0 +1,16452 @@
+#include "nz_zeroed.h"
+#include "nz_env.h"
+#include "nz_trace.h"
+#include "nz_decode_error.h"
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+#include "nz_sfx/sfx_archive.hpp"
+#include "lzpf_arith.h"
+#include "nz_cm.h"
+#include "nz_cd_tokens.h"
+#include "nz_lzhds.h"
+#include "nz_optimum_lz.h"
+#include "nz_optimum_text.h"
+#include "nz_optimum_seg.h"
+#include "nz_optimum_param1.h"
+#include "nz_optimum2_lz.h"
+#include "nz_text_transform.h"
+#include "nz_postfilter.h"
+#include "nz_bwt.h"
+#include "nz_calloc_vec.h"
+#include "nz_audio.h"
+#include <atomic>
+#include <exception>
+#include <condition_variable>
+#include <cerrno>
+#include <cpuid.h>
+#include <memory>
+#include <mutex>
+#include <type_traits>
+#include <thread>
+#include <iterator>
+#include "nz_exefilter.h"
+#include "nz_texttransform_num.h"
+#include "nz_lzpf_encoder.h"
+#include "nz_lzhd_encoder.h"
+
+#include <algorithm>
+#include <array>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+#include <set>
+#include <chrono>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <ios>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <sstream>
+#include "nz_selfcheck.h"
+#include "nz_lzhd_text.h"
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <unordered_set>
+#include <vector>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>   // SetFileAttributes for the attribute records (type 3)
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/wait.h>
+#include <unistd.h>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <utime.h>
+#endif
+#endif
+
+namespace nz {
+namespace recon {
+
+namespace fs = std::filesystem;
+
+namespace {
+
+constexpr std::array<unsigned char, 2> kMagicPrefix = {0xae, 0x01};
+constexpr const char* kKnownSignaturePrefix = "NanoZip ";
+constexpr const char* kKnownSignature = "NanoZip 0.09 alpha";
+constexpr std::size_t kKnownSignatureBytes = 18;
+constexpr unsigned kSupportedMajor = 0;
+constexpr unsigned kSupportedMinor = 9;
+
+constexpr std::array<char, 4> kReconMarker = {'N', 'Z', 'R', '1'};
+constexpr std::uint8_t kReconFormatMajor = 1;
+constexpr std::uint8_t kReconFormatMinor = 0;
+
+constexpr std::uint8_t kFlagHasTimestamps = 1u << 0;
+constexpr std::uint8_t kFlagHasPermissions = 1u << 1;
+
+constexpr std::size_t kBufferSize = 1u << 20;
+
+struct SourceFile {
+    fs::path source_path;
+    std::string archive_name;
+    std::uint64_t size = 0;
+    std::uint32_t permissions = 0644;
+    std::int64_t mtime_unix = 0;
+    std::uint32_t checksum = 0;
+};
+
+bool ParseVersionFromSignature(const std::string& signature, unsigned* major, unsigned* minor) {
+    if (major == nullptr || minor == nullptr) {
+        return false;
+    }
+    if (signature.rfind(kKnownSignaturePrefix, 0) != 0) {
+        return false;
+    }
+
+    const std::size_t start = std::char_traits<char>::length(kKnownSignaturePrefix);
+    std::size_t i = start;
+    if (i >= signature.size() || !std::isdigit(static_cast<unsigned char>(signature[i]))) {
+        return false;
+    }
+
+    unsigned maj = 0;
+    while (i < signature.size() && std::isdigit(static_cast<unsigned char>(signature[i]))) {
+        maj = (maj * 10u) + static_cast<unsigned>(signature[i] - '0');
+        ++i;
+    }
+
+    if (i >= signature.size() || signature[i] != '.') {
+        return false;
+    }
+    ++i;
+
+    if (i >= signature.size() || !std::isdigit(static_cast<unsigned char>(signature[i]))) {
+        return false;
+    }
+
+    unsigned min = 0;
+    while (i < signature.size() && std::isdigit(static_cast<unsigned char>(signature[i]))) {
+        min = (min * 10u) + static_cast<unsigned>(signature[i] - '0');
+        ++i;
+    }
+
+    *major = maj;
+    *minor = min;
+    return true;
+}
+
+template <typename T>
+void WriteLE(std::ostream& out, T value) {
+    using U = std::make_unsigned_t<T>;
+    U v = static_cast<U>(value);
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        const unsigned char b = static_cast<unsigned char>((v >> (i * 8u)) & static_cast<U>(0xffu));
+        out.put(static_cast<char>(b));
+    }
+}
+
+template <typename T>
+bool ReadLE(std::istream& in, T* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    using U = std::make_unsigned_t<T>;
+    U v = 0;
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        const int ch = in.get();
+        if (ch == EOF) {
+            return false;
+        }
+        v |= (static_cast<U>(static_cast<unsigned char>(ch)) << (i * 8u));
+    }
+    *out = static_cast<T>(v);
+    return true;
+}
+
+std::uint32_t UpdateCrc32(std::uint32_t crc, const unsigned char* data, std::size_t size) {
+    static std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < t.size(); ++i) {
+            std::uint32_t x = i;
+            for (unsigned bit = 0; bit < 8; ++bit) {
+                const bool one = (x & 1u) != 0;
+                x >>= 1u;
+                if (one) {
+                    x ^= 0xedb88320u;
+                }
+            }
+            t[i] = x;
+        }
+        return t;
+    }();
+
+    std::uint32_t x = crc;
+    for (std::size_t i = 0; i < size; ++i) {
+        x = (x >> 8u) ^ table[(x ^ data[i]) & 0xffu];
+    }
+    return x;
+}
+
+std::uint32_t UpdateCrc16(std::uint32_t crc, const unsigned char* data, std::size_t size) {
+    std::uint32_t x = crc;
+    for (std::size_t i = 0; i < size; ++i) {
+        x ^= static_cast<std::uint32_t>(data[i]);
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            if ((x & 1u) != 0u) {
+                x = (x >> 1u) ^ 0xa001u;
+            } else {
+                x >>= 1u;
+            }
+        }
+    }
+    return x & 0xffffu;
+}
+
+void UpdateFletcher16(std::uint32_t* s1, std::uint32_t* s2, const unsigned char* data, std::size_t size) {
+    if (s1 == nullptr || s2 == nullptr) {
+        return;
+    }
+    // Deferred modulo: the per-byte `% 255` was 14 % of a 2.29 GB decode (perf,
+    // 2026-09-03). Reducing once per block is exact -- every intermediate a_i is
+    // congruent to its reduced value, so the sum of the unreduced a_i is too.
+    // With 64-bit accumulators a block of 65536 bytes cannot overflow.
+    std::uint64_t a = *s1;
+    std::uint64_t b = *s2;
+    std::size_t i = 0;
+    while (i < size) {
+        const std::size_t end = std::min(size, i + 65536u);
+        for (; i < end; ++i) {
+            a += data[i];
+            b += a;
+        }
+        a %= 255u;
+        b %= 255u;
+    }
+    *s1 = static_cast<std::uint32_t>(a);
+    *s2 = static_cast<std::uint32_t>(b);
+}
+
+void Fletcher32Step(std::uint32_t* s1, std::uint32_t* s2, std::uint32_t word) {
+    if (s1 == nullptr || s2 == nullptr) {
+        return;
+    }
+    std::uint32_t a = *s1;
+    std::uint32_t b = *s2;
+    a = (a + (word & 0xffffu)) % 0xffffu;
+    b = (b + a) % 0xffffu;
+    *s1 = a;
+    *s2 = b;
+}
+
+void UpdateFletcher32(
+    std::uint32_t* s1,
+    std::uint32_t* s2,
+    std::uint8_t* pending_lo_byte,
+    bool* has_pending_lo_byte,
+    const unsigned char* data,
+    std::size_t size) {
+    if (s1 == nullptr || s2 == nullptr || pending_lo_byte == nullptr || has_pending_lo_byte == nullptr) {
+        return;
+    }
+
+    std::size_t i = 0;
+    if (*has_pending_lo_byte) {
+        if (size > 0) {
+            const std::uint32_t w =
+                static_cast<std::uint32_t>(*pending_lo_byte) |
+                (static_cast<std::uint32_t>(data[0]) << 8u);
+            Fletcher32Step(s1, s2, w);
+            *has_pending_lo_byte = false;
+            *pending_lo_byte = 0;
+            i = 1;
+        } else {
+            return;
+        }
+    }
+
+    // Deferred modulo (see UpdateFletcher16): words are < 65536, so with 64-bit
+    // accumulators a block of 2^20 words cannot overflow.
+    {
+        std::uint64_t a = *s1, b = *s2;
+#if defined(__SSE2__)
+        // Blocks of up to 256 x 8 words with SSE2, the Adler-32 way: per lane l the
+        // sum S_l of its words and the running total A_l of those sums after each
+        // 16 bytes. Over N = 8K words, a += sum(S) and b += N*a + sum((N-i)*w_i)
+        // = N*a + 8*sum(A) - sum(l*S_l). Same residues mod 65535, so the same
+        // checksum; the lanes stay in 32 bits (A_l <= 256*257/2 * 65535).
+        while (size - i >= 16u) {
+            const std::size_t k = std::min<std::size_t>((size - i) / 16u, 256u);
+            const __m128i z = _mm_setzero_si128();
+            __m128i sl = z, sh = z, al = z, ah = z;
+            const unsigned char* q = data + i;
+            for (std::size_t j = 0; j < k; ++j, q += 16) {
+                const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
+                sl = _mm_add_epi32(sl, _mm_unpacklo_epi16(x, z));
+                sh = _mm_add_epi32(sh, _mm_unpackhi_epi16(x, z));
+                al = _mm_add_epi32(al, sl);
+                ah = _mm_add_epi32(ah, sh);
+            }
+            alignas(16) std::uint32_t vs[8], va[8];
+            _mm_store_si128(reinterpret_cast<__m128i*>(vs), sl); _mm_store_si128(reinterpret_cast<__m128i*>(vs + 4), sh);
+            _mm_store_si128(reinterpret_cast<__m128i*>(va), al); _mm_store_si128(reinterpret_cast<__m128i*>(va + 4), ah);
+            std::uint64_t sum = 0, acc = 0, weighted = 0;
+            for (unsigned l = 0; l < 8u; ++l) { sum += vs[l]; acc += va[l]; weighted += static_cast<std::uint64_t>(l) * vs[l]; }
+            b += static_cast<std::uint64_t>(8u * k) * a + 8u * acc - weighted;
+            a += sum;
+            a %= 0xffffu;
+            b %= 0xffffu;
+            i += 16u * k;
+        }
+#endif
+        while (i + 1 < size) {
+            const std::size_t end = std::min(size - 1, i + (std::size_t{1} << 21));
+            for (; i + 1 < end + 1 && i + 1 < size; i += 2u) {
+                a += static_cast<std::uint32_t>(data[i]) | (static_cast<std::uint32_t>(data[i + 1u]) << 8u);
+                b += a;
+            }
+            a %= 0xffffu;
+            b %= 0xffffu;
+        }
+        *s1 = static_cast<std::uint32_t>(a);
+        *s2 = static_cast<std::uint32_t>(b);
+    }
+
+    if (i < size) {
+        *pending_lo_byte = data[i];
+        *has_pending_lo_byte = true;
+    }
+}
+
+std::uint32_t FinalizeFletcher32(
+    std::uint32_t s1,
+    std::uint32_t s2,
+    std::uint8_t pending_lo_byte,
+    bool has_pending_lo_byte) {
+    if (has_pending_lo_byte) {
+        const std::uint32_t w = static_cast<std::uint32_t>(pending_lo_byte);
+        s1 = (s1 + (w & 0xffffu)) % 0xffffu;
+        s2 = (s2 + s1) % 0xffffu;
+    }
+    if (s1 == 0u) {
+        s1 = 0xffffu;
+    }
+    if (s2 == 0u) {
+        s2 = 0xffffu;
+    }
+    return ((s1 & 0xffffu) << 16u) | (s2 & 0xffffu);
+}
+
+// A checksum computed over bytes that arrive in pieces. The primitives above
+// are all incremental already; this only carries their state so a slice can be
+// verified while it streams to disk instead of after its whole buffer exists.
+// Feeding it one buffer in one Update gives exactly ComputeBufferChecksum.
+struct ChecksumStream {
+    ChecksumMode mode = ChecksumMode::kNone;
+    std::uint32_t c16 = 0xffffu;
+    std::uint32_t c32 = 0xffffffffu;
+    std::uint32_t f1 = 0, f2 = 0;
+    std::uint8_t f32_pending = 0;
+    bool f32_has_pending = false;
+    void Reset(ChecksumMode m) { *this = ChecksumStream(); mode = m; }
+    void Update(const unsigned char* data, std::size_t n) {
+        if (n == 0u) return;
+        switch (mode) {
+            case ChecksumMode::kCrc16: c16 = UpdateCrc16(c16, data, n); break;
+            case ChecksumMode::kCrc32: c32 = UpdateCrc32(c32, data, n); break;
+            case ChecksumMode::kFletcher16: UpdateFletcher16(&f1, &f2, data, n); break;
+            case ChecksumMode::kFletcher32: UpdateFletcher32(&f1, &f2, &f32_pending, &f32_has_pending, data, n); break;
+            case ChecksumMode::kNone: break;
+        }
+    }
+    std::uint32_t Finish() const {
+        switch (mode) {
+            case ChecksumMode::kNone: return 0u;
+            case ChecksumMode::kCrc16: return (c16 ^ 0xffffu) & 0xffffu;
+            case ChecksumMode::kCrc32: return c32 ^ 0xffffffffu;
+            case ChecksumMode::kFletcher16: return ((f2 & 0xffu) << 8u) | (f1 & 0xffu);
+            case ChecksumMode::kFletcher32: return FinalizeFletcher32(f1, f2, f32_pending, f32_has_pending);
+        }
+        return 0u;
+    }
+};
+
+bool ComputeFileChecksum(const fs::path& path, ChecksumMode mode, std::uint32_t* out_checksum) {
+    if (out_checksum == nullptr) {
+        return false;
+    }
+    if (mode == ChecksumMode::kNone) {
+        *out_checksum = 0;
+        return true;
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    std::vector<unsigned char> buffer(kBufferSize);
+    std::uint32_t c16 = 0xffffu;
+    std::uint32_t c32 = 0xffffffffu;
+    std::uint32_t f1 = 0;
+    std::uint32_t f2 = 0;
+    std::uint8_t f32_pending = 0;
+    bool f32_has_pending = false;
+
+    while (input) {
+        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize got = input.gcount();
+        if (got <= 0) {
+            break;
+        }
+        const std::size_t n = static_cast<std::size_t>(got);
+
+        switch (mode) {
+            case ChecksumMode::kCrc16:
+                c16 = UpdateCrc16(c16, buffer.data(), n);
+                break;
+            case ChecksumMode::kCrc32:
+                c32 = UpdateCrc32(c32, buffer.data(), n);
+                break;
+            case ChecksumMode::kFletcher16:
+                UpdateFletcher16(&f1, &f2, buffer.data(), n);
+                break;
+            case ChecksumMode::kFletcher32:
+                UpdateFletcher32(&f1, &f2, &f32_pending, &f32_has_pending, buffer.data(), n);
+                break;
+            case ChecksumMode::kNone:
+                break;
+        }
+    }
+
+    if (input.bad()) {
+        return false;
+    }
+
+    switch (mode) {
+        case ChecksumMode::kNone:
+            *out_checksum = 0;
+            break;
+        case ChecksumMode::kCrc16:
+            *out_checksum = (c16 ^ 0xffffu) & 0xffffu;
+            break;
+        case ChecksumMode::kCrc32:
+            *out_checksum = c32 ^ 0xffffffffu;
+            break;
+        case ChecksumMode::kFletcher16:
+            *out_checksum = ((f2 & 0xffu) << 8u) | (f1 & 0xffu);
+            break;
+        case ChecksumMode::kFletcher32:
+            *out_checksum = FinalizeFletcher32(f1, f2, f32_pending, f32_has_pending);
+            break;
+    }
+    return true;
+}
+
+bool WildcardMatch(const std::string& pattern, const std::string& text) {
+    const std::size_t p_len = pattern.size();
+    const std::size_t t_len = text.size();
+    std::vector<int> memo((p_len + 1u) * (t_len + 1u), -1);
+
+    const auto idx = [t_len](std::size_t p, std::size_t t) {
+        return p * (t_len + 1u) + t;
+    };
+
+    std::function<bool(std::size_t, std::size_t)> rec = [&](std::size_t p, std::size_t t) -> bool {
+        int& slot = memo[idx(p, t)];
+        if (slot != -1) {
+            return slot != 0;
+        }
+
+        bool ok = false;
+        if (p == p_len) {
+            ok = (t == t_len);
+        } else if (pattern[p] == '*') {
+            ok = rec(p + 1u, t) || (t < t_len && rec(p, t + 1u));
+        } else if (pattern[p] == '?') {
+            ok = (t < t_len) && rec(p + 1u, t + 1u);
+        } else if (pattern[p] == '[') {
+            // A CHARACTER CLASS, the way the original's scan reads it (measured
+            // against it): `[abc]` and `[a-c]`, negated by a leading `!` or `^`,
+            // case-sensitive, and a class that is never closed matches NOTHING
+            // -- `a x.nz 'f[.txt'` answers "No files found" there. A `]` outside
+            // a class is an ordinary character. This port matched the brackets
+            // literally, so a file whose NAME contains them was compressed where
+            // the original finds nothing, and a real class matched nothing where
+            // the original expands it.
+            std::size_t q = p + 1u;
+            bool neg = false;
+            if (q < p_len && (pattern[q] == '!' || pattern[q] == '^')) { neg = true; ++q; }
+            bool hit = false, closed = false;
+            for (; q < p_len; ++q) {
+                if (pattern[q] == ']') { closed = true; break; }
+                if (q + 2u < p_len && pattern[q + 1u] == '-' && pattern[q + 2u] != ']') {
+                    if (t < t_len && (unsigned char)pattern[q] <= (unsigned char)text[t] &&
+                        (unsigned char)text[t] <= (unsigned char)pattern[q + 2u]) hit = true;
+                    q += 2u;
+                } else if (t < t_len && pattern[q] == text[t]) {
+                    hit = true;
+                }
+            }
+            ok = closed && t < t_len && (hit != neg) && rec(q + 1u, t + 1u);
+        } else {
+            ok = (t < t_len && pattern[p] == text[t]) && rec(p + 1u, t + 1u);
+        }
+
+        slot = ok ? 1 : 0;
+        return ok;
+    };
+
+    return rec(0, 0);
+}
+
+bool MatchesAnyPattern(const std::string& name, const std::vector<std::string>& patterns) {
+    if (patterns.empty()) {
+        return true;
+    }
+    for (const std::string& pat : patterns) {
+        if (WildcardMatch(pat, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsExcluded(const std::string& name, const std::vector<std::string>& exclude_patterns) {
+    for (const std::string& pat : exclude_patterns) {
+        if (WildcardMatch(pat, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string NormalizeArchiveName(const fs::path& source, bool strip_paths) {
+    if (strip_paths) {
+        return source.filename().generic_string();
+    }
+
+    std::error_code ec;
+    fs::path rel = source;
+    const fs::path cwd = fs::current_path(ec);
+    if (!ec) {
+        fs::path tentative = fs::relative(source, cwd, ec);
+        if (!ec && !tentative.empty()) {
+            rel = tentative;
+        }
+    }
+
+    fs::path clean;
+    for (const auto& part : rel) {
+        const std::string piece = part.generic_string();
+        if (piece.empty() || piece == "." || piece == "..") {
+            continue;
+        }
+        clean /= part;
+    }
+
+    if (clean.empty()) {
+        clean = source.filename();
+    }
+
+    std::string out = clean.generic_string();
+    if (out.empty()) {
+        out = source.filename().generic_string();
+    }
+    return out;
+}
+
+std::uint32_t PermissionsToMode(fs::perms p) {
+    std::uint32_t mode = 0;
+    if ((p & fs::perms::owner_read) != fs::perms::none) {
+        mode |= 0400u;
+    }
+    if ((p & fs::perms::owner_write) != fs::perms::none) {
+        mode |= 0200u;
+    }
+    if ((p & fs::perms::owner_exec) != fs::perms::none) {
+        mode |= 0100u;
+    }
+    if ((p & fs::perms::group_read) != fs::perms::none) {
+        mode |= 0040u;
+    }
+    if ((p & fs::perms::group_write) != fs::perms::none) {
+        mode |= 0020u;
+    }
+    if ((p & fs::perms::group_exec) != fs::perms::none) {
+        mode |= 0010u;
+    }
+    if ((p & fs::perms::others_read) != fs::perms::none) {
+        mode |= 0004u;
+    }
+    if ((p & fs::perms::others_write) != fs::perms::none) {
+        mode |= 0002u;
+    }
+    if ((p & fs::perms::others_exec) != fs::perms::none) {
+        mode |= 0001u;
+    }
+    return mode;
+}
+
+fs::perms ModeToPermissions(std::uint32_t mode) {
+    fs::perms p = fs::perms::none;
+    if ((mode & 0400u) != 0u) {
+        p |= fs::perms::owner_read;
+    }
+    if ((mode & 0200u) != 0u) {
+        p |= fs::perms::owner_write;
+    }
+    if ((mode & 0100u) != 0u) {
+        p |= fs::perms::owner_exec;
+    }
+    if ((mode & 0040u) != 0u) {
+        p |= fs::perms::group_read;
+    }
+    if ((mode & 0020u) != 0u) {
+        p |= fs::perms::group_write;
+    }
+    if ((mode & 0010u) != 0u) {
+        p |= fs::perms::group_exec;
+    }
+    if ((mode & 0004u) != 0u) {
+        p |= fs::perms::others_read;
+    }
+    if ((mode & 0002u) != 0u) {
+        p |= fs::perms::others_write;
+    }
+    if ((mode & 0001u) != 0u) {
+        p |= fs::perms::others_exec;
+    }
+    return p;
+}
+
+std::int64_t FileTimeToUnix(const fs::file_time_type& t) {
+    namespace ch = std::chrono;
+    const auto now_ft = fs::file_time_type::clock::now();
+    const auto now_sys = ch::system_clock::now();
+    const auto sys_tp = ch::time_point_cast<ch::system_clock::duration>(t - now_ft + now_sys);
+    return ch::duration_cast<ch::seconds>(sys_tp.time_since_epoch()).count();
+}
+
+fs::file_time_type UnixToFileTime(std::int64_t unix_seconds) {
+    namespace ch = std::chrono;
+    const auto sys_tp = ch::system_clock::time_point{} + ch::seconds(unix_seconds);
+    const auto now_ft = fs::file_time_type::clock::now();
+    const auto now_sys = ch::system_clock::now();
+    return ch::time_point_cast<fs::file_time_type::duration>(sys_tp - now_sys + now_ft);
+}
+
+// Create an extracted file exactly the way the original does: a single
+// open(O_WRONLY|O_CREAT|O_TRUNC) whose mode argument is the mode stored in the
+// archive, and no chmod afterwards.  That distinction is observable -- the
+// kernel applies the umask and drops S_ISUID/S_ISGID at creation, so an archived
+// 04755 lands as 0755, while a post-hoc chmod would restore the setuid bit the
+// original does not.  An archive with no permission record (which is also what
+// -np and an all-0600 input produce) uses the original's own default of 0600.
+// What the footer's "IO-out" figure reports on an extraction: bytes written to
+// disk and the time the writes took, summed over every file and every parallel
+// worker's pwrite. The original prints it after IO-in, on the same line and with
+// no trailing period, only when writing took a measurable millisecond:
+//     IO-in: 0.88s, 4959 MB/s. IO-out: 2.30s, 1997 MB/s
+// (measured on the reporter's 4.6 GB archive, Linux and Windows). `t` writes
+// nothing and prints none. This port printed no IO-out at all on decode.
+struct DecodeIoStats {
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> nanos{0};
+};
+inline DecodeIoStats& DecodeWriteIo() {
+    static DecodeIoStats s;
+    return s;
+}
+inline void NoteDecodeWrite(std::size_t n, std::chrono::steady_clock::time_point w0) {
+    DecodeWriteIo().bytes += n;
+    DecodeWriteIo().nanos += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count());
+}
+
+bool WriteExtractedFile(const fs::path& path, const unsigned char* data, std::size_t n,
+                        std::uint32_t mode, long owner_uid = -1, long owner_gid = -1) {
+#if defined(_WIN32)
+    (void)mode; (void)owner_uid; (void)owner_gid;
+    const auto w0 = std::chrono::steady_clock::now();
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    // Never hand the CRT a single write above 2 GB: msvcrt's _write() takes an
+    // unsigned count but returns an int, so a 2.29 GB request completes on disk
+    // and then reports a negative count, which the stream layer treats as a
+    // short write and retries forever (100% CPU after the file is complete --
+    // the first user report). 256 MB pieces keep every count comfortably small.
+    std::size_t off = 0;
+    while (off < n) {
+        const std::size_t piece = std::min<std::size_t>(n - off, std::size_t{1} << 28);
+        out.write(reinterpret_cast<const char*>(data) + off, static_cast<std::streamsize>(piece));
+        if (!out) return false;
+        off += piece;
+    }
+    out.close();
+    NoteDecodeWrite(n, w0);
+    return static_cast<bool>(out);
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                          static_cast<mode_t>(mode & 07777u));
+    if (fd < 0) {
+        return false;
+    }
+    // -fo: the original calls fchown on the open descriptor with the stored
+    // user/group and ignores the result (measured: fchown32(fd, uid, gid), then
+    // utime; nothing printed when it fails for a non-root user).
+    if (owner_uid >= 0) (void)::fchown(fd, static_cast<uid_t>(owner_uid), static_cast<gid_t>(owner_gid));
+    const auto w0 = std::chrono::steady_clock::now();
+    std::size_t written = 0;
+    while (written < n) {
+        const ssize_t w = ::write(fd, data + written, n - written);
+        if (w <= 0) {
+            ::close(fd);
+            return false;
+        }
+        written += static_cast<std::size_t>(w);
+    }
+    const bool closed = (::close(fd) == 0);
+    NoteDecodeWrite(n, w0);
+    return closed;
+#endif
+}
+
+bool ApplyExtractedMetadata(
+    const fs::path& path,
+    bool has_permissions,
+    std::uint32_t permissions,
+    bool has_mtime,
+    std::int64_t mtime_unix,
+    std::string* out_warning) {
+    bool ok = true;
+    std::ostringstream warnings;
+
+    std::error_code ec;
+    if (has_permissions && permissions != 0u) {
+        fs::permissions(path, ModeToPermissions(permissions), fs::perm_options::replace, ec);
+        if (ec) {
+            ok = false;
+            warnings << "cannot apply permissions to " << path.string() << ": " << ec.message();
+            ec.clear();
+        }
+    }
+    if (has_mtime && mtime_unix > 0) {
+        fs::last_write_time(path, UnixToFileTime(mtime_unix), ec);
+        if (ec) {
+            if (!warnings.str().empty()) {
+                warnings << "; ";
+            }
+            ok = false;
+            warnings << "cannot apply mtime to " << path.string() << ": " << ec.message();
+        }
+    }
+
+    if (out_warning != nullptr) {
+        *out_warning = warnings.str();
+    }
+    return ok;
+}
+
+std::string MakeUniqueName(const std::string& base, std::unordered_set<std::string>* used) {
+    if (used == nullptr) {
+        return base;
+    }
+    if (used->insert(base).second) {
+        return base;
+    }
+
+    fs::path p(base);
+    const std::string stem = p.stem().string();
+    const std::string ext = p.extension().string();
+
+    for (unsigned i = 2; i < 1000000u; ++i) {
+        std::ostringstream oss;
+        oss << stem << '_' << i << ext;
+        const std::string candidate = oss.str();
+        if (used->insert(candidate).second) {
+            return candidate;
+        }
+    }
+    return base;
+}
+
+bool CollectRawFiles(
+    const CliOptions& options,
+    std::vector<fs::path>* out_files,
+    std::vector<std::string>* warnings,
+    std::string* error) {
+    if (out_files == nullptr || warnings == nullptr || error == nullptr) {
+        return false;
+    }
+
+    out_files->clear();
+    warnings->clear();
+    error->clear();
+
+    for (const std::string& arg : options.positional) {
+        const fs::path input(arg);
+        std::error_code ec;
+        const fs::file_status st = fs::status(input, ec);
+        if (ec || st.type() == fs::file_type::not_found) {
+            // The original's own wording, printed without the port's
+            // "Warning: " prefix (measured: `nz a new.nz nope.txt`).
+            warnings->push_back("No files found with " + arg);
+            continue;
+        }
+
+        if (fs::is_regular_file(st)) {
+            out_files->push_back(input);
+            continue;
+        }
+
+        if (fs::is_directory(st)) {
+            if (!options.recurse) {
+                warnings->push_back("skipping directory (use -r): " + arg);
+                continue;
+            }
+
+            fs::recursive_directory_iterator it(input, fs::directory_options::skip_permission_denied, ec);
+            fs::recursive_directory_iterator end;
+            if (ec) {
+                warnings->push_back("cannot recurse directory: " + arg);
+                continue;
+            }
+
+            for (; it != end; it.increment(ec)) {
+                if (ec) {
+                    ec.clear();
+                    continue;
+                }
+                const auto& entry = *it;
+                const fs::path p = entry.path();
+                std::error_code ec2;
+                if (entry.is_regular_file(ec2) && !ec2) {
+                    out_files->push_back(p);
+                }
+            }
+            continue;
+        }
+
+        warnings->push_back("unsupported input type: " + arg);
+    }
+
+    if (out_files->empty()) {
+        *error = "Nothing to do (no files found).";
+        return false;
+    }
+    return true;
+}
+
+bool BuildSourceList(
+    const CliOptions& options,
+    std::vector<SourceFile>* out_sources,
+    std::vector<std::string>* warnings,
+    std::string* error,
+    bool need_checksum) {
+    if (out_sources == nullptr || warnings == nullptr || error == nullptr) {
+        return false;
+    }
+
+    std::vector<fs::path> files;
+    if (!CollectRawFiles(options, &files, warnings, error)) {
+        return false;
+    }
+
+    std::unordered_set<std::string> used_names;
+    out_sources->clear();
+
+    for (const fs::path& file : files) {
+        const std::string as_rel = file.generic_string();
+        if (IsExcluded(as_rel, options.exclude_patterns)) {
+            continue;
+        }
+
+        std::string archive_name = NormalizeArchiveName(file, options.strip_paths);
+        if (archive_name.empty()) {
+            warnings->push_back("skipping empty archive path: " + file.string());
+            continue;
+        }
+        if (IsExcluded(archive_name, options.exclude_patterns)) {
+            continue;
+        }
+
+        archive_name = MakeUniqueName(archive_name, &used_names);
+
+        std::error_code ec;
+        const std::uint64_t size = fs::file_size(file, ec);
+        if (ec) {
+            warnings->push_back("cannot stat size: " + file.string());
+            continue;
+        }
+
+        SourceFile src;
+        src.source_path = file;
+        src.archive_name = archive_name;
+        src.size = size;
+
+        if (!options.no_permissions) {
+            const fs::file_status st = fs::status(file, ec);
+            if (!ec) {
+                src.permissions = PermissionsToMode(st.permissions());
+            }
+        } else {
+            src.permissions = 0;
+        }
+
+        if (!options.no_timestamps) {
+            const fs::file_time_type ft = fs::last_write_time(file, ec);
+            if (!ec) {
+                src.mtime_unix = FileTimeToUnix(ft);
+            }
+        } else {
+            src.mtime_unix = 0;
+        }
+
+        if (need_checksum) {
+            std::uint32_t checksum = 0;
+            if (!ComputeFileChecksum(file, options.checksum, &checksum)) {
+                warnings->push_back("cannot checksum file: " + file.string());
+                continue;
+            }
+            src.checksum = checksum;
+        }
+
+        out_sources->push_back(src);
+    }
+
+    if (out_sources->empty()) {
+        *error = "no files left after filters/excludes";
+        return false;
+    }
+
+    return true;
+}
+
+std::string FormatChecksum(ChecksumMode mode, std::uint32_t checksum) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    // The original always prints 8 hex digits, narrow modes included
+    // (a crc16 of 0x3935 lists as "00003935").
+    if (mode == ChecksumMode::kCrc16 || mode == ChecksumMode::kFletcher16) {
+        oss << std::setw(8) << (checksum & 0xffffu);
+    } else if (mode == ChecksumMode::kNone) {
+        oss << "----";
+    } else {
+        oss << std::setw(8) << checksum;
+    }
+    return oss.str();
+}
+
+std::string FormatMode(std::uint32_t mode) {
+    if (mode == 0) {
+        return "----";
+    }
+    std::ostringstream oss;
+    oss << std::oct << std::setfill('0') << std::setw(4) << (mode & 07777u);
+    return oss.str();
+}
+
+std::string FormatMtime(std::int64_t unix_seconds) {
+    // Measured: a timestamp that comes out as exactly 0 prints as an EMPTY field
+    // (the size column follows straight after "perm "); negative values print
+    // normally (1969-Dec-30 ...).
+    if (unix_seconds == 0) {
+        return "";
+    }
+
+    const std::time_t t = static_cast<std::time_t>(unix_seconds);
+    std::tm tmv{};
+#if defined(_WIN32)
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+
+    char buf[64] = {0};
+    if (std::strftime(buf, sizeof(buf), "%Y-%b-%d %H:%M:%S", &tmv) == 0) {
+        return "---- --- -- --:--:--";
+    }
+    return buf;
+}
+
+// The archive stores a file's mtime as its epoch MINUS the writer's local UTC
+// offset -- the writer converts local->UTC a second time. Measured: a file whose
+// mtime is 1788282000 (12:00:00 local, -0500) is stored as 1788300000, and the
+// original lists it back as "12:00:00". Adding the offset recovers the true epoch,
+// after which plain localtime reproduces the original's output.
+// A legacy archive stores a file's mtime as its LOCAL wall clock reinterpreted
+// as UTC, so the value has to be shifted back by the zone offset both to print
+// it and to restore it.  Getting this wrong is invisible in a listing that is
+// only compared against itself: it shows up as a whole-hours skew against the
+// original.
+std::int64_t LegacyStoredMtimeToUnix(std::int64_t stored) {
+    // Measured on l/x under TZ=UTC, Asia/Kolkata and America/Sao_Paulo: the
+    // stored value is epoch MINUS the writer's offset; the reader adds ITS OWN
+    // current offset, so the result is only right in the writer's zone (a
+    // 2*offset skew elsewhere -- reproduced, see ORIGINAL_QUIRKS). Everything is
+    // a 32-bit time_t in the original: a 2038+ mtime wraps to 1901/1963.
+    // The offset is the reader's CURRENT one (DST included: Europe/Berlin in
+    // September adds +2 h to a January 1970 stamp), not the offset at the file's
+    // own date -- measured under Berlin, Sydney, Kolkata, Sao Paulo and UTC.
+    const std::int32_t s32 = static_cast<std::int32_t>(static_cast<std::uint32_t>(stored));
+    static const long off = [] {
+        const std::time_t now = std::time(nullptr);
+        std::tm tmv{};
+#if defined(_WIN32)
+        localtime_s(&tmv, &now);
+        return static_cast<long>(-_timezone + (tmv.tm_isdst > 0 ? 3600 : 0));
+#else
+        localtime_r(&now, &tmv);
+        return static_cast<long>(tmv.tm_gmtoff);
+#endif
+    }();
+    const std::int64_t sum = static_cast<std::int64_t>(s32) + static_cast<std::int64_t>(off);
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(sum)));
+}
+
+// The plain listing shows names longer than 38 columns as "..." plus their last
+// 35 characters (measured: 36-38 whole, 39+ cut). The progress line has its own
+// rule (40 / 37, DecodeProgress::Name).
+std::string TruncateName40(const std::string& name) {
+    if (name.size() > 38u) return "..." + name.substr(name.size() - 35u);
+    return name;
+}
+
+// The original creates the directories of an extracted path with mode 0700
+// (measured on every tree of the round-3 matrix), whatever the umask says.
+void MakeDirs0700(const fs::path& dir) {
+    if (dir.empty()) return;
+    std::error_code ec;
+    if (fs::exists(dir, ec)) return;
+    MakeDirs0700(dir.parent_path());
+#if defined(_WIN32)
+    fs::create_directory(dir, ec);
+#else
+    ::mkdir(dir.c_str(), 0700);
+#endif
+}
+
+std::string FormatMtimeStored(std::int64_t stored) {
+    return FormatMtime(LegacyStoredMtimeToUnix(stored));
+}
+
+// The original restores a timestamp with utime(), which takes whole seconds and
+// leaves the access time at "now".  Going through std::filesystem instead lands
+// a fractional nanosecond part that a byte-exact tree comparison catches.
+// A Windows-made archive stores file attributes (record type 3); on Windows the
+// original RESTORES them, so a read-only, hidden or system file comes back that
+// way. Measured on a real Windows 10 machine, all four bits. Applied AFTER the
+// data is written and closed, because READONLY would otherwise refuse the write.
+void SetExtractedWinAttributes(const fs::path& path, std::uint8_t attr) {
+#if defined(_WIN32)
+    DWORD flags = 0;
+    if (attr & 1u) flags |= FILE_ATTRIBUTE_READONLY;
+    if (attr & 2u) flags |= FILE_ATTRIBUTE_HIDDEN;
+    if (attr & 4u) flags |= FILE_ATTRIBUTE_SYSTEM;
+    if (attr & 8u) flags |= FILE_ATTRIBUTE_ARCHIVE;
+    // the wide form for the same reason _wopen is used in the sink: path::string()
+    // is UTF-8 on MinGW and the A entry point would read it in the code page
+    if (flags != 0u) SetFileAttributesW(path.wstring().c_str(), flags);
+#else
+    (void)path; (void)attr;   // on a POSIX host the mode carries this (0400/0600)
+#endif
+}
+
+bool SetExtractedMtime(const fs::path& path, std::int64_t stored) {
+    const std::int64_t real = LegacyStoredMtimeToUnix(stored);
+    if (real == 0) return true;   // measured: a zero timestamp is left alone; negatives are applied
+#if defined(_WIN32)
+    // mingw hides the utime() family under -std=c++17 (__STRICT_ANSI__), and
+    // Windows has no whole-second-only stat to be exact against anyway.
+    std::error_code ec;
+    fs::last_write_time(path, UnixToFileTime(real), ec);
+    return !ec;
+#else
+    struct utimbuf tb;
+    tb.actime = std::time(nullptr);
+    tb.modtime = static_cast<std::time_t>(real);
+    return ::utime(path.c_str(), &tb) == 0;
+#endif
+}
+
+std::string HumanBytes(std::uint64_t bytes) {
+    static const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    double x = static_cast<double>(bytes);
+    std::size_t u = 0;
+    while (x >= 1024.0 && u + 1 < (sizeof(units) / sizeof(units[0]))) {
+        x /= 1024.0;
+        ++u;
+    }
+
+    std::ostringstream oss;
+    if (u == 0) {
+        oss << static_cast<std::uint64_t>(x) << ' ' << units[u];
+    } else {
+        oss << std::fixed << std::setprecision(2) << x << ' ' << units[u];
+    }
+    return oss.str();
+}
+
+// Whether a name survives a round trip through the machine's active code page.
+// On Windows the original only ever sees the ANSI form of a filename, so a name
+// that does not round-trip is a name it cannot open. Everywhere else the bytes
+// are the name and the question does not arise.
+// WC_NO_BEST_FIT_CHARS, except on a UTF-8 ACP where the flag is not allowed.
+// Without it the conversion silently APPROXIMATES: on a CP1252 machine the
+// Hungarian `u`- and `o`-double-acute come back as plain `u` and `o` and the
+// name looks convertible, so a file the original refuses got stored under a
+// mangled name (`arvizturo.txt` for `árvíztűrő.txt`). The Win32 A file APIs do
+// not best-fit filenames either, which is why the original prints `???` and
+// stores nothing. Reported by xman as diacritics differing after unpacking.
+#if defined(_WIN32)
+inline DWORD NativeCpFlags() {
+    return (::GetACP() == CP_UTF8) ? 0u : WC_NO_BEST_FIT_CHARS;
+}
+#endif
+
+inline bool NameSurvivesNativeCodePage(const fs::path& name) {
+#if defined(_WIN32)
+    const std::wstring w = name.wstring();
+    if (w.empty()) return true;
+    BOOL lossy = FALSE;
+    const DWORD fl = NativeCpFlags();
+    BOOL* const pl = (fl == 0u) ? nullptr : &lossy;   // not allowed with CP_UTF8
+    const int n = ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()),
+                                        nullptr, 0, nullptr, pl);
+    if (n <= 0) return false;
+    std::string a(static_cast<std::size_t>(n), '\0');
+    ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()), &a[0], n, nullptr, pl);
+    return lossy == FALSE;
+#else
+    (void)name;
+    return true;
+#endif
+}
+
+// Windows: a filename is a byte string in the machine's ACTIVE CODE PAGE, not
+// UTF-8. The original calls the ANSI Win32 API (its own message for a name it
+// cannot open comes out mangled under a different code page), so an archive made
+// on a Hungarian Windows carries CP1250 bytes and one made on a Russian machine
+// CP1251 -- and extracting on the same machine has to recreate exactly that name.
+//
+// libstdc++'s `std::filesystem::path(std::string)` on MinGW instead requires
+// valid UTF-8 and THROWS "Cannot convert character sequence" on anything else, so
+// every archive whose names are not plain ASCII failed with a filesystem error
+// where the original works. Reported by xman on Win7 x64 with Hungarian accented
+// filenames; reproduced here under wine, and in four lines of libstdc++.
+//
+// So: convert through the active code page, exactly as the ANSI API would, and
+// leave every other platform's bytes alone (they are already the native encoding).
+inline fs::path PathFromNativeBytes(const std::string& s) {
+#if defined(_WIN32)
+    if (s.empty()) return fs::path();
+    const int n = ::MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return fs::path(s);   // not representable: let the caller fail as it did
+    std::wstring w(static_cast<std::size_t>(n), L'\0');
+    ::MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return fs::path(w);
+#else
+    return fs::path(s);
+#endif
+}
+
+// The inverse: the bytes the original would store or print for a path.
+inline std::string NativeBytesFromPath(const fs::path& p) {
+#if defined(_WIN32)
+    const std::wstring w = p.wstring();
+    if (w.empty()) return std::string();
+    const DWORD fl = NativeCpFlags();   // no best-fit, as the A file APIs do
+    const int n = ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()),
+                                        nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s(static_cast<std::size_t>(n), '\0');
+    ::WideCharToMultiByte(CP_ACP, fl, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+    return s;
+#else
+    return p.string();
+#endif
+}
+
+fs::path ResolveArchivePath(const CliOptions& options) {
+    fs::path out = PathFromNativeBytes(options.archive_path);
+    // The CLI already applied the original's suffix rule (".nz", or ".exe" for
+    // `w32c`); only a name with neither gets one here.
+    if (!options.no_filename_ext && out.extension() != ".nz" && out.extension() != ".exe") {
+        out += ".nz";
+    }
+    return out;
+}
+
+// The directory holding this executable. `w32c` reads its self-extractor stub
+// from there -- measured with strace on the original, which opens
+// `<exedir>/nz_w32c.sfx`, not a path relative to the working directory.
+fs::path ExecutableDir() {
+    std::error_code ec;
+#if defined(_WIN32)
+    wchar_t buf[32768];
+    const DWORD n = ::GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+    if (n != 0u) return fs::path(std::wstring(buf, buf + n)).parent_path();
+#else
+    const fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) return self.parent_path();
+#endif
+    return fs::current_path(ec);
+}
+
+bool CopyFileData(std::istream& in, std::ostream* out, std::uint64_t size, std::uint32_t* out_checksum, ChecksumMode mode) {
+    std::vector<unsigned char> buffer(kBufferSize);
+
+    std::uint64_t left = size;
+    std::uint32_t c16 = 0xffffu;
+    std::uint32_t c32 = 0xffffffffu;
+    std::uint32_t f1 = 0;
+    std::uint32_t f2 = 0;
+    std::uint8_t f32_pending = 0;
+    bool f32_has_pending = false;
+
+    while (left > 0) {
+        const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(left, buffer.size()));
+        in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(chunk));
+        const std::streamsize got = in.gcount();
+        if (got <= 0) {
+            return false;
+        }
+        if (out != nullptr) {
+            out->write(reinterpret_cast<const char*>(buffer.data()), got);
+            if (!*out) {
+                return false;
+            }
+        }
+
+        const std::size_t n = static_cast<std::size_t>(got);
+        switch (mode) {
+            case ChecksumMode::kCrc16:
+                c16 = UpdateCrc16(c16, buffer.data(), n);
+                break;
+            case ChecksumMode::kCrc32:
+                c32 = UpdateCrc32(c32, buffer.data(), n);
+                break;
+            case ChecksumMode::kFletcher16:
+                UpdateFletcher16(&f1, &f2, buffer.data(), n);
+                break;
+            case ChecksumMode::kFletcher32:
+                UpdateFletcher32(&f1, &f2, &f32_pending, &f32_has_pending, buffer.data(), n);
+                break;
+            case ChecksumMode::kNone:
+                break;
+        }
+
+        left -= static_cast<std::uint64_t>(n);
+    }
+
+    if (out_checksum != nullptr) {
+        switch (mode) {
+            case ChecksumMode::kNone:
+                *out_checksum = 0;
+                break;
+            case ChecksumMode::kCrc16:
+                *out_checksum = (c16 ^ 0xffffu) & 0xffffu;
+                break;
+            case ChecksumMode::kCrc32:
+                *out_checksum = c32 ^ 0xffffffffu;
+                break;
+            case ChecksumMode::kFletcher16:
+                *out_checksum = ((f2 & 0xffu) << 8u) | (f1 & 0xffu);
+                break;
+            case ChecksumMode::kFletcher32:
+                *out_checksum = FinalizeFletcher32(f1, f2, f32_pending, f32_has_pending);
+                break;
+        }
+    }
+
+    return true;
+}
+
+bool SkipBytes(std::istream& in, std::uint64_t size) {
+    if (size == 0) {
+        return true;
+    }
+
+    const std::streamoff as_off = static_cast<std::streamoff>(size);
+    in.seekg(as_off, std::ios::cur);
+    if (in.good()) {
+        return true;
+    }
+
+    in.clear();
+    std::vector<char> buffer(64 * 1024);
+    std::uint64_t left = size;
+    while (left > 0) {
+        const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(left, buffer.size()));
+        in.read(buffer.data(), static_cast<std::streamsize>(chunk));
+        const std::streamsize got = in.gcount();
+        if (got <= 0) {
+            return false;
+        }
+        left -= static_cast<std::uint64_t>(got);
+    }
+    return true;
+}
+
+fs::path SanitizeExtractPath(const std::string& name) {
+    fs::path p = PathFromNativeBytes(name);
+    // on Windows "C:x" is not absolute, but root / "C:x" leaves the root
+    if (p.is_absolute() || p.has_root_name() || p.has_root_directory()) {
+        return {};
+    }
+
+    fs::path out;
+    for (const auto& part : p) {
+        const std::string x = part.generic_string();
+        if (x.empty() || x == ".") {
+            continue;
+        }
+        if (x == "..") {
+            // `a` keeps a ".." past the front of what it was typed with
+            // (`a x.nz d1/sub/../f`), so it is resolved here; only one that
+            // climbs out of the extraction directory is refused
+            if (!out.has_relative_path()) return {};
+            out = out.parent_path();
+            continue;
+        }
+        out /= part;
+    }
+    return out;
+}
+
+std::string ShellQuote(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size() + 2);
+    out.push_back('\'');
+    for (char c : raw) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
+std::string GdbQuote(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size() + 2);
+    out.push_back('"');
+    for (char c : raw) {
+        if (c == '\\' || c == '"') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+
+
+// There is no fallback to an original `nz` binary anywhere in this program: every
+// decode is native, and a stream no native decoder accepts is reported as corrupt.
+// (`NZ_NO_BRIDGE`, which the test suites still export, is simply ignored.)
+
+
+
+
+
+
+
+std::string ParseProcValue(const char* path, const char* key_prefix) {
+    std::ifstream input(path);
+    if (!input) {
+        return {};
+    }
+
+    std::string line;
+    const std::string prefix(key_prefix);
+    while (std::getline(input, line)) {
+        if (line.rfind(prefix, 0) == 0) {
+            std::string value = line.substr(prefix.size());
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+                value.erase(value.begin());
+            }
+            return value;
+        }
+    }
+    return {};
+}
+
+struct LegacyCnEntry {
+    std::string path;
+    std::uint64_t size = 0;
+    std::uint32_t checksum = 0;
+    bool has_checksum = false;
+    // Set when the archive stores checksums but this file has none of its own:
+    // a parallel (-pN) container splits a big file across streams and each
+    // stream checksums only its slice, so no whole-file value exists. The
+    // original lists such a file as "n/a"; verifying the file against a slice
+    // checksum would fail every time.
+    bool checksum_na = false;
+    std::uint32_t permissions = 0;
+    bool has_permissions = false;
+    // What the original's `l` prints in the mode column, which is not always
+    // `permissions`: see ApplyLegacyAttributeRecords (quirk 76).
+    std::uint32_t listed_permissions = 0;
+    bool has_listed_permissions = false;
+    // An archive made by the WINDOWS original stores file attributes (record
+    // type 3) instead of POSIX modes: one nibble per entry, `8 | R | H<<1 | S<<2`
+    // where 8 is the archive bit. The Linux original maps them to a mode -- 0400
+    // for read-only, 0600 otherwise -- and the Windows one prints them as an
+    // "R H S A" field.
+    std::uint8_t win_attr = 0;
+    bool has_win_attr = false;
+    std::int64_t mtime_unix = 0;
+    bool has_mtime = false;
+    // -fo archives carry uid/gid runs (record types 8 and 9); `l -fo` shows them
+    // as a "user/grp." column.
+    std::uint32_t uid = 0;
+    std::uint32_t gid = 0;
+    bool has_owner = false;
+};
+
+enum class LegacyPayloadMode {
+    kUnknown,
+    kStore,
+    kLiteralOnly,
+    kCompressed
+};
+
+// The decoded output. Either a std::vector moved in from a producer (no copy),
+// or an UNINITIALISED heap array for producers that fill every byte themselves
+// -- the parallel containers, whose slices are proven to tile the output before
+// any worker starts. std::vector<unsigned char>(n) zeroes n bytes on ONE thread
+// before the decode can begin; on a 2.3 GB archive that alone was half a second
+// of the critical path, and every page was then faulted in a second time by the
+// workers.
+
+// A read-only view of the archive bytes. The parser and every decoder only ever
+// read them, so they can look at a memory MAPPING of the file instead of a heap
+// copy: on a 2 GB archive that is 2 GB of anonymous memory turned into
+// reclaimable page cache (the original streams its input, quirk 23).
+// A position or length inside the ARCHIVE. Deliberately not `std::size_t`: on a
+// 32-bit build that is 32 bits, so an archive over 4 GB cannot even be indexed,
+// let alone mapped -- which is why `nz-re` x86 answers "Out of memory!" to a
+// 4.6 GB archive the original reads without trouble. Widening the offsets is the
+// first half of fixing that; windowing the mapping is the second.
+using ArcPos = std::uint64_t;
+
+class WindowedFile;
+
+// The main stream's data records, as one continuous byte space WITHOUT copying
+// them. A multi-block archive interleaves tables and checksums between its data
+// records, so the chain decoders need them spliced; doing that with a real
+// buffer costs a copy of the whole payload -- 4.6 GB on the archive this exists
+// for, which is what a 32-bit build cannot have. The map translates a splice
+// offset into a file offset instead.
+struct SpliceMap {
+    std::vector<std::pair<ArcPos, ArcPos>> rec;   // (offset in the file, length)
+    std::vector<ArcPos> start;                    // cumulative start in splice space
+    ArcPos total = 0;
+    void Add(ArcPos off, ArcPos len) {
+        if (len == 0u) return;
+        rec.emplace_back(off, len);
+        start.push_back(total);
+        total += len;
+    }
+    std::size_t Find(ArcPos p) const {            // record holding splice offset p
+        if (p >= total || rec.empty()) return rec.size();
+        std::size_t lo = 0, hi = rec.size();
+        while (lo + 1u < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2u;
+            if (start[mid] <= p) lo = mid; else hi = mid;
+        }
+        return lo;
+    }
+};
+
+class ByteView {
+public:
+    ByteView() = default;
+    ByteView(const unsigned char* p, ArcPos n) : p_(p), n_(n) {}
+    ByteView(const std::vector<unsigned char>& v) : p_(v.data()), n_(v.size()) {}   // NOLINT: implicit by design
+    // A view onto a file that is mapped a window at a time: there is no pointer
+    // to the whole thing, which is the point.
+    ByteView(WindowedFile* src, ArcPos base, ArcPos n) : src_(src), base_(base), n_(n) {}
+    // The spliced data records of a source, as one continuous space. `flat` is
+    // used when the archive is fully mapped and `src` when it is windowed.
+    ByteView(WindowedFile* src, const unsigned char* flat, const SpliceMap* map)
+        : p_(flat), src_(src), smap_(map), n_(map != nullptr ? map->total : 0u) {}
+    ArcPos size() const { return n_; }
+    bool empty() const { return n_ == 0u; }
+    // NOTE: no data(), begin() or end(). A windowed view cannot produce a
+    // pointer to the whole archive, so the absence is deliberate -- it makes a
+    // use that would only work on a fully mapped file a COMPILE error instead of
+    // a silent read of the wrong thing.
+    bool windowed() const { return src_ != nullptr; }
+    // A resident pointer to [off, off+len) of the archive. Today the whole file
+    // is mapped and this is plain pointer arithmetic; it exists so that every
+    // consumer already asks for a BOUNDED RANGE rather than helping itself to a
+    // pointer at the whole file, which is what a windowed mapping needs (a
+    // 32-bit build cannot map a 4.6 GB archive at all). Returns nullptr when the
+    // range runs past the end -- callers that bound-check first cannot see it.
+    const unsigned char* Span(ArcPos off, ArcPos len) const {
+        if (off > n_ || len > n_ - off) return nullptr;
+        if (smap_ != nullptr) return SplicedSpan(off, len);
+        if (src_ != nullptr) return ResidentSpan(off, len);
+        return p_ + off;
+    }
+    // Append [off, off+len) of the archive to a byte vector. The bulk of the
+    // former `begin() + a, begin() + b` pairs; one range request instead of two
+    // loose pointers into the whole file.
+    void AppendTo(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const {
+        if (smap_ != nullptr) { AppendSpliced(dst, off, len); return; }
+        const unsigned char* q = Span(off, len);
+        if (q != nullptr && len != 0u) dst->insert(dst->end(), q, q + static_cast<std::size_t>(len));
+    }
+    // Offset of the first `v` in [off, end), or `end` when there is none. The
+    // filename tables' NUL scans, as a range instead of two loose pointers.
+    ArcPos FindByte(ArcPos off, ArcPos end, unsigned char v) const {
+        if (off >= end || end > n_) return end;
+        const unsigned char* q = Span(off, end - off);
+        if (q == nullptr) return end;
+        const void* h = std::memchr(q, v, static_cast<std::size_t>(end - off));
+        return h == nullptr ? end : off + static_cast<ArcPos>(static_cast<const unsigned char*>(h) - q);
+    }
+    // [off, off+len) as a std::string -- the entry paths.
+    std::string StringAt(ArcPos off, ArcPos len) const {
+        const unsigned char* q = Span(off, len);
+        return q == nullptr ? std::string() : std::string(reinterpret_cast<const char*>(q), static_cast<std::size_t>(len));
+    }
+    // A little-endian u32 at `off`. 0 when the range runs past the end -- every
+    // caller bound-checks first, so that only happens on input already judged
+    // corrupt, where the old code read past the mapping instead.
+    std::uint32_t U32At(ArcPos off) const {
+        const unsigned char* q = Span(off, 4u);
+        if (q == nullptr) return 0u;
+        return static_cast<std::uint32_t>(q[0]) | (static_cast<std::uint32_t>(q[1]) << 8u) |
+               (static_cast<std::uint32_t>(q[2]) << 16u) | (static_cast<std::uint32_t>(q[3]) << 24u);
+    }
+    unsigned char operator[](ArcPos i) const {
+        // The fast path is ONLY for a plain flat view. A spliced one has to
+        // translate even a single byte: `src_ == nullptr` is true for a splice
+        // over a fully mapped archive too, and taking the shortcut there read
+        // the file at the untranslated offset -- every varint and block header
+        // silently wrong, while Span() still answered correctly.
+        if (src_ == nullptr && smap_ == nullptr) return p_[i];
+        const unsigned char* q = Span(i, 1u);
+        return q != nullptr ? *q : 0u;
+    }
+    // The records of `map`, whose offsets are in THIS view's space, as one
+    // continuous space. Inherits the backing AND the base: a self-extractor's
+    // view starts past the PE stub, and building the splice over the archive's
+    // own base instead put every record off by the stub's length.
+    ByteView Spliced(const SpliceMap* map) const {
+        ByteView v(*this);
+        v.smap_ = map;
+        v.n_ = (map != nullptr) ? map->total : 0u;
+        return v;
+    }
+    // Which backing this view reads through -- a flat pointer, a window, or a
+    // splice. Diagnostics only.
+    const char* DebugKind() const {
+        if (smap_ != nullptr) return src_ != nullptr ? "splice/windowed" : "splice/flat";
+        return src_ != nullptr ? "windowed" : "flat";
+    }
+    ByteView subview(ArcPos off) const {
+        if (off > n_) return ByteView();
+        if (smap_ != nullptr) return *this;            // splice space is not re-based
+        if (src_ != nullptr) return ByteView(src_, base_ + off, n_ - off);
+        return ByteView(p_ + off, n_ - off);
+    }
+private:
+    const unsigned char* ResidentSpan(ArcPos off, ArcPos len) const;   // needs WindowedFile
+    const unsigned char* SplicedSpan(ArcPos off, ArcPos len) const;
+    // AppendTo over a splice, a record at a time straight into `dst`: through
+    // Span() a range that straddles records is gathered into a thread-local
+    // scratch first, which for the whole payload (PayloadFlat) was a second copy
+    // of it -- 31 MB on a 128 MB -cc entry -- kept alive for the rest of the run.
+    void AppendSpliced(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const;
+    const unsigned char* p_ = nullptr;
+    WindowedFile* src_ = nullptr;
+    const SpliceMap* smap_ = nullptr;
+    ArcPos base_ = 0;
+    ArcPos n_ = 0;
+};
+
+// What the footer's "IO-in" line reports: the bytes of archive acquired and the
+// time acquiring them took. The original streams its input and measures a real
+// read; this reader maps the file, so on the mapped path the number is the
+// mapping call and comes out at 0.00s with an enormous rate -- true of a mapped
+// reader, and a real figure again the day this reader streams. It is kept here
+// rather than threaded through six call sites because the footer is printed once
+// per archive, immediately after that archive was opened. Before this, IO-in
+// repeated the DECODE time and rate, which claimed a 38-minute read of a file
+// the reader had already finished with.
+struct ArchiveIoStats {
+    std::uint64_t bytes = 0;
+    double seconds = 0.0;
+};
+inline ArchiveIoStats& LastArchiveIo() {
+    static ArchiveIoStats s;
+    return s;
+}
+
+// A file mapped a WINDOW at a time, for archives that do not fit the address
+// space -- a 32-bit build gets about 3 GB of it, so a 4.6 GB archive cannot be
+// mapped whole and this reader answered "Out of memory!" where the original,
+// which streams, reads the file without trouble.
+//
+// Every caller already asks for a bounded RANGE (ByteView::Span and friends), so
+// a window only has to cover the range in front of it. Two properties make the
+// returned pointers safe to hold:
+//
+//   * the windows are PER THREAD, so one worker can never unmap what another is
+//     reading -- no reference counting, no lock on the hot path;
+//   * each thread keeps several, so a caller that legitimately holds two spans
+//     at once (the BWT prefilter's range coder takes a byte and a buffer) does
+//     not evict the first with the second.
+//
+// A range larger than the standard window gets a mapping of its own size; the
+// decoders ask for one chunk record at a time, which is megabytes, not gigabytes.
+class WindowedFile {
+public:
+    // Without large-file support a 32-bit build's off_t is 32 bits, `fstat` on a
+    // 4.6 GB archive fails with EOVERFLOW and the window never opens -- the file
+    // simply looks unreadable. That is a BUILD flag, so catch it at compile time
+    // rather than as a runtime "Out of memory!": compile with
+    // -D_FILE_OFFSET_BITS=64 (harmless on 64-bit, where off_t is already 64).
+#if !defined(_WIN32)
+    static_assert(sizeof(off_t) >= 8,
+                  "build with -D_FILE_OFFSET_BITS=64: a 32-bit off_t cannot describe "
+                  "an archive over 2 GB, which is the whole point of the windowed reader");
+#endif
+    // 1 MiB, not the 8 it was: every window a thread holds stays resident, and
+    // with four of 8 MiB the archive added ~30 MiB to a decode's peak (`t -t1` of
+    // a 128 MB -cd archive: 143 MiB, the original 110; at 1 MiB, 116). The
+    // CPU cycles of `t` are the same.
+    static constexpr std::uint64_t kWindowBytes = 1ull << 20;
+    static constexpr std::size_t kWindowsPerThread = 4;
+
+    ~WindowedFile() { Close(); }
+    bool Open(const std::string& path) {
+        Close();
+#if defined(_WIN32)
+        handle_ = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) { handle_ = nullptr; return false; }
+        LARGE_INTEGER li{};
+        if (!::GetFileSizeEx(handle_, &li) || li.QuadPart <= 0) { Close(); return false; }
+        size_ = static_cast<std::uint64_t>(li.QuadPart);
+        mapping_ = ::CreateFileMappingA(handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mapping_ == nullptr) { Close(); return false; }
+        SYSTEM_INFO si{}; ::GetSystemInfo(&si);
+        granularity_ = si.dwAllocationGranularity ? si.dwAllocationGranularity : 65536u;
+#else
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) return false;
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) { Close(); return false; }
+        size_ = static_cast<std::uint64_t>(st.st_size);
+        const long pg = ::sysconf(_SC_PAGESIZE);
+        granularity_ = pg > 0 ? static_cast<std::uint64_t>(pg) : 4096u;
+#endif
+        ++generation_;
+        return true;
+    }
+    void Close() {
+        DropAllThreadWindows();
+#if defined(_WIN32)
+        if (mapping_ != nullptr) { ::CloseHandle(mapping_); mapping_ = nullptr; }
+        if (handle_ != nullptr) { ::CloseHandle(handle_); handle_ = nullptr; }
+#else
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+#endif
+        size_ = 0;
+    }
+    std::uint64_t size() const { return size_; }
+    bool open() const {
+#if defined(_WIN32)
+        return mapping_ != nullptr;
+#else
+        return fd_ >= 0;
+#endif
+    }
+
+    // A pointer to [off, off+len) that stays valid until this thread asks for
+    // kWindowsPerThread further ranges that do not fit the same windows.
+    const unsigned char* Resident(std::uint64_t off, std::uint64_t len) {
+        if (!open() || off > size_ || len > size_ - off) return nullptr;
+        if (len == 0u) len = 1u;               // a zero-length range still needs a place
+        Cache& c = ThreadCache();
+        if (c.owner != this || c.generation != generation_) { c.Drop(); c.owner = this; c.generation = generation_; }
+        for (std::size_t i = 0; i < kWindowsPerThread; ++i) {
+            Win& w = c.w[i];
+            if (w.p != nullptr && off >= w.base && off + len <= w.base + w.len) {
+                w.used = ++c.tick;
+                return w.p + static_cast<std::size_t>(off - w.base);
+            }
+        }
+        return MapInto(c, off, len);
+    }
+
+private:
+    struct Win { std::uint64_t base = 0, len = 0, used = 0; unsigned char* p = nullptr; };
+    struct Cache {
+        Win w[kWindowsPerThread];
+        std::uint64_t tick = 0;
+        WindowedFile* owner = nullptr;
+        std::uint64_t generation = 0;
+        void Drop() {
+            for (Win& x : w) {
+                if (x.p != nullptr) {
+#if defined(_WIN32)
+                    ::UnmapViewOfFile(x.p);
+#else
+                    ::munmap(x.p, static_cast<std::size_t>(x.len));
+#endif
+                }
+                x = Win{};
+            }
+            tick = 0; owner = nullptr; generation = 0;
+        }
+        ~Cache() { Drop(); Unregister(this); }
+    };
+
+    // Every live thread cache, so Close() can drop the windows of threads that
+    // are still alive (the decode pool outlives one archive).
+    static std::mutex& CachesMutex() { static std::mutex m; return m; }
+    static std::vector<Cache*>& Caches() { static std::vector<Cache*> v; return v; }
+    static void Unregister(Cache* c) {
+        std::lock_guard<std::mutex> lk(CachesMutex());
+        std::vector<Cache*>& v = Caches();
+        v.erase(std::remove(v.begin(), v.end(), c), v.end());
+    }
+    static Cache& ThreadCache() {
+        static thread_local Cache c;
+        static thread_local bool registered = [] {
+            std::lock_guard<std::mutex> lk(CachesMutex());
+            return true;
+        }();
+        (void)registered;
+        static thread_local bool listed = [&] {
+            std::lock_guard<std::mutex> lk(CachesMutex());
+            Caches().push_back(&c);
+            return true;
+        }();
+        (void)listed;
+        return c;
+    }
+    void DropAllThreadWindows() {
+        std::lock_guard<std::mutex> lk(CachesMutex());
+        for (Cache* c : Caches()) if (c->owner == this) c->Drop();
+    }
+
+    const unsigned char* MapInto(Cache& c, std::uint64_t off, std::uint64_t len) {
+        const std::uint64_t base = (off / granularity_) * granularity_;
+        std::uint64_t span = (off - base) + len;
+        if (span < kWindowBytes) span = kWindowBytes;
+        if (base + span > size_) span = size_ - base;
+        // evict the least recently used slot
+        std::size_t victim = 0;
+        for (std::size_t i = 1; i < kWindowsPerThread; ++i)
+            if (c.w[i].p == nullptr || c.w[i].used < c.w[victim].used) victim = i;
+        Win& w = c.w[victim];
+        if (w.p != nullptr) {
+#if defined(_WIN32)
+            ::UnmapViewOfFile(w.p);
+#else
+            ::munmap(w.p, static_cast<std::size_t>(w.len));
+#endif
+            w = Win{};
+        }
+#if defined(_WIN32)
+        void* m = ::MapViewOfFile(mapping_, FILE_MAP_READ,
+                                  static_cast<DWORD>(base >> 32), static_cast<DWORD>(base & 0xffffffffu),
+                                  static_cast<SIZE_T>(span));
+        if (m == nullptr) return nullptr;
+#else
+        void* m = ::mmap(nullptr, static_cast<std::size_t>(span), PROT_READ, MAP_PRIVATE, fd_,
+                         static_cast<off_t>(base));
+        if (m == MAP_FAILED) return nullptr;
+#endif
+        w.p = static_cast<unsigned char*>(m); w.base = base; w.len = span; w.used = ++c.tick;
+        return w.p + static_cast<std::size_t>(off - base);
+    }
+
+#if defined(_WIN32)
+    HANDLE handle_ = nullptr;
+    HANDLE mapping_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+    std::uint64_t size_ = 0;
+    std::uint64_t granularity_ = 4096;
+    std::uint64_t generation_ = 0;
+};
+
+inline const unsigned char* ByteView::ResidentSpan(ArcPos off, ArcPos len) const {
+    return src_->Resident(base_ + off, len);
+}
+
+// Write [off, off+len) of a payload VIEW to a file, a window at a time. The
+// flat sibling above needs a pointer at the whole entry, which is exactly what
+// a >4 GB payload cannot give -- and what makes a 32-bit build say "Out of
+// memory!" on an archive it has already decoded. Chunked at the mapping window
+// so a windowed or spliced payload serves every piece from one window.
+// `*err`, when given, receives errno on a failure (ENOSPC is reported apart).
+bool WriteExtractedFileRange(const fs::path& path, const ByteView& src, ArcPos off, ArcPos len,
+                             std::uint32_t mode, long owner_uid = -1, long owner_gid = -1,
+                             int* err = nullptr) {
+    static constexpr ArcPos kPiece = 8ull << 20;
+    if (err != nullptr) *err = 0;
+#if defined(_WIN32)
+    (void)mode; (void)owner_uid; (void)owner_gid;
+    const auto w0 = std::chrono::steady_clock::now();
+    errno = 0;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) { if (err != nullptr) *err = errno; return false; }
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) return false;
+        out.write(reinterpret_cast<const char*>(q), static_cast<std::streamsize>(take));
+        if (!out) { if (err != nullptr) *err = errno; return false; }
+        done += take;
+    }
+    out.close();
+    NoteDecodeWrite(static_cast<std::size_t>(len), w0);
+    if (!out && err != nullptr) *err = errno;
+    return static_cast<bool>(out);
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                          static_cast<mode_t>(mode & 07777u));
+    if (fd < 0) { if (err != nullptr) *err = errno; return false; }
+    if (owner_uid >= 0) (void)::fchown(fd, static_cast<uid_t>(owner_uid), static_cast<gid_t>(owner_gid));
+    const auto w0 = std::chrono::steady_clock::now();
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) { ::close(fd); return false; }
+        ArcPos w_done = 0;
+        while (w_done < take) {
+            const ssize_t w = ::write(fd, q + w_done, static_cast<std::size_t>(take - w_done));
+            if (w <= 0) { if (err != nullptr) *err = (w < 0) ? errno : ENOSPC; ::close(fd); return false; }
+            w_done += static_cast<ArcPos>(w);
+        }
+        done += take;
+    }
+    const bool closed = (::close(fd) == 0);
+    if (!closed && err != nullptr) *err = errno;
+    NoteDecodeWrite(static_cast<std::size_t>(len), w0);
+    return closed;
+#endif
+}
+
+// The checksum of [off, off+len) of a payload VIEW, a window at a time.
+std::uint32_t ChecksumRange(ChecksumMode mode, const ByteView& src, ArcPos off, ArcPos len) {
+    static constexpr ArcPos kPiece = 8ull << 20;
+    ChecksumStream cs; cs.Reset(mode);
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) break;
+        cs.Update(q, static_cast<std::size_t>(take));
+        done += take;
+    }
+    return cs.Finish();
+}
+
+// The self-check's CRC-64 of [off, off+len) of a payload view; *whole = false
+// when part of the range is not there.
+std::uint64_t SelfCheckCrcRange(const ByteView& src, ArcPos off, ArcPos len, bool* whole) {
+    static constexpr ArcPos kPiece = 8ull << 20;
+    nzr::selfcheck::Crc64 c;
+    *whole = true;
+    for (ArcPos done = 0; done < len; ) {
+        const ArcPos take = (len - done < kPiece) ? (len - done) : kPiece;
+        const unsigned char* q = src.Span(off + done, take);
+        if (q == nullptr) { *whole = false; break; }
+        c.Update(q, static_cast<std::size_t>(take));
+        done += take;
+    }
+    return c.Final();
+}
+
+// A range in splice space. Inside one record it is the file's own bytes; across
+// a record boundary it has to be gathered, so a small per-thread scratch holds
+// it -- two slots, for the same reason a thread keeps several windows.
+inline void ByteView::AppendSpliced(std::vector<unsigned char>* dst, ArcPos off, ArcPos len) const {
+    if (off > n_ || len > n_ - off) return;
+    while (len != 0u) {
+        const std::size_t k = smap_->Find(off);
+        if (k >= smap_->rec.size()) return;
+        const ArcPos ko = off - smap_->start[k];
+        ArcPos take = smap_->rec[k].second - ko;
+        if (take > len) take = len;
+        if (take == 0u) return;
+        const ArcPos file_off = smap_->rec[k].first + ko;
+        const unsigned char* q = src_ != nullptr ? src_->Resident(base_ + file_off, take) : p_ + file_off;
+        if (q == nullptr) return;
+        dst->insert(dst->end(), q, q + static_cast<std::size_t>(take));
+        off += take; len -= take;
+    }
+}
+
+inline const unsigned char* ByteView::SplicedSpan(ArcPos off, ArcPos len) const {
+    if (len == 0u) len = 1u;
+    const std::size_t i = smap_->Find(off);
+    if (i >= smap_->rec.size()) return nullptr;
+    const ArcPos in_rec = off - smap_->start[i];
+    const auto at = [&](ArcPos file_off, ArcPos n) -> const unsigned char* {
+        return src_ != nullptr ? src_->Resident(base_ + file_off, n) : p_ + file_off;
+    };
+    if (in_rec + len <= smap_->rec[i].second) return at(smap_->rec[i].first + in_rec, len);
+    struct Scratch { std::vector<unsigned char> b[2]; unsigned next = 0; };
+    static thread_local Scratch sc;
+    std::vector<unsigned char>& buf = sc.b[sc.next];
+    sc.next ^= 1u;
+    buf.assign(static_cast<std::size_t>(len), 0u);
+    ArcPos done = 0, p = off;
+    while (done < len) {
+        const std::size_t k = smap_->Find(p);
+        if (k >= smap_->rec.size()) return nullptr;
+        const ArcPos ko = p - smap_->start[k];
+        ArcPos take = smap_->rec[k].second - ko;
+        if (take > len - done) take = len - done;
+        const unsigned char* q = at(smap_->rec[k].first + ko, take);
+        if (q == nullptr) return nullptr;
+        std::memcpy(buf.data() + static_cast<std::size_t>(done), q, static_cast<std::size_t>(take));
+        done += take; p += take;
+    }
+    return buf.data();
+}
+
+
+// The archive file, mapped read-only where the platform allows it and read into
+// a vector otherwise (Windows, and any mmap failure).
+class ArchiveBytes {
+public:
+    ~ArchiveBytes() { Close(); }
+    ArchiveBytes() = default;
+    ArchiveBytes(const ArchiveBytes&) = delete;
+    ArchiveBytes& operator=(const ArchiveBytes&) = delete;
+    bool Open(const std::string& path) {
+        const auto io_t0 = std::chrono::steady_clock::now();
+        const bool io_ok = OpenImpl(path);
+        LastArchiveIo().seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - io_t0).count();
+        LastArchiveIo().bytes = io_ok ? static_cast<std::uint64_t>(View().size()) : 0u;
+        return io_ok;
+    }
+private:
+    bool OpenImpl(const std::string& path) {
+        Close();
+        oom_ = false;
+        // An archive that does not fit this build's address space is read a
+        // window at a time. A 32-bit build gets about 3 GB, so anything near or
+        // above that -- xman's 4.6 GB -cO archive, the case this exists for --
+        // never had a whole-file mapping available; it used to be refused with
+        // "Out of memory!" while the original, which streams, read it.
+        // It is the DEFAULT now (2026-10-15): with a whole-file mapping every page
+        // a decode had read stayed resident, so `t` of a 128 MB stored archive
+        // peaked at 132 MiB and reads 36 MiB windowed; the compressing methods
+        // lose 8-15 MiB, -co/-cO/-cc about nothing, at the same speed.
+        // NZ_MAP_WHOLE=1 asks for the whole-file mapping (comparisons).
+        const bool must_window = !Addressable(FileSizeOf(path));
+        if (must_window || NZ_ENV("NZ_MAP_WHOLE") == nullptr) {
+            if (win_.Open(path)) {
+                windowed_ = true;
+                if (NZ_ENV("NZ_VERBOSE_NATIVE"))
+                    std::fprintf(stderr, "[native] windowed mapping: %llu bytes in %llu-byte windows\n",
+                                 (unsigned long long)win_.size(),
+                                 (unsigned long long)WindowedFile::kWindowBytes);
+                return true;
+            }
+            // Only an archive this build cannot address is "Out of memory!";
+            // anything else the window could not open goes the old way below,
+            // which reports what it finds.
+            if (must_window) { oom_ = true; return false; }
+        }
+#if !defined(_WIN32)
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            struct stat st{};
+            if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                if (!Addressable(static_cast<std::uint64_t>(st.st_size))) {
+                    ::close(fd);
+                    oom_ = true;
+                    return false;
+                }
+                const std::size_t n = static_cast<std::size_t>(st.st_size);
+                void* m = ::mmap(nullptr, n, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (m != MAP_FAILED) {
+                    ::close(fd);
+                    map_ = static_cast<const unsigned char*>(m);
+                    map_n_ = n;
+                    return true;
+                }
+            }
+            ::close(fd);
+        }
+#else
+        // Windows has no mmap, so the archive used to be read into the vector
+        // below -- as much committed memory as the archive is long, which a
+        // 4.5 GB archive cannot get on an ordinary machine. A file mapping
+        // spends address space instead, which a 64-bit build has to spare, and
+        // the pages it touches come and go under the OS's control.
+        {
+            const HANDLE fh = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (fh != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER li{};
+                if (::GetFileSizeEx(fh, &li) && li.QuadPart > 0) {
+                    if (!Addressable(static_cast<std::uint64_t>(li.QuadPart))) {
+                        ::CloseHandle(fh);
+                        oom_ = true;
+                        return false;
+                    }
+                    const HANDLE mh =
+                        ::CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+                    if (mh != nullptr) {
+                        void* m = ::MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+                        ::CloseHandle(mh);
+                        if (m != nullptr) {
+                            ::CloseHandle(fh);
+                            map_ = static_cast<const unsigned char*>(m);
+                            map_n_ = static_cast<std::size_t>(li.QuadPart);
+                            return true;
+                        }
+                    }
+                }
+                ::CloseHandle(fh);
+            }
+        }
+#endif
+        // A whole-file mapping that FAILED (a 3 GB archive does not fit a 32-bit
+        // process's address space even though its length is representable) is
+        // still a candidate for the windowed reader -- try that before falling
+        // back to reading the file into memory, which needs even more.
+        if (win_.Open(path)) {
+            windowed_ = true;
+            if (NZ_ENV("NZ_VERBOSE_NATIVE"))
+                std::fprintf(stderr, "[native] windowed mapping (whole-file mapping unavailable): %llu bytes\n",
+                             (unsigned long long)win_.size());
+            return true;
+        }
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return false;
+        input.seekg(0, std::ios::end);
+        const std::streamoff len = input.tellg();
+        input.seekg(0, std::ios::beg);
+        if (len > 0) {
+            // Reading the archive in is the fallback when it cannot be mapped.
+            // A 32-bit build runs out of address space well before 4 GB and the
+            // resize() below then threw std::length_error straight past main:
+            // a 3 GB archive aborted the process with a C++ terminate message
+            // instead of reporting anything.
+            const std::uint64_t n64 = static_cast<std::uint64_t>(len);
+            if (!Addressable(n64) || n64 > static_cast<std::uint64_t>(vec_.max_size())) {
+                oom_ = true;
+                return false;
+            }
+            try {
+                vec_.resize(static_cast<std::size_t>(len));
+            } catch (const std::exception&) {
+                vec_.clear();
+                vec_.shrink_to_fit();
+                oom_ = true;
+                return false;
+            }
+            input.read(reinterpret_cast<char*>(vec_.data()), len);
+            if (!input) vec_.resize(static_cast<std::size_t>(input.gcount()));
+        }
+        return true;
+    }
+public:
+    void Close() {
+        if (windowed_) { win_.Close(); windowed_ = false; }
+        if (map_ != nullptr) {
+#if defined(_WIN32)
+            ::UnmapViewOfFile(const_cast<unsigned char*>(map_));
+#else
+            ::munmap(const_cast<unsigned char*>(map_), map_n_);
+#endif
+            map_ = nullptr;
+            map_n_ = 0;
+        }
+        vec_.clear();
+        vec_.shrink_to_fit();
+    }
+    // The file's length without mapping it -- what decides whether a whole-file
+    // mapping is even possible.
+    static std::uint64_t FileSizeOf(const std::string& path) {
+        std::error_code ec;
+        const auto n = fs::file_size(fs::u8path(path), ec);
+        return ec ? 0u : static_cast<std::uint64_t>(n);
+    }
+    // Whether this build can hold the whole archive at once. A 32-bit build
+    // cannot above 4 GB: narrowing the length to size_t wraps it, and the header
+    // walk then reads a fraction of the file as if it were the whole archive and
+    // calls a sound archive corrupt. Measured on a 4.4 GB -co archive, where the
+    // 32-bit build reported "Archive corrupted. Error decoding (code 25600)" --
+    // which is how a user's 4.5 GB archive of one video file first surfaced. The
+    // original streams the archive and has no such limit; until this reader does
+    // too, an archive it cannot address is reported, not guessed at.
+    static bool Addressable(std::uint64_t n) {
+        return n <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+    }
+    // The archive is longer than this build can hold.
+    bool oom() const { return oom_; }
+    // `off` drops a self-extractor's PE stub without moving a byte.
+    ByteView View(std::size_t off = 0u) const {
+        if (windowed_) {
+            const std::uint64_t n = win_.size();
+            return off <= n ? ByteView(const_cast<WindowedFile*>(&win_), off, n - off) : ByteView();
+        }
+        const unsigned char* p = map_ != nullptr ? map_ : vec_.data();
+        const std::size_t n = map_ != nullptr ? map_n_ : vec_.size();
+        return off <= n ? ByteView(p + off, n - off) : ByteView();
+    }
+    bool mapped() const { return map_ != nullptr || windowed_; }
+    bool windowed() const { return windowed_; }
+private:
+    const unsigned char* map_ = nullptr;
+    std::size_t map_n_ = 0;
+    bool oom_ = false;
+    bool windowed_ = false;
+    WindowedFile win_;
+    std::vector<unsigned char> vec_;
+};
+
+class ByteBuffer {
+public:
+    ByteBuffer() = default;
+    ByteBuffer(std::vector<unsigned char>&& v) : vec_(std::move(v)) {}   // NOLINT: implicit by design
+    ByteBuffer& operator=(std::vector<unsigned char>&& v) { raw_.reset(); raw_n_ = 0; vec_ = std::move(v); return *this; }
+    ByteBuffer(ByteBuffer&&) = default;
+    ByteBuffer& operator=(ByteBuffer&&) = default;
+    ByteBuffer(const ByteBuffer& o) { *this = o; }
+    ByteBuffer& operator=(const ByteBuffer& o) {
+        if (this != &o) { raw_.reset(); raw_n_ = 0; vec_.assign(o.data(), o.data() + o.size()); }
+        return *this;
+    }
+    static ByteBuffer Uninitialized(std::size_t n) {
+        ByteBuffer b;
+        if (n) { b.raw_.reset(new unsigned char[n]); b.raw_n_ = n; }
+        return b;
+    }
+    unsigned char* data() { return raw_ ? raw_.get() : vec_.data(); }
+    const unsigned char* data() const { return raw_ ? raw_.get() : vec_.data(); }
+    std::size_t size() const { return raw_ ? raw_n_ : vec_.size(); }
+    bool empty() const { return size() == 0u; }
+    void clear() { raw_.reset(); raw_n_ = 0; vec_.clear(); }
+    template <class It> void assign(It a, It b) { raw_.reset(); raw_n_ = 0; vec_.assign(a, b); }
+    const unsigned char* begin() const { return data(); }
+    const unsigned char* end() const { return data() + size(); }
+private:
+    std::vector<unsigned char> vec_;
+    std::unique_ptr<unsigned char[]> raw_;
+    std::size_t raw_n_ = 0;
+};
+
+struct LegacyCnContext {
+    std::string archive_path;
+    ChecksumMode checksum_mode = ChecksumMode::kNone;
+    bool checksum_verification_supported = true;
+    std::uint8_t legacy_method = 0;
+    std::uint8_t legacy_method_p0 = 0;
+    std::uint8_t legacy_method_p1 = 0;
+    std::uint8_t legacy_method_p2 = 0;   // the block-size byte-float (memory figure)
+    // CM decoder params (method==0x4b, p0==7): extracted from the two extra
+    // bytes that precede the filename table span in -cc archives.
+    int cm_a_bits = 28;
+    int cm_b_bits = 25;
+    std::uint32_t cm_window_size = 1024u * 1024u;
+    bool native_payload_supported = false;
+    // The record walker stopped at a record that runs past the end of the file
+    // (a cut-off archive). The original reports such a decode failure as
+    // "Error decoding (code 25600)" where an in-range corruption is code 100.
+    bool truncated_input = false;
+    // Parallel (-pN) container: one entry per worker stream, that stream's own
+    // window byte (p1). The original prints one "Compressor #k" line per worker.
+    std::vector<std::uint8_t> parallel_p1;
+    // The parser already checked every entry's checksum over `data` (its
+    // validate_decoded_candidate gate): the extractor need not run the same pass
+    // over gigabytes a second time.
+    bool checksums_verified = false;
+    // Per-entry verdict when checksums_verified (1 = matches its stored checksum).
+    // Empty = every entry matched. A damaged archive whose decode still completed
+    // gets its good files written and the bad ones reported and skipped.
+    std::vector<std::uint8_t> entry_checksum_ok;
+    // Set when the decode failed part-way: `data` then holds only the blocks
+    // completed before the failure (the original writes exactly those).
+    bool decode_failed = false;
+    // With decode_failed: the streams all decoded cleanly but the output came
+    // out short -- reported as "Unexpected end of file." rather than a code.
+    bool decode_eof = false;
+    // The file ends before the decoder can start: the record framing itself is
+    // cut, or the first data record carries fewer bytes than the codec's first
+    // block header. The original's reader reports that as "Unexpected end of
+    // file." and never creates a compressor, so no "Compressor #k" line either.
+    // Measured over m_<codec>.nz truncated byte by byte around the first data
+    // record: every codec reports it while the record header is incomplete, and
+    // -cc/-co/-cO also with 1-4 payload bytes (their block header is 5).
+    bool eof_before_decode = false;
+    // A data record's header was read (its payload may be cut). The original
+    // creates the decompressor object then, and that is what prints
+    // "Compressor #k"; an archive cut before its first data record never gets
+    // one. Measured on m_<codec>.nz cut byte by byte around that record.
+    bool saw_data_record = true;
+    // The archive is cut inside its first data record: the report is the
+    // family's short-end status (see the parser), not the decoder's own.
+    bool cut_first_data_record = false;
+    // The original's status for the failure (ERROR_CODES.md): printed plain when
+    // a record follows the failing one, as code<<8|slot when it was the last.
+    std::uint32_t decode_code = 0;
+    std::uint32_t decode_fatal_id = 0;
+    std::size_t decode_slot = 0;
+    bool decode_at_last_record = false;
+    // Data records in payload (spliced) space: cumulative end offsets, and
+    // whether any record follows the last data record in the file.
+    // FILE offsets (in payload space), so ArcPos -- they are compared against a
+    // decoder's recorded input position, which is 64-bit.
+    std::vector<ArcPos> payload_record_ends;
+    bool records_after_data = false;
+    // A parallel container written by the sink (psink): the files are already on
+    // disk (or verified, for `t`); the extractor only reports.
+    bool sink_handled = false;
+    std::size_t sink_failed_entries = 0;
+    bool sink_plain_code = false;   // the failing stream had another record ahead
+    LegacyPayloadMode payload_mode = LegacyPayloadMode::kUnknown;
+    std::vector<LegacyCnEntry> entries;
+    std::uint64_t data_offset = 0;
+    std::uint64_t total_data_size = 0;
+    ByteBuffer data;
+    // The archive's mapping, kept alive past the parse, and the payload as a
+    // VIEW onto it. `data` is a copy of the payload and costs as much memory as
+    // the payload is long -- 4.6 GB on a large archive, which is what a 32-bit
+    // build cannot have and what makes even `l` cost gigabytes. When the parse
+    // can describe the payload instead of copying it, it fills these and leaves
+    // `data` empty; `Payload()` is what the decoders read either way.
+    std::shared_ptr<ArchiveBytes> src;
+    std::shared_ptr<SpliceMap> splice;
+    ByteView payload_view;
+    bool payload_is_view = false;
+    // Where zero padding begins in the payload (a cut last data record handed to
+    // the codec at its declared length, see the parser); none when ~0.
+    ArcPos pad_from = ~ArcPos{0};
+    ByteView Payload() const {
+        if (payload_is_view) return payload_view;
+        return ByteView(data.data(), data.size());
+    }
+    // A flat pointer to the payload, materialised ONCE on demand, for the
+    // decoders that still index a contiguous buffer. Asking for it costs a copy
+    // of the whole payload -- exactly what the view exists to avoid -- so a
+    // decoder that has been converted to read ranges must not call it.
+    mutable ByteBuffer flat_cache;
+    const ByteBuffer& PayloadFlat() const {
+        if (!payload_is_view) return data;
+        if (flat_cache.empty() && payload_view.size() != 0u) {
+            std::vector<unsigned char> v;
+            // One allocation of the final size: appended piece by piece into an
+            // empty vector, the payload was reallocated and copied again at
+            // every doubling.
+            v.reserve(payload_view.size());
+            payload_view.AppendTo(&v, 0u, payload_view.size());
+            flat_cache = ByteBuffer(std::move(v));
+        }
+        return flat_cache;
+    }
+};
+
+// Copies the thread's recorded decode error (nz_decode_error.h) into the context
+// and decides how the original would print it: plain when a record follows the
+// failing one, code<<8|slot when the failing record was the archive's last (or
+// the input ended). The failing record is found from the input offset the
+// decoder recorded, in payload (spliced data record) space.
+void AdoptDecodeError(LegacyCnContext& ctx) {
+    const nzr::derr::State& e = nzr::derr::Current();
+    if (e.code == 0xfffffffeu) { ctx.decode_eof = true; ctx.decode_code = 0u; ctx.decode_slot = e.parallel ? e.slot : 0u; ctx.decode_at_last_record = true; nzr::derr::Clear(); return; }
+    ctx.decode_code = e.code;
+    ctx.decode_fatal_id = e.fatal_id;
+    ctx.decode_slot = e.parallel ? e.slot : 0u;
+    bool last = ctx.truncated_input || e.parallel;   // a worker stream's status is always reported at the end
+    if (!e.parallel && e.has_pos && !ctx.payload_record_ends.empty()) {
+        std::size_t idx = 0;
+        // a position ON a record's end belongs to that record: the block loop
+        // records where the failing record stops
+        while (idx + 1u < ctx.payload_record_ends.size() && e.input_pos > ctx.payload_record_ends[idx]) ++idx;
+        // shifted when the failing record is the last one -- or the input ended
+        last = ((idx + 1u == ctx.payload_record_ends.size()) && !ctx.records_after_data) || ctx.truncated_input;
+    }
+    ctx.decode_at_last_record = last && !ctx.sink_plain_code;
+    if (NZ_ENV("NZ_TRACE_DERR")) {
+        std::fprintf(stderr, "[derr] code=%u parallel=%d has_pos=%d pos=%llu records=%zu after_data=%d sink_plain=%d trunc=%d -> last=%d ends:",
+                     e.code, (int)e.parallel, (int)e.has_pos, (unsigned long long)e.input_pos, ctx.payload_record_ends.size(),
+                     (int)ctx.records_after_data, (int)ctx.sink_plain_code, (int)ctx.truncated_input, (int)ctx.decode_at_last_record);
+        for (auto x : ctx.payload_record_ends) std::fprintf(stderr, " %llu", (unsigned long long)x);
+        std::fprintf(stderr, "\n");
+    }
+    nzr::derr::Clear();
+}
+
+// A line from the source collector: the ones that reproduce the original's own
+// wording go out verbatim, the port's extra diagnostics keep "Warning: ".
+inline void PrintCollectorLine(std::ostream& os, const std::string& w) {
+    if (w.rfind("No files found with ", 0) == 0) os << w << '\n';
+    else os << "Warning: " << w << '\n';
+}
+
+// The original's corruption report (ERROR_CODES.md). Returns the exit status:
+// 2 for the "Archive corrupted" lines (main maps it to 0 unless NZ_STRICT_EXIT),
+// 255 for the fatal "Internal error" path, which the original exits with (-1)
+// and whose line comes after a newline, without clearing the status line.
+int PrintCorruptLine(std::ostream& os, const LegacyCnContext& c) {
+    if (c.decode_fatal_id != 0u) {
+        os << "\nInternal error: " << c.decode_fatal_id << "! Please report this to sami (at) nanozip.net.\n";
+        return 255;
+    }
+    ClearStatusLine(os);
+    if (c.decode_eof || c.eof_before_decode) { os << "Archive corrupted. Unexpected end of file.\n"; return 2; }
+    std::uint32_t code;
+    if (c.cut_first_data_record && c.legacy_method == 0x2bu &&
+        (c.legacy_method_p0 == 1u || c.legacy_method_p0 == 2u)) code = 2u << 8;        // lzpf
+    else if (c.cut_first_data_record && c.legacy_method == 0x2bu &&
+             (c.legacy_method_p0 == 3u || c.legacy_method_p0 == 4u)) code = 4u << 8;   // -cd/-cD
+    // A record the engine declined without a status of its own is the original's
+    // 100, and it follows the same plain-or-shifted rule as any other: shifted
+    // (100 << 8) when the failing record is the archive's last -- a -co/-cc/-cO
+    // archive with a byte flipped 80-99 % in reports 25600 there, 100 at 30-60 %.
+    else if (c.decode_code == 0u) code = (c.truncated_input || c.decode_at_last_record) ? 25600u : 100u;
+    else code = c.decode_at_last_record ? ((c.decode_code << 8) | static_cast<std::uint32_t>(c.decode_slot & 0xffu)) : c.decode_code;
+    os << "Archive corrupted. Error decoding (code " << code << ")\n";
+    return 2;
+}
+
+// ---------------------------------------------------------------------------
+// Progress engine: the original's status line as decompiled (FUN_0804b740 /
+// FUN_0804b8d0 / FUN_0804ba70; ~/.cache/nzre_tools/cli_parity/PROGRESS_ENGINE.md).
+//  * One slot per worker stream, holding the bytes that stream has produced.
+//    Eight are visible (the struct holds eight); a worker tick prints them
+//    joined by '|' up to the first empty one, each "<N> MB" (MB up to 9 GB, then
+//    GB, then TB -- FUN_0804be20), then four spaces and one backspace per
+//    character written.
+//  * A worker tick is gated by time(): nothing is redrawn while the whole second
+//    is the one of the previous tick. Ticks come from every completed block, so
+//    the line refreshes about once a second while blocks complete.
+//  * The writer's tick (FUN_0804ab00 first) clears the line, prints the file name
+//    in 40 columns plus a space, then the same fields; its gate is a second
+//    variable of its own. It fires when a file starts.
+//  * The "Archive / Threads / Compressor" header precedes all of this. Some of
+//    our decodes run while the archive is still being parsed, so the header
+//    printer is registered up front and fired by the first tick or explicitly.
+// Measured too: a single-container decode shows "0 MB" right after the name (the
+// original's first tick lands within the first block); a parallel one shows an
+// empty field until the first stream has produced something.
+namespace progress {
+
+constexpr std::size_t kMaxSlots = 256;
+constexpr std::size_t kVisibleSlots = 8;
+
+struct Engine {
+    std::mutex mu;
+    std::ostream* os = nullptr;                       // null = engine off (l, own container)
+    std::function<void(std::ostream&)> header;
+    bool header_done = false;
+    LegacyCnContext snapshot;                         // header fields published by the parser
+    bool have_snapshot = false;
+    bool parallel = false;
+    std::array<std::atomic<std::uint64_t>, kMaxSlots> done{};
+    std::array<std::atomic<bool>, kMaxSlots> started{};    // worker began (SlotStarted)
+    std::array<bool, kMaxSlots> announced{};               // its "Compressor #k" line is out
+    std::function<std::string(std::size_t)> compressor_line;   // set by the header registration
+    std::atomic<std::uint64_t> total{0};
+    std::string name, shown_name;
+    bool worker_gate = false, writer_gate = false;
+    std::time_t worker_sec = 0, writer_sec = 0;
+    bool asking = false;    // an overwrite question waits on the line: draw nothing over it
+};
+
+inline Engine& E() { static Engine e; return e; }
+inline thread_local std::size_t t_slot = 0;
+
+// FUN_0804a990(buf, name, 0x28): a name longer than 40 columns is "..." plus its
+// last 37 characters (the listing's 38/35 rule is a different formatter).
+inline std::string Name40(const std::string& name) {
+    if (name.size() <= 40u) return name;
+    return "..." + name.substr(name.size() - 37u);
+}
+
+inline std::string HumanSize(std::uint64_t bytes) {
+    // FUN_0804be20 with start unit MB: the unit rises while the value exceeds
+    // 9 units of the next one; rounding is half-up.
+    unsigned unit = 2;
+    while (unit < 4 && bytes > (9ull << (10u * (unit + 1u)))) ++unit;
+    const unsigned shift = 10u * unit;
+    const std::uint64_t v = (bytes + (1ull << (shift - 1u))) >> shift;
+    static const char* const names[] = {" B", " KB", " MB", " GB", " TB"};
+    return std::to_string(v) + names[unit];
+}
+
+inline std::string FieldsLocked(Engine& e) {
+    std::string f;
+    for (std::size_t i = 0; i < kVisibleSlots; ++i) {
+        const std::uint64_t v = e.done[i].load(std::memory_order_relaxed);
+        if (v == 0u) break;
+        if (i) f += '|';
+        f += HumanSize(v);
+    }
+    return f;
+}
+
+inline void WriteFieldLocked(Engine& e, std::string prefix, const std::string& fields) {
+    prefix += fields;
+    prefix += "    ";
+    prefix.append(fields.size() + 4u, '\b');
+    e.os->write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    e.os->flush();
+}
+
+inline void EnsureHeaderLocked(Engine& e) {
+    if (e.header_done || e.os == nullptr) return;
+    e.header_done = true;
+    if (e.header) e.header(*e.os);
+}
+
+// Main registers the header printer before the archive is parsed.
+inline void Begin(std::ostream* os, std::function<void(std::ostream&)> header) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.os = os; e.header = std::move(header); e.header_done = false;
+    e.have_snapshot = false; e.parallel = false;
+    for (auto& d : e.done) d.store(0u, std::memory_order_relaxed);
+    for (auto& d : e.started) d.store(false, std::memory_order_relaxed);
+    e.announced.fill(false); e.compressor_line = nullptr;
+    e.total.store(0u, std::memory_order_relaxed);
+    e.name.clear(); e.shown_name.clear();
+    e.worker_gate = e.writer_gate = false;
+}
+inline void End() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.os = nullptr; e.header = nullptr; e.compressor_line = nullptr;
+}
+// A worker took slot k (ParallelForEach). The original prints each worker's
+// "Compressor #k" line when that worker first ticks; the ones already running
+// when the header goes out appear in the header write itself.
+inline void SlotStarted(std::size_t k) {
+    Engine& e = E();
+    if (e.os == nullptr || k >= kMaxSlots) return;
+    e.started[k].store(true, std::memory_order_relaxed);
+}
+inline bool SlotStarted(std::size_t k, const Engine& e) { return k < kMaxSlots && e.started[k].load(std::memory_order_relaxed); }
+inline void MarkAnnounced(std::size_t k) { Engine& e = E(); if (k < kMaxSlots) e.announced[k] = true; }
+inline void SetCompressorLine(std::function<std::string(std::size_t)> f) { E().compressor_line = std::move(f); }
+inline bool Active() { return E().os != nullptr; }
+
+// The parser publishes what the header needs before any decode it runs itself.
+inline void Publish(const LegacyCnContext& snap) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (e.os == nullptr) return;
+    e.snapshot = snap; e.have_snapshot = true;
+}
+inline bool HaveSnapshot() { return E().have_snapshot; }
+inline const LegacyCnContext& Snapshot() { return E().snapshot; }
+
+// Called by the header printer once the header lines are out: the original's
+// writer prints the first file's name at once for a single container (the
+// writer starts as soon as the first block lands) and a first "0 MB" tick
+// follows within the same instant; a parallel container shows an empty field.
+inline void WriterStartLocked(Engine& e);
+inline void HeaderPrinted(bool parallel, const std::string& first_name) {
+    Engine& e = E();   // caller holds e.mu (runs inside EnsureHeaderLocked)
+    e.parallel = parallel;
+    e.name = first_name;
+    if (!parallel) WriterStartLocked(e);
+    // Parallel: the original's header ends with a name tick whose name is not
+    // known yet (a run of spaces of varying length, left alone here); the first
+    // worker tick then prints the empty field, which happens here too.
+}
+
+inline void EnsureHeader() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    EnsureHeaderLocked(e);
+}
+
+inline void WorkerTickLocked(Engine& e) {
+    if (e.asking) return;
+    const std::time_t now = std::time(nullptr);
+    if (e.worker_gate && now == e.worker_sec) return;
+    e.worker_gate = true; e.worker_sec = now;
+    EnsureHeaderLocked(e);
+    WriteFieldLocked(e, std::string(), FieldsLocked(e));
+}
+
+// The writer starts on the first block of the first stream: name + empty field,
+// then the "0 MB" tick, exactly the single-container start (measured on a 4-stream
+// 2 MB archive: "name     \b\b\b\b" then "0 MB    \b...", as for one stream).
+inline void WriterStartLocked(Engine& e) {
+    if (e.asking || e.name.empty() || e.name == e.shown_name) return;
+    EnsureHeaderLocked(e);
+    ClearStatusLine(*e.os);
+    WriteFieldLocked(e, Name40(e.name) + " ", std::string());
+    e.shown_name = e.name;
+    e.writer_gate = true; e.writer_sec = std::time(nullptr);
+    WriteFieldLocked(e, std::string(), HumanSize(0));
+    e.worker_gate = true; e.worker_sec = e.writer_sec;
+}
+
+// Worker side: n more output bytes from this thread's stream.
+inline void Add(std::uint64_t n) {
+    Engine& e = E();
+    if (e.os == nullptr || n == 0u) return;
+    const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
+    const bool first_of_stream0 = slot == 0u && e.done[0].load(std::memory_order_relaxed) == 0u;
+    std::lock_guard<std::mutex> lk(e.mu);
+    EnsureHeaderLocked(e);
+    if (slot < kMaxSlots && !e.announced[slot] && e.compressor_line && !e.asking) {
+        // This worker's line was not in the header: clear the status line, print
+        // it, and redraw the name (the original's writer re-ticks right after).
+        e.announced[slot] = true;
+        ClearStatusLine(*e.os);
+        const std::string line = e.compressor_line(slot);
+        e.os->write(line.data(), static_cast<std::streamsize>(line.size()));
+        if (!e.shown_name.empty()) { ClearStatusLine(*e.os); WriteFieldLocked(e, Name40(e.shown_name) + " ", FieldsLocked(e)); }
+    }
+    if (first_of_stream0 && e.parallel) WriterStartLocked(e);
+    e.done[slot].fetch_add(n, std::memory_order_relaxed);
+    e.total.fetch_add(n, std::memory_order_relaxed);
+    WorkerTickLocked(e);
+}
+inline bool Decoded() { return E().total.load(std::memory_order_relaxed) != 0u; }
+
+// A decode attempt that fails is retried with other parameters or declined;
+// its figures must not stay on the counter. Scope rewinds unless committed.
+inline std::uint64_t Mark() {
+    const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
+    return E().done[slot].load(std::memory_order_relaxed);
+}
+inline void Rewind(std::uint64_t mark) {
+    Engine& e = E();
+    const std::size_t slot = t_slot < kMaxSlots ? t_slot : kMaxSlots - 1u;
+    const std::uint64_t cur = e.done[slot].load(std::memory_order_relaxed);
+    if (cur > mark) {
+        e.done[slot].store(mark, std::memory_order_relaxed);
+        e.total.fetch_sub(cur - mark, std::memory_order_relaxed);
+    }
+}
+struct Scope {
+    std::uint64_t mark;
+    bool committed = false;
+    Scope() : mark(Mark()) {}
+    ~Scope() { if (!committed) Rewind(mark); }
+    void Commit() { committed = true; }
+    void Restart() { Rewind(mark); }
+};
+
+// Writer side: a file starts. Prints name + fields, gated to one per second;
+// the same name twice in a row is not reprinted.
+inline void FileStart(const std::string& name) {
+    Engine& e = E();
+    if (e.os == nullptr) return;
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.name = name;
+    if (e.asking || name.empty() || name == e.shown_name) return;
+    const std::time_t now = std::time(nullptr);
+    if (e.writer_gate && now == e.writer_sec) return;
+    e.writer_gate = true; e.writer_sec = now;
+    EnsureHeaderLocked(e);
+    ClearStatusLine(*e.os);
+    WriteFieldLocked(e, Name40(name) + " ", FieldsLocked(e));
+    e.shown_name = name;
+}
+
+// A worker stream finished. For a parallel container the writer starts with
+// the first stream, so the first file's name appears then.
+inline void StreamDone(std::size_t) {}
+
+struct SlotScope {
+    std::size_t saved;
+    explicit SlotScope(std::size_t slot) : saved(t_slot) { t_slot = slot; }
+    ~SlotScope() { t_slot = saved; }
+};
+
+}  // namespace progress
+
+// ---------------------------------------------------------------------------
+// Parallel-container output sink: the original's writer model for -pN archives,
+// measured on 91 damaged single- and multi-file parallel containers (2026-09-04,
+// ~/.cache/nzre_tools/cli_parity/corrupt_compare_parallel.sh):
+//  * every WORKER writes its own stream straight into the output files at
+//    absolute offsets (strace: one open O_CREAT|O_TRUNC, then one open O_WRONLY
+//    per other worker) -- a stream that fails leaves a HOLE of zeros, or a short
+//    file when it was the last slot;
+//  * the CM family flushes per codec block, lzpf per member segment, -cd/-cD
+//    per file group (a table's files; 1 MB quanta inside a group) -- a status
+//    failure keeps NOTHING of the unit in flight, a clean-but-short stream
+//    flushes what it produced;
+//  * a group's FIRST file is created (empty) when the worker starts the group,
+//    the group's later files when bytes reach them; groups after a failure are
+//    never started; the other workers carry on;
+//  * slice checksums (one per table entry) are verified when the slice is out
+//    and a mismatch prints "Checksum mismatch [stored computed]: <file>", then
+//    the footer; a status error prints "Archive corrupted. Error decoding (code
+//    status<<8|slot)" and no footer.
+// `t` runs the same sink without touching the disk. NZ_SAFE keeps the old
+// assemble-then-verify path (verified bytes only).
+std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size);
+bool SafeMode();
+
+namespace psink {
+
+// The clean-but-short stream end: no status, "Unexpected end of file".
+constexpr std::uint32_t kCleanEndCode = 0xfffffffeu;
+
+struct Slice {
+    std::size_t entry = 0;            // index into the archive's entries
+    std::uint64_t file_off = 0;       // where it sits inside its file
+    std::uint64_t len = 0;
+    std::uint64_t spos = 0;           // where it starts inside the stream's output
+    ChecksumMode cmode = ChecksumMode::kNone;
+    std::uint32_t cval = 0;
+    bool has_cksum = false;
+    std::size_t group = 0;            // table group inside the stream
+    bool checked = false;
+};
+struct Stream {
+    std::vector<Slice> slices;        // in stream order
+    std::uint64_t total = 0;
+    std::vector<std::uint64_t> group_start;   // stream position where each group starts
+    std::uint64_t flushed = 0;        // bytes of the stream already on disk
+    std::size_t entered_group = 0;    // groups < this had their first file created
+    bool entered_any = false;
+    bool cut = false;                 // its last data record was cut off by the end of the archive
+    // Where the stream's LAST data record starts, in the same byte space the
+    // decoder consumes. The driver reports a status PLAIN when a later record
+    // step of the same slot notices it, and shifted (status<<8|slot) when the
+    // failing record was the last one or the input ended -- so a failure before
+    // this offset is the plain case. 0 = unknown, which keeps the shifted form.
+    std::uint64_t last_record_start = 0;
+    bool have_last_record = false;
+    // Incremental path (StreamWrite): the decoder hands over each block instead
+    // of one buffer at the end, so the stream's whole output never exists.
+    bool incremental = false;
+    std::uint64_t produced = 0;                 // bytes handed over so far
+    // kGroup holds back what a failure would NOT flush: the bytes after the last
+    // quantum boundary of the group in flight. That is at most one quantum (1 MB),
+    // so the stream still never materialises, and StreamEnd applies the same
+    // group/quantum rule to what is left here.
+    std::vector<unsigned char> hold;
+    std::uint64_t held_base = 0;                // hold covers [held_base, produced)
+    std::vector<ChecksumStream> sck;            // one per slice, fed as bytes pass
+    // The self-check's CRC-64 per slice (fed with sck, only while a check runs)
+    // and, once the stream has ended, what it decoded per slice.
+    std::vector<nzr::selfcheck::Crc64> sdig;
+    std::vector<nzr::selfcheck::Item> dig_items;
+    std::vector<std::pair<std::size_t, std::uint32_t>> pending_bad;  // slice index, computed value
+};
+enum class Policy { kProduced, kGroup, kStore };
+// What a worker of each codec reports when its stream ends early without a
+// status of its own (measured on cut and flipped -p4 containers):
+//   stream cut mid-group:      -cc/-co nothing ("Unexpected end of file"), -cO 100,
+//                              lzpf 2, -cd/-cD 4
+//   a group announced but no data record left for it (cut before it): CM family
+//                              100, lzpf 4, -cD 1
+//   not cut, decoder just stopped short: CM family 100, lzpf nothing, -cd 4
+enum class Family { kCm, kCo, kCO, kLzpf, kCd, kStore };
+
+struct FileState {
+    bool selected = false;
+    bool write_it = false;            // after the overwrite prompt / unsafe path
+    bool decided = false;             // prompt asked / path judged
+    bool deciding = false;            // its overwrite question is still waiting for the answer
+    bool created = false;
+    bool cannot_write = false;
+    // Every file used to stay open until Finish: a -co archive of 2000 files,
+    // extracted under a 256-descriptor limit, wrote 253 of them and printed
+    // "Cannot write" for the other 1747 (the original writes all 2000; the usual
+    // soft limit on Linux is 1024). A file is now closed the moment its last byte
+    // is written, with its timestamp and attributes applied then, and opened
+    // again, without truncating, if a rewound stream writes it once more.
+    std::uint64_t remaining = 0;      // bytes of its slices not written yet
+    bool closed = false;              // opened, written whole and closed
+    bool write_failed = false;        // a write failed: no further ones are tried
+    const LegacyCnEntry* entry = nullptr;
+    fs::path path;
+    std::string display;              // as the original names it: relative unless -o gave a root
+    int fd = -1;
+    std::mutex io;
+};
+
+struct Engine {
+    std::mutex mu;                    // state (files, streams, counters)
+    bool configured = false;          // RunExtractOrTest set the options
+    bool published = false;           // a parallel container handed its layout
+    bool committed = false;           // something was created/written: the outcome is final
+    const CliOptions* opt = nullptr;
+    bool test_mode = false;
+    std::ostream* os = nullptr;
+    fs::path root;
+    const std::vector<LegacyCnEntry>* entries = nullptr;
+    std::vector<Stream> streams;
+    Policy policy = Policy::kProduced;
+    Family family = Family::kCm;
+    std::uint64_t quantum = 0;        // -cd: 1 MB flush quanta inside a group
+    std::vector<std::unique_ptr<FileState>> files;
+    bool yes_to_all = false;
+    std::mutex ask_mu;                // held while the overwrite question waits (DecideLocked)
+    std::condition_variable decided_cv;   // a file's question was answered
+    std::size_t mismatches = 0;
+    std::size_t unsafe = 0;
+    std::size_t cannot = 0;
+    bool stream_failed = false;
+    std::atomic<std::size_t> write_errors{0};       // failed writes, outside e.mu
+    std::atomic<bool> disk_full_reported{false};    // "Out of disk space!" is printed once
+    bool plain_code = false;          // report the status without the slot (see Stream::last_record_start)
+    bool truncated = false;           // the archive itself is cut short
+};
+inline Engine& E() { static Engine e; return e; }
+inline void MarkTruncated() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); e.truncated = true; }
+
+// `force`: available even under NZ_SAFE. The self-check writes nothing, so safe
+// mode's reason to buffer (never write unverified bytes) does not apply to it.
+inline void Configure(const CliOptions& opt, bool test_mode, std::ostream& os, const fs::path& root, bool force = false) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.configured = force || !SafeMode();
+    e.published = e.committed = e.stream_failed = e.plain_code = e.truncated = false;
+    e.opt = &opt; e.test_mode = test_mode; e.os = &os; e.root = root;
+    e.entries = nullptr; e.streams.clear(); e.files.clear();
+    e.yes_to_all = opt.yes_to_all; e.mismatches = e.unsafe = e.cannot = 0;
+}
+inline void Reset() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    e.configured = e.published = e.committed = false;
+    e.entries = nullptr; e.streams.clear(); e.files.clear();
+    e.write_errors = 0; e.disk_full_reported = false;
+}
+// Available to a parallel path of the parser: configured and not yet used.
+inline bool Available() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.configured && !e.published; }
+inline bool Committed() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.committed; }
+// Whether the published layout takes StreamWrite. kStore keeps the buffered path
+// (it reports slices over whatever ARRIVED, padding and all), so a worker must
+// ask before deciding to roll through a small output buffer.
+inline bool AcceptsIncremental() { Engine& e = E(); std::lock_guard<std::mutex> lk(e.mu); return e.published && e.policy != Policy::kStore; }
+
+// The parser hands over the layout: streams in worker order, each a list of
+// slices (entry, offset in file, length, checksum) in stream order with their
+// table group. Returns false (and stays inactive) on an inconsistent layout.
+inline bool Publish(const std::vector<LegacyCnEntry>& entries, std::vector<Stream> streams,
+                    Policy policy, std::uint64_t quantum, Family family) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (!e.configured || e.published) return false;
+    for (Stream& s : streams) {
+        std::uint64_t pos = 0; std::size_t g = static_cast<std::size_t>(-1);
+        s.group_start.clear();
+        for (Slice& sl : s.slices) {
+            if (sl.entry >= entries.size()) return false;
+            if (sl.group != g) { g = sl.group; s.group_start.push_back(pos); }
+            sl.spos = pos; pos += sl.len;
+        }
+        s.total = pos; s.flushed = 0; s.entered_group = 0; s.entered_any = false;
+    }
+    e.entries = &entries; e.streams = std::move(streams); e.policy = policy; e.quantum = quantum; e.family = family;
+    e.files.clear();
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        auto f = std::make_unique<FileState>();
+        const LegacyCnEntry& en = entries[i];
+        f->selected = MatchesAnyPattern(en.path, e.opt->positional) && !IsExcluded(en.path, e.opt->exclude_patterns);
+        f->entry = &en;
+        e.files.push_back(std::move(f));
+    }
+    for (const Stream& st : e.streams)
+        for (const Slice& sl : st.slices) e.files[sl.entry]->remaining += sl.len;
+    e.published = true;
+    return true;
+}
+
+// Close a file that has all its bytes and give it its timestamp and attributes
+// now -- the original sets them file by file, and a later file written to the
+// same path (-sp, -forceout) must be the one whose stamp survives. With f.io
+// held, or before any writer can see the file.
+inline void CloseFileIo(FileState& f) {
+    if (f.fd < 0) return;
+#if defined(_WIN32)
+    ::_close(f.fd);
+#else
+    ::close(f.fd);
+#endif
+    f.fd = -1;
+    f.closed = true;
+    if (f.entry != nullptr) {
+        if (f.entry->has_mtime) (void)SetExtractedMtime(f.path, f.entry->mtime_unix);
+        if (f.entry->has_win_attr) SetExtractedWinAttributes(f.path, f.entry->win_attr);
+    }
+}
+
+// A write that failed. The original prints "Out of disk space!" once for a full
+// disk and goes on with the other files (measured with two outputs symlinked to
+// /dev/full: one line, and every other file written); a write failing for any
+// other reason is reported the way a file that cannot be created is. Either way
+// it counts as a failed entry. Here a failure used to be dropped in silence.
+inline void ReportWriteError(FileState& f, int err) {
+    Engine& e = E();
+    ++e.write_errors;
+    progress::Engine& pe = progress::E();
+    if (err == ENOSPC) {
+        if (e.disk_full_reported.exchange(true)) return;
+        std::lock_guard<std::mutex> plk(pe.mu);
+        ClearStatusLine(*e.os);
+        *e.os << "Out of disk space!" << '\n';
+        return;
+    }
+    std::lock_guard<std::mutex> plk(pe.mu);
+    *e.os << '\n' << "Cannot write: " << f.display << '\n';
+}
+
+// Under e.mu. Decide the file's path and, when needed, ask the overwrite
+// question (std::cin is read with the lock dropped; the timer keeps drawing).
+inline void DecideLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex>& lk) {
+    FileState& f = *e.files[idx];
+    if (f.decided) {
+        // a file split between workers: the other one is asking about it, and
+        // must not find it decided (write_it is still true) and truncate it
+        // before the answer -- answering No lost the file's old contents
+        e.decided_cv.wait(lk, [&f] { return !f.deciding; });
+        return;
+    }
+    f.decided = true;
+    const LegacyCnEntry& en = (*e.entries)[idx];
+    if (e.test_mode || !f.selected) { f.write_it = false; return; }
+    fs::path safe_rel = e.opt->strip_paths ? fs::path(SanitizeExtractPath(en.path)).filename()
+                                           : SanitizeExtractPath(en.path);
+    if (e.opt->forceout) safe_rel = PathFromNativeBytes(e.opt->positional.empty() ? std::string("*") : e.opt->positional.front());
+    if (safe_rel.empty()) {
+        std::cerr << "Skipping unsafe path in archive: " << en.path << '\n';
+        ++e.unsafe; f.write_it = false; return;
+    }
+    f.path = e.root / safe_rel;
+    // the same rule for what is PRINTED: the original's console carries the
+    // machine's code page, not UTF-8
+    f.display = e.opt->output_path.empty() ? NativeBytesFromPath(safe_rel) : NativeBytesFromPath(f.path);
+    f.write_it = true;
+    std::error_code ec;
+    if (!e.yes_to_all && fs::exists(f.path, ec)) {
+        // One question at a time. e.mu is dropped while the answer is read, so
+        // another worker reaching an existing file asked too: two questions on
+        // one line, two threads reading the same keyboard, and after `a` the
+        // others kept waiting for a line nobody would type -- `x` of a -pN
+        // archive over files already there hung (reported by xman).
+        f.deciding = true;
+        lk.unlock();
+        std::lock_guard<std::mutex> ask(e.ask_mu);
+        lk.lock();
+        if (!e.yes_to_all) for (;;) {
+            {
+                progress::Engine& pe = progress::E();
+                std::lock_guard<std::mutex> plk(pe.mu);
+                progress::EnsureHeaderLocked(pe);   // the question comes after the Compressor lines
+                ClearStatusLine(*e.os);
+                // the same 40/37 elision the progress line uses -- the original
+                // asks about "...<last 37>" for a name over 40 columns
+                *e.os << '\r' << "Overwrite " << progress::Name40(en.path) << " (Yes/No/Always)? ";
+                e.os->flush();
+                pe.asking = true;
+            }
+            std::string answer;
+            lk.unlock();
+            const bool got = static_cast<bool>(std::getline(std::cin, answer));
+            { progress::Engine& pe = progress::E(); std::lock_guard<std::mutex> plk(pe.mu); pe.asking = false; }
+            lk.lock();
+            if (!got) { f.write_it = false; break; }
+            const char k = answer.empty() ? '\0' : answer[0];
+            if (k == 'y') break;
+            if (k == 'n') { f.write_it = false; break; }
+            if (k == 'a') { e.yes_to_all = true; break; }
+        }
+        f.deciding = false;
+        e.decided_cv.notify_all();
+    }
+}
+
+// Under e.mu: create the file (the original opens it when a worker's cursor
+// enters it). A failure prints "Cannot write: <path>" once.
+inline void CreateLocked(Engine& e, std::size_t idx, std::unique_lock<std::mutex>& lk) {
+    FileState& f = *e.files[idx];
+    DecideLocked(e, idx, lk);
+    if (f.created) return;
+    f.created = true;
+    e.committed = true;
+    const LegacyCnEntry& en = (*e.entries)[idx];
+    progress::FileStart(en.path);
+    if (!f.write_it) return;
+    if (f.path.has_parent_path()) MakeDirs0700(f.path.parent_path());
+#if defined(_WIN32)
+    // mingw's <sys/stat.h> does not always expose _S_IREAD/_S_IWRITE, and the
+    // mode is irrelevant on Windows anyway (the permission records are POSIX).
+    //
+    // _wopen, NOT _open(path.string()): on MinGW `path::string()` returns UTF-8,
+    // and the ANSI _open then reads those bytes in the machine's code page -- a
+    // name with `a`-acute came out as the two characters its UTF-8 form spells in
+    // CP1252. Reported by xman on Win7 as "characters with diacritics in the
+    // unpacked file differ from the original"; it hit only the codecs that
+    // extract through this sink (-co, -cO, -cc), which is why the -cn and -cd
+    // paths looked fine. The wide form goes to the wide API unchanged.
+    f.fd = ::_wopen(f.path.wstring().c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0600);
+#else
+    f.fd = ::open(f.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                  static_cast<mode_t>((en.has_permissions ? en.permissions : 0600u) & 07777u));
+    if (f.fd >= 0 && e.opt->restore_ownership && en.has_owner)
+        (void)::fchown(f.fd, static_cast<uid_t>(en.uid), static_cast<gid_t>(en.gid));
+#endif
+    if (f.fd < 0) {
+        f.cannot_write = true; ++e.cannot;
+        progress::Engine& pe = progress::E();
+        std::lock_guard<std::mutex> plk(pe.mu);
+        *e.os << '\n' << "Cannot write: " << f.display << '\n';
+        return;
+    }
+    // Nothing to write into it (an empty entry): done already. No writer can
+    // hold f.io yet -- the file did not exist a moment ago.
+    if (f.remaining == 0u) CloseFileIo(f);
+}
+
+// Positional write, outside e.mu (per-file lock; workers of a split file share
+// the descriptor).
+inline void WriteAtImpl(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
+    if (n == 0u) return;
+    std::lock_guard<std::mutex> lk(f.io);
+    if (f.write_failed) return;
+    if (f.fd < 0) {
+        if (!f.closed) return;            // never opened: not written, or it could not be created
+        // written whole once and closed; a rewound stream writes it again
+#if defined(_WIN32)
+        f.fd = ::_wopen(f.path.wstring().c_str(), _O_WRONLY | _O_BINARY);
+#else
+        f.fd = ::open(f.path.c_str(), O_WRONLY);
+#endif
+        if (f.fd < 0) { f.write_failed = true; ReportWriteError(f, errno); return; }
+        f.closed = false;
+    }
+    const std::size_t total = n;
+#if defined(_WIN32)
+    if (::_lseeki64(f.fd, static_cast<long long>(off), SEEK_SET) < 0) { f.write_failed = true; ReportWriteError(f, errno); return; }
+    while (n > 0u) {
+        const unsigned piece = static_cast<unsigned>(std::min<std::size_t>(n, std::size_t{1} << 28));
+        const int w = ::_write(f.fd, p, piece);
+        if (w <= 0) { f.write_failed = true; ReportWriteError(f, errno); return; }
+        p += w; n -= static_cast<std::size_t>(w); 
+    }
+#else
+    while (n > 0u) {
+        const ssize_t w = ::pwrite(f.fd, p, n, static_cast<off_t>(off));
+        if (w <= 0) { f.write_failed = true; ReportWriteError(f, w < 0 ? errno : ENOSPC); return; }
+        p += w; n -= static_cast<std::size_t>(w); off += static_cast<std::uint64_t>(w);
+    }
+#endif
+    f.remaining = (total >= f.remaining) ? 0u : f.remaining - total;
+    if (f.remaining == 0u) CloseFileIo(f);
+}
+inline void WriteAt(FileState& f, std::uint64_t off, const unsigned char* p, std::size_t n) {
+    const auto w0 = std::chrono::steady_clock::now();
+    WriteAtImpl(f, off, p, n);
+    NoteDecodeWrite(n, w0);
+}
+
+inline void MismatchLine(Engine& e, const Slice& sl, std::uint32_t got) {
+    progress::Engine& pe = progress::E();
+    std::lock_guard<std::mutex> plk(pe.mu);
+    ClearStatusLine(*e.os);
+    *e.os << "Checksum mismatch [" << FormatChecksum(sl.cmode, sl.cval) << ' '
+          << FormatChecksum(sl.cmode, got) << "]: " << (*e.entries)[sl.entry].path << '\n';
+}
+
+// Under e.mu: an EMPTY entry the stream's cursor has passed. It is created in
+// entry order -- after the entries before it, before the ones after it -- where
+// it used to be created at StreamEnd, after everything: its O_TRUNC then wiped a
+// same-named file written meanwhile (-sp, -forceout; a -co archive of two empty
+// files and five others left `-forceout` a 0-byte file where the original leaves
+// the last entry's 2 000 000). Its checksum is judged in `x` and NOT in `t`,
+// which is what the original does with an empty file's damaged checksum.
+// Returns true, with the computed value, when it mismatches.
+inline bool EmptySliceLocked(Engine& e, Slice& sl, std::uint32_t* got, std::unique_lock<std::mutex>& lk) {
+    CreateLocked(e, sl.entry, lk);
+    if (sl.checked) return false;
+    sl.checked = true;
+    if (e.test_mode || !sl.has_cksum || e.opt->checksum == ChecksumMode::kNone) return false;
+    *got = ComputeBufferChecksum(sl.cmode, nullptr, 0u);
+    if (*got == sl.cval) return false;
+    ++e.mismatches;
+    return true;
+}
+
+// A worker starts stream k: the first file of its first group is created.
+// The offset, in the byte space this stream's decoder consumes, where its last
+// data record starts. A failure before it is the plainly-reported case.
+inline void SetLastRecordStart(std::size_t k, std::uint64_t off) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    e.streams[k].last_record_start = off;
+    e.streams[k].have_last_record = true;
+}
+
+inline void StreamBegin(std::size_t k) {
+    Engine& e = E();
+    std::unique_lock<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (!s.slices.empty() && !s.entered_any) { s.entered_any = true; s.entered_group = 1; CreateLocked(e, s.slices.front().entry, lk); }
+}
+
+// Put stream k back to its start so it can be decoded again. The sink writes at
+// absolute file offsets, so re-running a stream rewrites exactly the same byte
+// ranges -- what a retry produces replaces what the abandoned attempt wrote. Used
+// when the fast per-chunk decode turns out not to suit an archive and the slower
+// concatenated one has to run instead; the files already created stay created,
+// which is what they would have been anyway.
+inline void StreamRewind(std::size_t k) {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (e.mismatches >= s.pending_bad.size()) e.mismatches -= s.pending_bad.size();
+    s.pending_bad.clear();
+    // What this stream wrote will be written again: its files owe those bytes
+    // once more (and a file that completed and closed is reopened for them).
+    for (const Slice& sl : s.slices) {
+        if (sl.len == 0u || s.flushed <= sl.spos) continue;
+        FileState& f = *e.files[sl.entry];
+        std::lock_guard<std::mutex> fl(f.io);
+        f.remaining += std::min<std::uint64_t>(s.flushed - sl.spos, sl.len);
+    }
+    s.produced = 0;
+    s.flushed = 0;
+    s.hold.clear(); s.hold.shrink_to_fit(); s.held_base = 0;
+    s.sck.clear();
+    s.sdig.clear(); s.dig_items.clear();
+    for (Slice& sl : s.slices) sl.checked = false;
+}
+
+// The point up to which stream `s` would flush if it FAILED right now. kProduced
+// flushes everything; kGroup keeps only whole quanta of the group in flight (the
+// same rule StreamEnd applies). Monotonic: a new group starts at or after the
+// previous group's last whole quantum, so this never moves backwards.
+inline std::uint64_t SafeFlushPoint(const Engine& e, const Stream& s, std::uint64_t produced) {
+    if (e.policy != Policy::kGroup) return produced;
+    std::uint64_t gstart = 0;
+    for (std::uint64_t gs : s.group_start) if (gs <= produced) gstart = gs;
+    if (e.quantum != 0u && produced > gstart) return gstart + ((produced - gstart) / e.quantum) * e.quantum;
+    return gstart;
+}
+
+// A worker hands over the next `n` bytes of stream k, in order, instead of one
+// buffer at the end -- so the stream's whole output never exists. Under
+// Policy::kProduced a stream flushes everything it has produced and there is no
+// unit held back, so writing as the bytes arrive is byte-for-byte the same
+// decision StreamEnd would make. Under Policy::kGroup the bytes a failure would
+// NOT flush (after the last quantum boundary of the group in flight) are held in
+// `s.hold` -- at most one quantum -- and StreamEnd decides them. Slice checksums
+// are accumulated here and REPORTED in StreamEnd, in slice order, so the console
+// output does not depend on block boundaries.
+inline void StreamWrite(std::size_t k, const unsigned char* buf, std::size_t n) {
+    if (n == 0u) return;
+    Engine& e = E();
+    std::unique_lock<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    if (e.policy == Policy::kStore) return;      // store keeps the buffered path
+    const bool hold_back = (e.policy == Policy::kGroup);
+    // The checksums, the self-check's CRC-64 and the hold copy run without e.mu
+    // (issue #2 item 8): they touch only this stream's own state (sck, sdig,
+    // hold, produced), which only its worker uses, and the slices' positions,
+    // fixed at Publish. e.streams is not resized while workers run (Configure and
+    // Reset come before and after them), so `s` stays valid with the lock off.
+    lk.unlock();
+    s.incremental = true;
+    if (s.sck.size() != s.slices.size()) {
+        s.sck.resize(s.slices.size());
+        for (std::size_t i = 0; i < s.slices.size(); ++i) s.sck[i].Reset(s.slices[i].cmode);
+    }
+    const bool digest = nzr::selfcheck::Recorder::Get().Active();
+    if (digest && s.sdig.size() != s.slices.size()) s.sdig.assign(s.slices.size(), nzr::selfcheck::Crc64());
+    const std::uint64_t from = s.produced;
+    std::uint64_t to = from + n;
+    if (to > s.total) to = s.total;               // the caller overran its declared size
+    // Checksums follow the bytes as they pass, whatever the flush rule does
+    // with them: the original checks a slice it decoded, not one it wrote.
+    for (std::size_t i = 0; i < s.slices.size(); ++i) {
+        const Slice& sl = s.slices[i];
+        if (sl.len == 0u) continue;
+        const std::uint64_t ca = std::max(sl.spos, from);
+        const std::uint64_t cb = std::min(sl.spos + sl.len, to);
+        if (ca >= cb) continue;
+        s.sck[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
+        if (digest) s.sdig[i].Update(buf + (ca - from), static_cast<std::size_t>(cb - ca));
+    }
+    // kProduced flushes everything as it arrives, so the bytes go straight from
+    // the caller's buffer -- no hold, and no copy of every block.
+    if (hold_back) {
+        if (s.hold.empty()) s.held_base = from;
+        s.hold.insert(s.hold.end(), buf, buf + static_cast<std::size_t>(to - from));
+    } else {
+        s.held_base = from;
+    }
+    s.produced = to;
+    lk.lock();
+    const std::uint64_t safe = SafeFlushPoint(e, s, to);
+    // Each slice is created AND written before the next one is created, in entry
+    // order, as the original writes them: creating every file the range reached
+    // first and writing them all afterwards let a later O_TRUNC of the same path
+    // (-forceout, -sp) land in the middle of an earlier file's bytes.
+    for (std::size_t i = 0; i < s.slices.size(); ++i) {
+        Slice& sl = s.slices[i];
+        if (sl.len == 0u) {
+            std::uint32_t got = 0;
+            if (sl.spos < safe && EmptySliceLocked(e, sl, &got, lk)) s.pending_bad.emplace_back(i, got);
+            continue;
+        }
+        const std::uint64_t a = std::max(sl.spos, s.held_base);
+        const std::uint64_t b = std::min(sl.spos + sl.len, safe);
+        if (a < b) {
+            CreateLocked(e, sl.entry, lk);
+            FileState& f = *e.files[sl.entry];
+            if (f.write_it && !f.cannot_write) {
+                const unsigned char* src = (hold_back ? s.hold.data() : buf) + static_cast<std::size_t>(a - s.held_base);
+                e.committed = true;
+                lk.unlock();   // only this worker touches stream s and its hold
+                WriteAt(f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a));
+                lk.lock();
+            }
+        }
+        // kProduced reports a slice the moment its last byte has passed; kGroup
+        // waits for StreamEnd, because a failure can still take those bytes back.
+        if (e.policy != Policy::kGroup && !sl.checked && to >= sl.spos + sl.len) {
+            sl.checked = true;
+            if (sl.has_cksum && e.opt->checksum != ChecksumMode::kNone) {
+                const std::uint32_t got = s.sck[i].Finish();
+                if (got != sl.cval) { ++e.mismatches; s.pending_bad.emplace_back(i, got); }
+            }
+        }
+    }
+    s.flushed = std::max(s.flushed, safe);
+    if (hold_back && safe > s.held_base) {
+        s.hold.erase(s.hold.begin(), s.hold.begin() + static_cast<std::size_t>(safe - s.held_base));
+    }
+    s.held_base = safe;
+}
+
+// A worker ends stream k. `buf` holds its output (produced bytes valid), `ok` =
+// the stream decoded completely (the slice checksums may still disagree),
+// `clean_end` = it stopped early without a status. Flushes per policy, creates
+// the files the cursor reached, verifies the slices that are out.
+inline void StreamEnd(std::size_t k, const unsigned char* buf, std::uint64_t produced, bool ok, bool clean_end,
+                      // Store policy: bytes that actually arrived (the rest of `produced` is
+                      // zero padding the original writes anyway); the slice checksums are
+                      // computed over these.
+                      std::uint64_t received = ~std::uint64_t{0}) {
+    Engine& e = E();
+    std::unique_lock<std::mutex> lk(e.mu);
+    if (!e.published || k >= e.streams.size()) return;
+    Stream& s = e.streams[k];
+    // The stream streamed its output through StreamWrite: `buf` is not its whole
+    // output (it may be null), everything it produced is already on disk, and the
+    // slice checksums were accumulated as the bytes went past. Only the ending
+    // logic below -- the status, the group the cursor stands in, the empty files
+    // and the mismatch lines -- still has to run.
+    const bool inc = s.incremental;
+    if (inc) { produced = s.produced; received = produced; }
+    if (produced > s.total) produced = s.total;
+    if (received > produced) received = produced;
+    std::uint64_t flush_to = produced;
+    if (!ok && !clean_end && e.policy == Policy::kGroup) {
+        // The group in flight is lost; earlier groups (and whole quanta of this
+        // one) are out.
+        std::uint64_t gstart = 0;
+        for (std::uint64_t gs : s.group_start) if (gs <= produced) gstart = gs;
+        flush_to = gstart;
+        if (e.quantum != 0u && produced > gstart) flush_to = gstart + ((produced - gstart) / e.quantum) * e.quantum;
+    }
+    if (!ok) {
+        e.stream_failed = true;
+        // A failure with another record of this stream still ahead is the one
+        // the driver reports plainly.
+        const nzr::derr::State& st = nzr::derr::Current();
+        if (s.have_last_record && st.has_pos && st.input_pos < s.last_record_start) e.plain_code = true;
+        if (nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u) {
+            std::uint32_t code = 100u;
+            if (clean_end) {
+                const bool no_data_group = s.group_start.size() > 1u && produced <= s.group_start.back();
+                const bool cut = s.cut || e.truncated;
+                if (cut && no_data_group)
+                    code = (e.family == Family::kLzpf) ? 4u : (e.family == Family::kCd) ? 1u : 100u;
+                else if (cut)
+                    code = (e.family == Family::kCm || e.family == Family::kCo) ? kCleanEndCode
+                         : (e.family == Family::kCO) ? 100u : (e.family == Family::kLzpf) ? 2u : 4u;
+                else
+                    code = (e.family == Family::kLzpf) ? kCleanEndCode : (e.family == Family::kCd) ? 4u : 100u;
+            }
+            nzr::derr::Set(code);
+        }
+    }
+    const bool trace = NZ_ENV("NZ_TRACE_SINK") != nullptr;
+    if (trace) std::fprintf(stderr, "[sink] stream %zu produced=%llu ok=%d clean=%d flush_to=%llu code=%u\n", k,
+                            (unsigned long long)produced, (int)ok, (int)clean_end, (unsigned long long)flush_to, nzr::derr::Current().code);
+    // Files the flushed bytes reach, in entry order (each created and written
+    // before the next is created, as in StreamWrite), then the group the cursor
+    // stands in.
+    std::vector<std::pair<const Slice*, std::uint32_t>> bad;
+    for (const auto& pb : s.pending_bad) bad.emplace_back(&s.slices[pb.first], pb.second);
+    for (std::size_t si = 0; si < s.slices.size(); ++si) {
+        Slice& sl = s.slices[si];
+        // Incremental: everything up to s.flushed is already on disk and what is
+        // left of the stream lives in s.hold, covering [s.held_base, produced).
+        // Only the tail [s.flushed, flush_to) is still to decide -- under kGroup
+        // that is the group in flight, which a failure cuts back to a quantum.
+        const std::uint64_t a = std::max(sl.spos, s.flushed);
+        const std::uint64_t b = std::min(sl.spos + sl.len, flush_to);
+        if (sl.len == 0u) {
+            // Empty files inside the flushed range exist too.
+            std::uint32_t got = 0;
+            if (sl.spos <= flush_to && (ok || sl.spos < produced || sl.spos == 0u) &&
+                EmptySliceLocked(e, sl, &got, lk))
+                bad.emplace_back(&sl, got);
+            continue;
+        }
+        if (a < b) {
+            CreateLocked(e, sl.entry, lk);
+            FileState& f = *e.files[sl.entry];
+            const unsigned char* src = inc ? (s.hold.data() + static_cast<std::size_t>(a - s.held_base))
+                                           : (buf + a);
+            if (f.write_it && !f.cannot_write) {
+                e.committed = true;
+                lk.unlock();   // `src` may point into s.hold, which only this worker touches
+                WriteAt(f, sl.file_off + (a - sl.spos), src, static_cast<std::size_t>(b - a));
+                lk.lock();
+            }
+        }
+        // A stored slice is checked over whatever arrived (a cut one over 0 bytes:
+        // the original prints "ffffffff" for those).
+        const bool store_check = (e.policy == Policy::kStore) && !sl.checked;
+        if (!sl.checked && (flush_to >= sl.spos + sl.len || store_check)) {
+            sl.checked = true;
+            if (sl.has_cksum && e.opt->checksum != ChecksumMode::kNone) {
+                // Store: a slice with any byte received is checked whole (stub + zero
+                // padding); one with no record at all over nothing ("ffffffff").
+                const std::size_t avail = (store_check && received <= sl.spos) ? std::size_t{0} : static_cast<std::size_t>(sl.len);
+                const std::uint32_t got = inc ? s.sck[si].Finish()
+                                              : ComputeBufferChecksum(sl.cmode, buf + sl.spos, avail);
+                if (trace) std::fprintf(stderr, "[sink]   slice entry=%zu off=%llu len=%llu stored=%08x got=%08x\n", sl.entry,
+                                        (unsigned long long)sl.file_off, (unsigned long long)sl.len, sl.cval, got);
+                if (got != sl.cval) { ++e.mismatches; bad.emplace_back(&sl, got); }
+            } else if (trace) std::fprintf(stderr, "[sink]   slice entry=%zu unchecked has=%d\n", sl.entry, (int)sl.has_cksum);
+        }
+    }
+    s.flushed = std::max(s.flushed, flush_to);
+    // The group the cursor is in (or starts) when the stream ends short: its
+    // first file exists, empty, as the original leaves it.
+    if (!ok && produced < s.total) {
+        std::size_t g = 0;
+        for (std::size_t i = 0; i < s.group_start.size(); ++i) if (s.group_start[i] <= produced) g = i;
+        for (std::size_t i = s.entered_group; i <= g; ++i) {
+            for (const Slice& sl : s.slices) if (sl.group == i) { CreateLocked(e, sl.entry, lk); break; }
+        }
+        s.entered_group = std::max(s.entered_group, g + 1u);
+    }
+    // The self-check: what each slice decoded to. Rebuilt on every end of the
+    // stream (a stream can be rewound and decoded again), harvested by Finish.
+    if (nzr::selfcheck::Recorder::Get().Active()) {
+        s.dig_items.clear();
+        const std::uint64_t have = (e.policy == Policy::kStore) ? received : produced;
+        for (std::size_t si = 0; si < s.slices.size(); ++si) {
+            const Slice& sl = s.slices[si];
+            const std::uint64_t avail = (have > sl.spos) ? std::min<std::uint64_t>(sl.len, have - sl.spos) : 0u;
+            std::uint64_t crc = nzr::selfcheck::Crc64::Empty();
+            if (sl.len != 0u) {
+                if (inc) crc = (si < s.sdig.size()) ? s.sdig[si].Final() : nzr::selfcheck::Crc64::Empty();
+                else if (buf != nullptr && avail != 0u) crc = nzr::selfcheck::Crc64::Of(buf + sl.spos, static_cast<std::size_t>(avail));
+            }
+            s.dig_items.push_back({(*e.entries)[sl.entry].path, sl.file_off, sl.len, crc, ok && avail == sl.len});
+        }
+    }
+    std::vector<std::pair<const Slice*, std::uint32_t>> bad_copy = bad;
+    lk.unlock();
+    for (const auto& bd : bad_copy) MismatchLine(e, *bd.first, bd.second);
+    if (inc) { lk.lock(); s.hold.clear(); s.hold.shrink_to_fit(); }
+}
+
+struct Outcome { bool committed = false; bool stream_failed = false; bool plain_code = false; std::size_t mismatches = 0; std::size_t failed_entries = 0; };
+
+// Close everything, apply the timestamps, report.
+inline Outcome Finish() {
+    Engine& e = E();
+    std::lock_guard<std::mutex> lk(e.mu);
+    Outcome o;
+    if (!e.published) return o;
+    // What is still open is what never got all its bytes (a stream that stopped
+    // part-way): close it and stamp it, as before. Files that completed were
+    // closed and stamped when their last byte went out.
+    for (std::size_t i = 0; i < e.files.size(); ++i) {
+        FileState& f = *e.files[i];
+        std::lock_guard<std::mutex> fl(f.io);
+        CloseFileIo(f);
+    }
+    o.committed = e.committed; o.stream_failed = e.stream_failed; o.plain_code = e.plain_code;
+    o.mismatches = e.mismatches;
+    if (nzr::selfcheck::Recorder::Get().Active())
+        for (const Stream& st : e.streams)
+            for (const nzr::selfcheck::Item& it : st.dig_items) nzr::selfcheck::Recorder::Get().Add(it);
+    o.failed_entries = e.mismatches + e.unsafe + e.cannot + e.write_errors.load();
+    e.published = false;   // one container per run
+    return o;
+}
+
+}  // namespace psink
+
+constexpr int kLegacyNeedCompat = -100;
+
+// Sum of the bytes modulo 255: the one-byte per-stage check the original stores
+// in a block header ("staged" bytes) and verifies after each post-filter stage.
+unsigned StageCheck255(const std::uint8_t* p, std::size_t n) {
+    // The per-stage check byte: this archive family's Fletcher-32 (16-bit LE words
+    // mod 0xffff, odd tail byte as its own word, zero sums forced to 0xffff,
+    // packed s1<<16|s2) reduced modulo 255. Verified on five stage buffers of two
+    // codecs (GDB: FUN_080c0220 pops the last staged byte and compares it with
+    // checksum(stage) % 0xff).
+    std::uint32_t s1 = 0, s2 = 0;
+    std::size_t i = 0;
+    for (; i + 1 < n; i += 2) {
+        const std::uint32_t w = static_cast<std::uint32_t>(p[i]) | (static_cast<std::uint32_t>(p[i + 1]) << 8);
+        s1 = (s1 + w) % 0xffffu; s2 = (s2 + s1) % 0xffffu;
+    }
+    if (i < n) { s1 = (s1 + p[i]) % 0xffffu; s2 = (s2 + s1) % 0xffffu; }
+    if (s1 == 0u) s1 = 0xffffu;
+    if (s2 == 0u) s2 = 0xffffu;
+    return static_cast<unsigned>(((s1 << 16) | s2) % 255u);
+}
+
+// NZ_SAFE=1: instead of the original's behaviour on a damaged archive (write
+// whatever was decoded, checksum mismatches included, exit 0) write only the
+// entries whose checksum verifies, skip the rest and exit 2.
+bool SafeMode() {
+    static const bool on = (NZ_ENV("NZ_SAFE") != nullptr);
+    return on;
+}
+
+// The three single-container decoders report a corrupt stream (as opposed to
+// an unsupported one) with one of these messages; only then is the completed
+// prefix they leave in the output vector written the way the original does.
+bool IsCorruptStreamFailure(const std::string& m) {
+    return m == "optimum: decode failed" || m == "cm: malformed block stream" ||
+           m == "cm: output size mismatch" || m == "lzhd: malformed block stream" ||
+           m == "lzhd: unexpected end of file";
+}
+
+std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size);
+
+// Per-entry checksum verdicts over a decoded payload. Returns false only when the
+// entry sizes do not add up to the payload (a decode that did not complete);
+// `*bad` counts the entries whose stored checksum does not match.
+bool CheckEntries(const std::vector<LegacyCnEntry>& entries, ChecksumMode mode, bool supported,
+                  const unsigned char* data, std::size_t size,
+                  std::vector<std::uint8_t>* ok, std::size_t* bad) {
+    ok->assign(entries.size(), 1u);
+    *bad = 0;
+    std::size_t cursor = 0;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const LegacyCnEntry& e = entries[i];
+        if (e.size > size - cursor) return false;
+        const std::size_t n = static_cast<std::size_t>(e.size);
+        if (e.has_checksum && supported && mode != ChecksumMode::kNone &&
+            ComputeBufferChecksum(mode, data + cursor, n) != e.checksum) {
+            (*ok)[i] = 0u; ++*bad;
+        }
+        cursor += n;
+    }
+    return cursor == size;
+}
+
+
+
+std::uint32_t ComputeBufferChecksum(ChecksumMode mode, const unsigned char* data, std::size_t size) {
+    switch (mode) {
+        case ChecksumMode::kNone:
+            return 0;
+        case ChecksumMode::kCrc16:
+            return (UpdateCrc16(0xffffu, data, size) ^ 0xffffu) & 0xffffu;
+        case ChecksumMode::kCrc32:
+            return UpdateCrc32(0xffffffffu, data, size) ^ 0xffffffffu;
+        case ChecksumMode::kFletcher16: {
+            std::uint32_t s1 = 0;
+            std::uint32_t s2 = 0;
+            UpdateFletcher16(&s1, &s2, data, size);
+            return ((s2 & 0xffu) << 8u) | (s1 & 0xffu);
+        }
+        case ChecksumMode::kFletcher32: {
+            std::uint32_t s1 = 0;
+            std::uint32_t s2 = 0;
+            std::uint8_t pending = 0;
+            bool has_pending = false;
+            UpdateFletcher32(&s1, &s2, &pending, &has_pending, data, size);
+            return FinalizeFletcher32(s1, s2, pending, has_pending);
+        }
+    }
+    return 0;
+}
+
+bool ReadLegacyVarint(
+    const ByteView& bytes,
+    ArcPos* io_pos,
+    ArcPos end,
+    std::uint64_t* out_value) {
+    if (io_pos == nullptr || out_value == nullptr || *io_pos >= end || end > bytes.size()) {
+        return false;   // `end` beyond the buffer = a corrupt/truncated header (ASan, fuzz 2026-09-03)
+    }
+
+    ArcPos pos = *io_pos;
+    unsigned char cur = bytes[pos++];
+    std::uint64_t value = static_cast<std::uint64_t>(cur & 0x7fu);
+    unsigned shift = 7;
+
+    while ((cur & 0x80u) != 0u) {
+        if (pos >= end || shift >= 63u) {
+            return false;
+        }
+        cur = bytes[pos++];
+        value += (static_cast<std::uint64_t>((cur & 0x7fu) + 1u) << shift);
+        shift += 7u;
+    }
+
+    *io_pos = pos;
+    *out_value = value;
+    return true;
+}
+
+void WriteLegacyVarint(std::uint64_t value, std::vector<unsigned char>* out_bytes) {
+    if (out_bytes == nullptr) {
+        return;
+    }
+
+    const unsigned char first = static_cast<unsigned char>(value & 0x7fu);
+    std::uint64_t q = value >> 7u;
+    if (q == 0u) {
+        out_bytes->push_back(first);
+        return;
+    }
+
+    out_bytes->push_back(static_cast<unsigned char>(first | 0x80u));
+    while (q != 0u) {
+        const std::uint64_t y = q - 1u;
+        const unsigned char chunk = static_cast<unsigned char>(y & 0x7fu);
+        q = y >> 7u;
+        if (q != 0u) {
+            out_bytes->push_back(static_cast<unsigned char>(chunk | 0x80u));
+        } else {
+            out_bytes->push_back(chunk);
+        }
+    }
+}
+
+std::uint32_t ReadU32LE(const unsigned char* p);
+// Per-file attributes carried by the container's metadata records.  A legacy
+// archive is a flat sequence of [varint (size<<4)|type][payload] records, and
+// the files are handed to the compressor in BLOCKS: each block contributes a
+// type-1 filename table followed by the type-2/type-4 records for exactly that
+// table's files, while the type-5/6/7 checksum records form one running list
+// across the whole archive (a block emits the checksums of the files its data
+// record completes, which is why a block's checksum count need not match its
+// own table).  Validated against the original linux32 binary on 40+ synthesised
+// archives (1..200 files, single- and multi-block, every checksum mode,
+// -nt/-np, setuid/sticky modes).
+//
+//   type 2  timestamps  [u32le mtime of the record's first file] then a zigzag
+//                       bounded-varint delta per further file, until the record
+//                       ends.  Absent with -nt.
+//   type 4  permissions a sequence of u16le values V, each covering a run of
+//                       consecutive files:
+//                         V <  0x1000  ->  one file, mode = V
+//                         V >= 0x1000  ->  run of ((V >> 9) - 6) files,
+//                                          mode = V & 0x1ff
+//                       The ranges are disjoint because the encoder only
+//                       collapses a run when mode < 0x200, which is also why a
+//                       repeated setuid/sticky mode is written once per file.
+//                       Max run is 121, so 200 equal modes encode as 121 + 79.
+//                       The record is absent with -np and also when every mode
+//                       is 0600 -- such an archive is byte-identical to the -np
+//                       one, so absence means "no permissions stored", not
+//                       "default permissions", and the original then drops the
+//                       perm column from `l` and creates files with mode 0600.
+//   type 5/7 checksums  u32le per file  (5 = fletcher, 7 = crc32)
+//   type 6  checksums   u16le per file  (crc16).  Absent with -hn.
+//
+// Returns true only when every record parsed AND each attribute that appears at
+// all covers exactly one value per entry.  It never guesses: on false nothing
+// is written, so callers fall back to the older per-shape heuristics and, more
+// importantly, no half-parsed checksum can be mistaken for a real one.
+// Per stream: {table start, entries named by the stream through that table}.
+using LegacyTableMarks = std::map<unsigned, std::vector<std::pair<ArcPos, std::size_t>>>;
+
+bool ApplyLegacyAttributeRecords(
+    const ByteView& bytes,
+    // {stream, type, begin, end} -- begin/end are FILE offsets, so ArcPos.
+    const std::vector<std::array<ArcPos, 4>>& records,
+    const std::map<unsigned, std::vector<std::size_t>>& stream_named,
+    const std::set<std::string>& split_paths,
+    std::vector<LegacyCnEntry>* entries,
+    // Where each table starts, to place a permission record in its own block.
+    const LegacyTableMarks* table_marks = nullptr,
+    // The archive is cut: the records of its last blocks are gone, so the
+    // values cover only the files before them. Hand out what there is (the
+    // entries past it keep no checksum, as they keep no date) instead of
+    // refusing the whole set -- the original checks the entries it has values
+    // for. Only for an archive the record walk found cut.
+    bool lenient_tail = false) {
+    if (entries == nullptr || entries->empty()) {
+        return false;
+    }
+
+    // Per stream: the values decoded so far, one slot per file that stream's
+    // tables named, consumed in that order.
+    struct StreamAcc {
+        std::vector<std::int64_t> mtimes;
+        std::vector<std::uint32_t> perms;
+        std::vector<std::uint32_t> listed;   // the same values, NOT aligned to their blocks
+        std::vector<std::uint32_t> checksums;
+        std::vector<std::uint32_t> uids;
+        std::vector<std::uint32_t> gids;
+        std::vector<std::uint32_t> attrs;    // Windows attribute nibbles (record type 3)
+    };
+    std::map<unsigned, StreamAcc> acc;
+
+    for (const auto& rec : records) {
+        const unsigned sid = static_cast<unsigned>(rec[0]);
+        const unsigned rtype = static_cast<unsigned>(rec[1]);
+        // FILE offsets: on a 32-bit build a record past the 4 GB mark wrapped
+        // here, and every walk below read the archive 2^32 bytes short. On the
+        // reporter's 4.6 GB archive that made `l` print the WRONG stored
+        // checksum (d0b231e8 for 74abd879) and `x`/`t` then report a mismatch
+        // on output that was byte-identical to the original's.
+        const ArcPos rbegin = rec[2];
+        const ArcPos rend = rec[3];
+        if (rbegin > rend || rend > bytes.size()) return false;
+        const ArcPos rsize = rend - rbegin;
+
+        const auto named_it = stream_named.find(sid);
+        if (named_it == stream_named.end()) return false;
+        const std::size_t n = named_it->second.size();
+        StreamAcc& a = acc[sid];
+
+        switch (rtype) {
+            case 2u: {
+                if (rsize < 4u) return false;
+                ArcPos p = rbegin;
+                std::int64_t cur = static_cast<std::int64_t>(bytes.U32At(p));
+                p += 4u;
+                if (a.mtimes.size() >= n) return false;
+                a.mtimes.push_back(cur);
+                while (p < rend) {
+                    std::uint64_t z = 0u;
+                    if (!ReadLegacyVarint(bytes, &p, rend, &z)) return false;
+                    cur += static_cast<std::int64_t>(z >> 1u) ^ -static_cast<std::int64_t>(z & 1u);
+                    if (a.mtimes.size() >= n) return false;
+                    a.mtimes.push_back(cur);
+                }
+                if (p != rend) return false;
+                break;
+            }
+            case 3u: {
+                // Windows file attributes: one NIBBLE per entry, high nibble
+                // first, zero-padded to a byte. The nibble is
+                // `8 | READONLY | HIDDEN<<1 | SYSTEM<<2`, so 0 can only be
+                // padding (measured on seven files covering every combination).
+                // The record is OMITTED for a block whose files are all plain,
+                // so it has to be aligned to the files of its own block: the
+                // block's type-2 record comes first, which makes mtimes.size()
+                // the file count through this block. The gap is filled with 8
+                // (plain), which is what the original lists for such an entry.
+                std::size_t k = 0;
+                for (ArcPos p = rbegin; p < rend; ++p) {
+                    if (((bytes[p] >> 4) & 0x0fu) != 0u) ++k;
+                    if ((bytes[p] & 0x0fu) != 0u) ++k;
+                }
+                if (a.mtimes.size() >= k && a.attrs.size() < a.mtimes.size() - k)
+                    a.attrs.resize(a.mtimes.size() - k, 8u);
+                for (ArcPos p = rbegin; p < rend; ++p) {
+                    for (int half = 1; half >= 0; --half) {
+                        const std::uint32_t nib = (static_cast<std::uint32_t>(bytes[p]) >> (half * 4)) & 0x0fu;
+                        if (nib == 0u) continue;            // padding
+                        if (a.attrs.size() >= n) return false;
+                        a.attrs.push_back(nib);
+                    }
+                }
+                break;
+            }
+            case 4u: {
+                if ((rsize % 2u) != 0u) return false;
+                // The record is OMITTED for a block whose files are all 0600
+                // (the same rule as for a whole archive, applied block by
+                // block), so it covers the files of its OWN block only: the
+                // blocks before it that left theirs out are 0600. Measured on
+                // `a -cf -t1` of a 0664 file and a 0600 one, a table each: one
+                // type-4 record, and the original lists the second file 0600.
+                // Without this the record covered one entry of two, the whole
+                // record set was refused, and the heuristics that followed
+                // called an intact archive corrupt (-cf) or gave every file
+                // mode 0664 and a date in 1997 (-cd).
+                if (table_marks != nullptr) {
+                    const auto tm = table_marks->find(sid);
+                    std::size_t before = 0;   // entries named by the tables before this block's
+                    if (tm != table_marks->end()) {
+                        std::size_t through = 0;
+                        for (const auto& mark : tm->second) {
+                            if (mark.first >= rbegin) break;
+                            before = through;
+                            through = mark.second;
+                        }
+                    }
+                    if (a.perms.size() < before) a.perms.resize(before, 0600u);
+                }
+                for (ArcPos p = rbegin; p + 1u < rend; p += 2u) {
+                    const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
+                                            (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                    std::uint32_t mode = v;
+                    std::size_t run = 1u;
+                    if (v >= 0x1000u) {
+                        const std::uint32_t coded = v >> 9u;
+                        if (coded < 8u) return false;
+                        run = static_cast<std::size_t>(coded - 6u);
+                        mode = v & 0x1ffu;
+                    }
+                    if (run > n - a.perms.size()) return false;
+                    a.perms.insert(a.perms.end(), run, mode);
+                    a.listed.insert(a.listed.end(), std::min(run, n - std::min(n, a.listed.size())), mode);
+                }
+                break;
+            }
+            case 8u:
+            case 9u: {
+                // uid (8) / gid (9): u16 values, run-coded like the permissions
+                // (three files with uid 1000 were stored as e8 03 three times).
+                std::vector<std::uint32_t>& dst = (rtype == 8u) ? a.uids : a.gids;
+                if ((rsize % 2u) != 0u) return false;
+                for (ArcPos p = rbegin; p + 1u < rend; p += 2u) {
+                    const std::uint32_t v = static_cast<std::uint32_t>(bytes[p]) |
+                                            (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                    std::uint32_t id = v;
+                    std::size_t run = 1u;
+                    if (v >= 0x1000u) {
+                        const std::uint32_t coded = v >> 9u;
+                        if (coded < 8u) return false;
+                        run = static_cast<std::size_t>(coded - 6u);
+                        id = v & 0x1ffu;
+                    }
+                    if (run > n - dst.size()) return false;
+                    dst.insert(dst.end(), run, id);
+                }
+                break;
+            }
+            case 5u:
+            case 6u:
+            case 7u: {
+                const std::size_t width = (rtype == 6u) ? 2u : 4u;
+                if (rsize == 0u || (rsize % width) != 0u) return false;
+                if (a.checksums.size() + rsize / width > n) return false;
+                for (ArcPos p = rbegin; p < rend; p += width) {
+                    a.checksums.push_back(
+                        (width == 2u)
+                            ? (static_cast<std::uint32_t>(bytes[p]) |
+                               (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u))
+                            : bytes.U32At(p));
+                }
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+
+    // The blocks after the last permission record left theirs out too: 0600.
+    if (table_marks != nullptr) {
+        for (auto& kv : acc) {
+            const auto named_it = stream_named.find(kv.first);
+            if (named_it == stream_named.end()) return false;
+            StreamAcc& a = kv.second;
+            if (!a.perms.empty() && a.perms.size() < named_it->second.size())
+                a.perms.resize(named_it->second.size(), 0600u);
+        }
+    }
+
+    bool any = false;
+    for (const auto& kv : acc) {
+        const auto named_it = stream_named.find(kv.first);
+        if (named_it == stream_named.end()) return false;
+        const std::size_t n = named_it->second.size();
+        const StreamAcc& a = kv.second;
+        // Partial coverage means the layout was not the one described above;
+        // treat it as not understood rather than filling some files and not
+        // others -- EXCEPT for the mtimes, which the original itself leaves
+        // short. An mtime run longer than a record's payload (~32 KB) is split
+        // across several type-2 records, and the original parses each one as a
+        // fresh [u32 absolute][deltas] run: a continuation record's first four
+        // bytes are deltas, so it reads them as an absolute near zero and emits
+        // one value where three or four belonged. Measured on a 70 000-file
+        // archive: entries 0..32764 are right, from 32765 the original lists
+        // 1969-Dec-31 (the epoch in local time) and the LAST SIX entries get no
+        // date column at all, because its value run ran six short. So parse the
+        // records the same way and hand out what there is; the entries past the
+        // end keep has_mtime = false, which prints the same empty column, and
+        // the perms and checksums (fixed-width, exact) still apply. Quirk 43.
+        if ((!a.perms.empty() && (lenient_tail ? a.perms.size() > n : a.perms.size() != n)) ||
+            (!a.attrs.empty() && a.attrs.size() > n) ||
+            (!a.checksums.empty() && (lenient_tail ? a.checksums.size() > n : a.checksums.size() != n)) ||
+            a.mtimes.size() > n) {
+            return false;
+        }
+        if (!a.mtimes.empty() || !a.perms.empty() || !a.attrs.empty() || !a.checksums.empty()) any = true;
+    }
+    if (!any) return false;
+
+    for (auto& kv : acc) {
+        const std::vector<std::size_t>& named = stream_named.find(kv.first)->second;
+        StreamAcc& a = kv.second;
+        // An archive that stores attributes at all gives every entry one: the
+        // blocks whose files are plain just omit the record.
+        if (!a.attrs.empty() && a.attrs.size() < named.size()) a.attrs.resize(named.size(), 8u);
+        for (std::size_t i = 0; i < named.size(); ++i) {
+            LegacyCnEntry& e = (*entries)[named[i]];
+            if (i < a.mtimes.size()) { e.mtime_unix = a.mtimes[i]; e.has_mtime = true; }
+            if (!a.perms.empty() && i < a.perms.size()) {
+                e.permissions = a.perms[i]; e.has_permissions = true;
+                // The original's LISTER hands the stored modes out in order,
+                // without the block alignment its extractor applies, and gives
+                // the entries left over 0600: a block that omitted its record
+                // (all 0600) shifts every later block's modes up the listing.
+                // Measured: a -cf -t1 archive whose f2.txt (0600) block omits
+                // the record lists f2.txt 0644 and f5.txt 0600 -- f5's mode,
+                // then the pad -- and still extracts f2.txt 0600, f5.txt 0644.
+                e.listed_permissions = (i < a.listed.size()) ? a.listed[i] : 0600u;
+                e.has_listed_permissions = true;
+            }
+            if (!a.attrs.empty()) {
+                e.win_attr = static_cast<std::uint8_t>(a.attrs[i]);
+                e.has_win_attr = true;
+                // What the Linux original lists and restores for these.
+                e.permissions = (a.attrs[i] & 1u) ? 0400u : 0600u;
+                e.has_permissions = true;
+            }
+            if (a.uids.size() == named.size() && a.gids.size() == named.size()) {
+                e.uid = a.uids[i]; e.gid = a.gids[i]; e.has_owner = true;
+            }
+            if (!a.checksums.empty() && i < a.checksums.size()) {
+                if (split_paths.count(e.path) != 0u) {
+                    e.checksum_na = true;  // slice checksum, not this file's
+                } else {
+                    e.checksum = a.checksums[i];
+                    e.has_checksum = true;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+struct LegacyCnContext;
+class OptimumOut;
+static bool TryDecodeLegacyCm(const LegacyCnContext& legacy,
+                              OptimumOut* out_data,
+                              std::string* out_error_message);
+
+// One slice of one file inside a parallel (-pN) container. Each stream's record
+// set names its slices as (type-1 table with a single filename+length, type-10
+// offset WITHIN that file) pairs, in the order the stream's data decodes to, and
+// its type-5/6/7 record carries one checksum per slice in that same order.
+struct LegacyParallelSlice {
+    std::string path;
+    std::uint64_t osz = 0;   // this slice's decoded length
+    std::uint64_t ooff = 0;  // where it sits inside its own file
+    ChecksumMode cmode = ChecksumMode::kNone;
+    std::uint32_t cval = 0;
+    bool hasoff = false;
+    bool has_cksum = false;
+    std::size_t table = 0;   // which filename table of the stream introduced it (its flush group)
+};
+
+// One stream of a parallel (-pN) container.
+struct LegacyParallelStream {
+    // Block-record payload ranges for this stream, in order. Usually one, but
+    // concatenated when a stream spans several type-0 chunks.
+    std::vector<std::pair<ArcPos, ArcPos>> chunks;
+    std::uint64_t osz = 0, ooff = 0;      // this slice's size and output offset
+    ChecksumMode cmode = ChecksumMode::kNone;
+    std::uint32_t cval = 0;               // checksum OF THE SLICE, not the file
+    bool hasoff = false, hassz = false;
+    // Every slice this stream carries, in order. A single-file archive has one
+    // and the fields above describe it; a multi-file one can have several, of
+    // different files (a stream is a worker, not a file).
+    std::vector<LegacyParallelSlice> slices;
+    // This stream's own codec record (type 11): p0 = selector, p1 = the window
+    // byte. Every worker writes one; so far they have always agreed with each
+    // other, but the ring below is sized from the stream's OWN byte regardless.
+    std::uint8_t p0 = 0, p1 = 0;
+    bool hasparams = false;
+    std::size_t last_table_first = 0;     // index in `slices` of the latest table's first entry
+    std::size_t table_count = 0;          // filename tables seen so far
+    bool cut = false;                     // its last data record was cut off by the end of the file
+};
+
+// The -cd/-cD LZ ring, in 64 KB units, from the codec record's p1 byte:
+// bytefloat(p1 + 1) -- xp1 = p1 + 1, m = xp1 & 0xf, s = xp1 >> 4,
+// if (s) m = (m + 16) << (s - 1). The same mantissa/exponent byte the -cc
+// window and the lzpf dictionary capacity use. NOT round(size / 0x10000): that
+// fit every sample it was measured on and failed the first slice where the two
+// disagree (2322452 bytes: p1 = 33 -> 36 units, round gives 35, and a match
+// then reached past the whole ring).
+static std::uint32_t LegacyCdRingUnitsFromP1(std::uint8_t p1) {
+    const unsigned xp1 = static_cast<unsigned>(p1) + 1u;
+    unsigned m = xp1 & 0x0fu;
+    const unsigned sh = xp1 >> 4u;
+    if (sh) m = (m + 16u) << (sh - 1u);
+    return m ? static_cast<std::uint32_t>(m) : 1u;
+}
+
+// Detect and parse a parallel container. The encoder splits the input into one
+// slice per worker and gives each its own record set, tagged with a stream id
+// in the type-15 extension: type-1 = slice size, type-10 = u32 output offset,
+// type-5/6/7 = slice checksum, type-0 = its compressed (or, for -cn, raw) data.
+// Streams appear in arbitrary order and are tiled by their offsets.
+//
+// Detected by the record right after the version chunk being an extended one.
+// Returns false when the archive is not parallel or the record walk breaks.
+bool ParseLegacyParallelStreams(
+    const ByteView& bytes,
+    std::map<unsigned, LegacyParallelStream>* out_streams,
+    // A store (-cn) copies whatever bytes of a cut record exist (measured: the
+    // slice checksum is computed over stub + zero padding); the compressed
+    // codecs never see a cut record.
+    bool keep_cut_chunk = false) {
+    if (out_streams == nullptr) return false;
+    out_streams->clear();
+
+    ArcPos magic = bytes.size();
+    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+            magic = q;
+            break;
+        }
+    }
+    // The record after the magic is a stream-id extension (low nibble 15) in a
+    // parallel container; comparing the WHOLE byte to 0x0f only held while a
+    // checksum record came first, so `-hn` containers were rejected here.
+    if (magic == bytes.size() || (bytes[magic + 3u] & 0x0fu) != 0x0fu) return false;
+
+    ArcPos p = magic + 3u;
+    for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
+        std::uint64_t r = 0;
+        if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) return false;
+        unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+        unsigned sid = 0u;
+        ArcPos csz = r >> 4u;
+        if (ct == 15u) {
+            if (p >= bytes.size()) return false;
+            unsigned ext = bytes[p++];
+            if (ext >= 0xf8u) {
+                if (p >= bytes.size()) return false;
+                ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+            }
+            ct = ext & 0x0fu;
+            sid = ext >> 4u;
+            if (sid == 0u) ct += 15u;
+        }
+        bool cut_rec = false;
+        if (csz > bytes.size() - p) {
+            if (ct != 0u || p >= bytes.size()) return false;
+            csz = bytes.size() - p; cut_rec = true;   // cut data record: dropped, the stream ends short
+        }
+        LegacyParallelStream& st = (*out_streams)[sid];
+        if (ct == 1u && csz >= 2u) {
+            // A filename TABLE: (size varint, name\0) pairs, one per file the
+            // block starts (a stream carrying a continued part of a big file
+            // and two small files has a one-entry table + a two-entry table).
+            // The stream-level size is the first entry's (the single-file
+            // container has exactly one).
+            ArcPos tp = p;
+            bool first = true;
+            while (tp < p + csz) {
+                std::uint64_t v = 0;
+                if (!ReadLegacyVarint(bytes, &tp, p + csz, &v)) break;
+                const ArcPos nul_at = bytes.FindByte(tp, p + csz, 0u);
+                if (nul_at == p + csz) break;
+                if (first) { st.osz = v; st.hassz = true; st.last_table_first = st.slices.size(); first = false; ++st.table_count; }
+                LegacyParallelSlice sl;
+                sl.table = st.table_count - 1u;
+                sl.path = bytes.StringAt(tp, nul_at - tp);
+                sl.osz = v;
+                st.slices.push_back(std::move(sl));
+                tp = nul_at + 1u;
+            }
+        } else if (ct == 11u && csz >= 1u) {
+            st.p0 = bytes[p];
+            st.p1 = (csz >= 2u) ? bytes[p + 1u] : 0u;
+            st.hasparams = true;
+        } else if (ct == 10u && csz >= 4u) {
+            st.ooff = bytes.U32At(p);
+            st.hasoff = true;
+            // The offset belongs to the continued file part the table just
+            // introduced: its FIRST entry (a stream resumes a big file first,
+            // then starts new files, which sit at offset 0 of their own).
+            if (st.last_table_first < st.slices.size() && !st.slices[st.last_table_first].hasoff) {
+                st.slices[st.last_table_first].ooff = st.ooff; st.slices[st.last_table_first].hasoff = true;
+            } else {
+                for (auto it = st.slices.rbegin(); it != st.slices.rend(); ++it) {
+                    if (!it->hasoff) { it->ooff = st.ooff; it->hasoff = true; break; }
+                }
+            }
+        } else if ((ct == 5u || ct == 6u || ct == 7u) && csz > 0u) {
+            const ChecksumMode m = (ct == 5u) ? ChecksumMode::kFletcher32
+                                 : (ct == 6u) ? ChecksumMode::kCrc16
+                                              : ChecksumMode::kCrc32;
+            const std::size_t width = (ct == 6u) ? 2u : 4u;
+            if ((csz % width) == 0u) {
+                ArcPos q = p;
+                for (auto& sl : st.slices) {
+                    if (sl.has_cksum || q + width > p + csz) continue;
+                    sl.cmode = m;
+                    sl.cval = (width == 2u)
+                        ? (static_cast<std::uint32_t>(bytes[q]) |
+                           (static_cast<std::uint32_t>(bytes[q + 1u]) << 8u))
+                        : bytes.U32At(q);
+                    sl.has_cksum = true;
+                    q += width;
+                }
+            }
+            if (csz == width) {  // the single-file fields the older paths read
+                st.cmode = m;
+                st.cval = (width == 2u)
+                    ? (static_cast<std::uint32_t>(bytes[p]) |
+                       (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u))
+                    : bytes.U32At(p);
+            }
+        } else if (ct == 0u && csz > 0u) {
+            if (!cut_rec || keep_cut_chunk) st.chunks.emplace_back(p, csz);
+            if (cut_rec) st.cut = true;
+        }
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[PAR] rec sid=%u ct=%u csz=%zu at %zu\n", sid, ct, csz, p);
+        p += csz;
+    }
+    if (NZ_ENV("NZ_TRACE_PARSTREAM")) {
+        for (const auto& kv : *out_streams) {
+            std::fprintf(stderr, "[PAR] stream %u: osz=%llu(%d) ooff=%llu(%d) cmode=%d chunks=%zu slices=%zu\n",
+                         kv.first, (unsigned long long)kv.second.osz, (int)kv.second.hassz,
+                         (unsigned long long)kv.second.ooff, (int)kv.second.hasoff,
+                         (int)kv.second.cmode, kv.second.chunks.size(), kv.second.slices.size());
+        }
+    }
+    return !out_streams->empty();
+}
+
+// Assemble a parallel (-pN) container that holds SEVERAL files.
+//
+// A stream is a worker, not a file: it can carry slices of two different files,
+// and one file's slices can be spread over several streams. Each stream decodes
+// as ONE unit -- its data records form a single chain whose output is the
+// concatenation of its slices in table order -- and every slice then lands at
+// (its file's base in the output) + (its own offset WITHIN that file). The
+// type-10 offset being file-relative rather than output-relative is what makes
+// the single-file tiling paths wrong here: in a two-file archive both files have
+// a slice at offset 0.
+//
+// `decode_stream` turns one stream's concatenated chunk bytes into its declared
+// output length; it is the only codec-specific part. Every slice is checked
+// against its own checksum, so a wrong layout produces nothing rather than
+// wrong bytes.
+// ---------------------------------------------------------------------------
+// Parallel decode of a parallel container's worker streams.
+//
+// The streams of a -pN container are independent by construction (each worker
+// of the original owned its own codec instance, window and checksum), so they
+// decode concurrently -- the original does the same (2.29 GB in 4.7 s on 16
+// cores where this port, decoding them one after another, took 49 s). Every
+// stream writes into its own disjoint slice of the assembled buffer, and
+// DisjointCover() proves the slices tile the output without overlap BEFORE any
+// thread runs, so no two threads ever touch the same byte.
+// ---------------------------------------------------------------------------
+unsigned g_decode_threads = 0;   // -t<n> (0 = automatic)
+
+unsigned DecodeThreadCount() {
+    if (const char* e = NZ_ENV("NZ_THREADS")) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v > 0) return static_cast<unsigned>(std::min<long>(v, 256));
+    }
+    unsigned n = g_decode_threads ? g_decode_threads : std::thread::hardware_concurrency();
+    if (n == 0u) n = 1u;
+    if (n > 64u) n = 64u;
+    return n;
+}
+
+// Sorts [offset, offset+size) ranges and checks that they tile [0, total)
+// exactly: no gap, no overlap. The precondition for writing slices from
+// several threads.
+bool DisjointCover(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t total) {
+    std::sort(ranges.begin(), ranges.end());
+    std::uint64_t at = 0;
+    for (const auto& r : ranges) {
+        if (r.first != at || r.second == 0u || r.second > total - at) return false;
+        at += r.second;
+    }
+    return at == total;
+}
+
+// Runs fn(i) for every i in [0, n) on up to DecodeThreadCount() threads; a false
+// return stops the scheduling of further items. std::bad_alloc inside a worker
+// is re-thrown on the calling thread so main() reports "Out of memory!".
+bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) {
+    if (n == 0u) return true;
+    const std::size_t threads = std::min<std::size_t>(DecodeThreadCount(), n);
+    std::atomic<bool> ok{true};
+    std::atomic<bool> oom{false};
+    // The original reports the FIRST slot (lowest index) that holds an error
+    // status, as status<<8 | slot. Each worker's decoders record their status in
+    // the thread-local channel; collect the lowest slot's and hand it to the
+    // calling thread when the batch is over.
+    std::mutex fail_mu;
+    bool have_fail = false; std::size_t fail_slot = 0; nzr::derr::State fail_state;
+    const auto record_failure = [&](std::size_t i) {
+        std::lock_guard<std::mutex> lk(fail_mu);
+        if (!have_fail || i < fail_slot) { have_fail = true; fail_slot = i; fail_state = nzr::derr::Current(); }
+        nzr::derr::Clear();
+    };
+    const auto publish_failure = [&]() {
+        if (!have_fail) return;
+        nzr::derr::t_state = fail_state; nzr::derr::t_state.parallel = true; nzr::derr::t_state.slot = fail_slot;
+        if (nzr::derr::t_state.code == 0u && nzr::derr::t_state.fatal_id == 0u) nzr::derr::t_state.code = 100u;
+    };
+    if (threads <= 1u) {
+        for (std::size_t i = 0; i < n; ++i) {   // every stream runs, as the original's workers do after a failure
+            progress::SlotScope slot(i);
+            progress::SlotStarted(i);
+            if (!fn(i)) { ok = false; record_failure(i); }
+            else progress::StreamDone(i);
+        }
+        publish_failure();
+        return ok;
+    }
+    // The streams share the thread budget with the inverse BWT inside each of
+    // them (issue #2 item 9): `threads` workers each running a BWT team of the
+    // whole -t count oversubscribed the machine (8 x 8 on 8 cores). While they
+    // run, each team gets its share, at least one; set here, on the calling
+    // thread, before the workers start, and put back after they are joined.
+    struct BwtShare {
+        unsigned saved;
+        explicit BwtShare(unsigned share) : saved(NzBwtGetThreadCount()) { NzBwtSetThreadCount(share); }
+        ~BwtShare() { NzBwtSetThreadCount(saved); }
+    } bwt_share(std::max<unsigned>(1u, DecodeThreadCount() / static_cast<unsigned>(threads)));
+    std::atomic<std::size_t> next{0};
+    auto worker = [&]() {
+        for (;;) {
+            const std::size_t i = next.fetch_add(1u);
+            if (i >= n) return;
+            try {
+                progress::SlotScope slot(i);
+                progress::SlotStarted(i);
+                if (!fn(i)) { ok = false; record_failure(i); }
+                else progress::StreamDone(i);
+            } catch (const std::bad_alloc&) {
+                oom = true; ok = false;
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(threads - 1u);
+    for (std::size_t k = 1; k < threads; ++k) pool.emplace_back(worker);
+    worker();
+    for (auto& th : pool) th.join();
+    if (oom) throw std::bad_alloc();
+    publish_failure();
+    return ok;
+}
+
+template <class DecodeStreamFn>
+bool AssembleParallelMultiFile(
+    const ByteView& bytes,
+    const std::map<unsigned, LegacyParallelStream>& streams,
+    const std::vector<LegacyCnEntry>& entries,
+    std::uint64_t total,
+    DecodeStreamFn&& decode_stream,
+    std::vector<unsigned char>* out,
+    // Parallel sink: write each stream as it completes instead of assembling.
+    bool use_sink = false,
+    psink::Policy policy = psink::Policy::kProduced,
+    std::uint64_t quantum = 0u,
+    psink::Family family = psink::Family::kCm,
+    // `-hn` writes no checksum at all: a slice without one is then normal, not
+    // a slice whose checksum we failed to read.
+    bool require_cksum = true) {
+    if (out == nullptr || entries.size() < 2u || total == 0u ||
+        total > (static_cast<std::uint64_t>(1) << 40)) {
+        return false;
+    }
+    // Files are laid out in the order `entries` holds them, which is also how
+    // the caller splits the assembled buffer back into files.
+    std::map<std::string, std::uint64_t> base;
+    std::uint64_t acc = 0;
+    for (const LegacyCnEntry& e : entries) {
+        if (!base.emplace(e.path, acc).second) return false;
+        acc += e.size;
+    }
+    if (acc != total) return false;
+
+    // Validate every stream and prove the slices tile the output before any
+    // thread runs; then decode the streams concurrently, each writing its own
+    // disjoint slices.
+    std::vector<const LegacyParallelStream*> list;
+    std::vector<std::uint64_t> outs;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& kv : streams) {
+        const LegacyParallelStream& st = kv.second;
+        if ((st.chunks.empty() && !st.cut) || st.slices.empty()) continue;
+        std::uint64_t stream_out = 0;
+        for (const LegacyParallelSlice& sl : st.slices) {
+            if (sl.osz == 0u) continue;   // an empty file: nothing to decode or place
+            if (require_cksum && !sl.has_cksum) return false;
+            const auto it = base.find(sl.path);
+            if (it == base.end()) return false;
+            if (it->second + sl.ooff + sl.osz > total) return false;
+            ranges.emplace_back(it->second + sl.ooff, sl.osz);
+            stream_out += sl.osz;
+        }
+        if (stream_out > total) return false;
+        if (stream_out == 0u) continue;   // only empty files: no data to decode
+        list.push_back(&st);
+        outs.push_back(stream_out);
+    }
+    if (!DisjointCover(ranges, total)) return false;
+    if (use_sink) {
+        std::map<std::string, std::size_t> eidx;
+        for (std::size_t i = 0; i < entries.size(); ++i) eidx.emplace(entries[i].path, i);
+        std::vector<psink::Stream> streams;
+        for (const LegacyParallelStream* st : list) {
+            psink::Stream ps;
+            for (const LegacyParallelSlice& sl : st->slices) {
+                psink::Slice x;
+                x.entry = eidx.find(sl.path)->second; x.file_off = sl.ooff; x.len = sl.osz;
+                x.cmode = sl.cmode; x.cval = sl.cval; x.has_cksum = sl.has_cksum; x.group = sl.table;
+                ps.slices.push_back(x);
+            }
+            ps.cut = st->cut;
+            streams.push_back(std::move(ps));
+        }
+        use_sink = psink::Publish(entries, std::move(streams), policy, quantum, family);
+    }
+    std::vector<unsigned char> assembled_store;
+    if (!use_sink) assembled_store.assign(static_cast<std::size_t>(total), 0);
+
+    const bool all = ParallelForEach(list.size(), [&](std::size_t idx) -> bool {
+        const LegacyParallelStream& st = *list[idx];
+        const std::uint64_t stream_out = outs[idx];
+        if (use_sink) {
+            psink::StreamBegin(idx);
+            // Where this stream's LAST data record starts in the byte space its
+            // decoder consumes (the chunks are fed concatenated): a failure
+            // before it is the one the driver reports plainly. The single-file
+            // parallel paths do the same; without it a multi-file container
+            // printed status<<8|slot where the original prints the status.
+            // Only a recorded input position decides -- "produced nothing" is
+            // not a criterion (pmf_o 0.50/0.60 and pmf_Ou 0.60 produce nothing
+            // and are shifted). A block the engine declines without a status
+            // records its place too (nzr::derr::SetPos), which is what makes
+            // pmf_o 0.30 plain: its failing block is the first of six records.
+            if (st.chunks.size() > 1u) {
+                std::uint64_t off = 0;
+                for (std::size_t q = 0; q + 1u < st.chunks.size(); ++q) off += st.chunks[q].second;
+                psink::SetLastRecordStart(idx, off);
+            }
+            const auto accept_all = [](const std::vector<unsigned char>&) { return true; };
+            std::vector<unsigned char> decoded;
+            bool okd = decode_stream(st.chunks, stream_out, accept_all, &decoded);
+            if (decoded.size() > stream_out) decoded.resize(static_cast<std::size_t>(stream_out));
+            std::uint64_t received = decoded.size();
+            if (policy == psink::Policy::kStore) decoded.resize(static_cast<std::size_t>(stream_out));   // zero-padded, as the original writes it
+            else okd = okd && decoded.size() == stream_out;
+            const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
+            psink::StreamEnd(idx, decoded.data(), decoded.size(), okd, clean, received);
+            return okd;
+        }
+        const auto accept = [&](const std::vector<unsigned char>& dec) -> bool {
+            if (dec.size() != stream_out) return false;
+            std::uint64_t cur = 0;
+            for (const LegacyParallelSlice& sl : st.slices) {
+                if (sl.osz == 0u) continue;
+                if (ComputeBufferChecksum(sl.cmode, dec.data() + cur,
+                                          static_cast<std::size_t>(sl.osz)) != sl.cval) {
+                    return false;
+                }
+                cur += sl.osz;
+            }
+            return true;
+        };
+        std::vector<unsigned char> decoded;
+        if (!decode_stream(st.chunks, stream_out, accept, &decoded)) return false;
+        if (!accept(decoded)) return false;
+        std::uint64_t cursor = 0;
+        for (const LegacyParallelSlice& sl : st.slices) {
+            if (sl.osz == 0u) continue;
+            const std::uint64_t file_base = base.find(sl.path)->second;
+            std::memcpy(assembled_store.data() + static_cast<std::size_t>(file_base + sl.ooff),
+                        decoded.data() + static_cast<std::size_t>(cursor),
+                        static_cast<std::size_t>(sl.osz));
+            cursor += sl.osz;
+        }
+        return true;
+    });
+    if (use_sink) return psink::Committed();
+    if (!all) return false;
+    *out = std::move(assembled_store);
+    return true;
+}
+
+// Concatenate a stream's data-record payloads into one buffer.
+inline std::vector<unsigned char> ConcatParallelChunks(
+    const ByteView& bytes,
+    const std::vector<std::pair<ArcPos, ArcPos>>& chunks) {
+    std::vector<unsigned char> in;
+    for (const auto& c : chunks) {
+        if (c.first + c.second > bytes.size()) return std::vector<unsigned char>();
+        bytes.AppendTo(&in, c.first, c.second);
+    }
+    return in;
+}
+
+// Assemble a parallel STORE (-cn) payload: each stream's data record holds its
+// slice verbatim, so the whole file is the slices tiled by their offsets. Every
+// slice is checked against its own checksum, so a wrong layout cannot produce
+// output.
+bool TryAssembleParallelStore(
+    const ByteView& bytes,
+    std::uint64_t total_size,
+    std::vector<unsigned char>* out,
+    const std::vector<LegacyCnEntry>* entries = nullptr) {
+    if (out == nullptr || total_size == 0u) return false;
+    std::map<unsigned, LegacyParallelStream> streams;
+    if (!ParseLegacyParallelStreams(bytes, &streams, /*keep_cut_chunk=*/true)) return false;
+    if (entries != nullptr && entries->size() == 1u && psink::Available()) {
+        // Sink: each raw slice goes straight out; a bad slice is written and
+        // reported like the original does ("Checksum mismatch [...]: file").
+        std::vector<const LegacyParallelStream*> list;
+        std::vector<psink::Stream> pstreams;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto& kv : streams) {
+            const LegacyParallelStream& st = kv.second;
+            if (st.chunks.empty() && !st.cut) continue;
+            // A worker that holds the WHOLE file writes no offset record (only
+            // slices get one): `-p2 tiny` is one stream with the file, one empty.
+            if (!st.hassz || (st.hasoff && st.ooff > total_size) || st.osz > total_size - (st.hasoff ? st.ooff : 0u)) return false;
+            psink::Stream ps; psink::Slice sl;
+            sl.entry = 0u; sl.file_off = st.ooff; sl.len = st.osz; sl.cmode = st.cmode; sl.cval = st.cval;
+            sl.has_cksum = (st.cmode != ChecksumMode::kNone); sl.group = 0u;
+            ps.slices.push_back(sl); pstreams.push_back(std::move(ps));
+            list.push_back(&st); ranges.emplace_back(st.ooff, st.osz);
+        }
+        // The sink writes each slice where its stream says, so the slices need not
+        // tile the output: a file listed twice has both copies at the same offsets
+        // and they simply overwrite (see the note in the tiling paths).
+        if (list.empty()) return false;
+        if (!psink::Publish(*entries, std::move(pstreams), psink::Policy::kStore, 0u, psink::Family::kStore)) return false;
+        for (std::size_t idx = 0; idx < list.size(); ++idx) {
+            const LegacyParallelStream& st = *list[idx];
+            progress::SlotScope slot(idx);
+            psink::StreamBegin(idx);
+            std::vector<unsigned char> slice = ConcatParallelChunks(bytes, st.chunks);
+            const std::uint64_t received = std::min<std::uint64_t>(slice.size(), st.osz);
+            slice.resize(static_cast<std::size_t>(st.osz));   // a cut slice is written zero-padded to its size
+            progress::Add(received);
+            // A short (cut) slice is not an error for a store: the slice goes out whole
+            // and its checksum is reported over the bytes that arrived.
+            psink::StreamEnd(idx, slice.data(), slice.size(), true, false, received);
+        }
+        return psink::Committed();
+    }
+
+    std::vector<unsigned char> assembled(static_cast<std::size_t>(total_size), 0);
+    std::uint64_t covered = 0;
+    for (const auto& kv : streams) {
+        const LegacyParallelStream& st = kv.second;
+        if (st.chunks.empty()) continue;
+        if (!st.hassz || st.cmode == ChecksumMode::kNone) {
+            if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+                std::fprintf(stderr, "[PAR] store: stream %u missing off/sz/cksum\n", kv.first);
+            return false;
+        }
+        if (st.hasoff && st.ooff > total_size) return false;
+        if (st.osz > total_size - (st.hasoff ? st.ooff : 0u)) return false;
+
+        std::vector<unsigned char> slice;
+        slice.reserve(static_cast<std::size_t>(st.osz));
+        for (const auto& c : st.chunks) {
+            bytes.AppendTo(&slice, c.first, c.second);
+        }
+        if (slice.size() != st.osz) return false;
+        if (ComputeBufferChecksum(st.cmode, slice.data(), slice.size()) != st.cval) return false;
+        std::memcpy(assembled.data() + static_cast<std::size_t>(st.ooff),
+                    slice.data(), slice.size());
+        covered += st.osz;
+    }
+    if (covered != total_size) {
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[PAR] store: covered=%llu != total=%llu\n",
+                         (unsigned long long)covered, (unsigned long long)total_size);
+        return false;
+    }
+    *out = std::move(assembled);
+    return true;
+}
+
+// Walk a multi-block "stored" (-cn, method_p0==0) payload. NanoZip splits a
+// large stored file into several blocks: each block is [varint (len<<4)|0]
+// [len raw bytes], and every block except the last is followed by a per-block
+// checksum trailer (one tag byte + checksum_bytes). Single-block stores (the
+// common case) are handled by the simpler tail scan; this covers files large
+// enough to split (e.g. a 215 KB source file -> 196608 + 18566). On success
+// *out holds the concatenated raw payload (exactly `total` bytes) and the walk
+// consumes the buffer up to EOF, which makes the starting offset unambiguous.
+bool TryAssembleStoredBlocks(
+    const ByteView& bytes,
+    ArcPos first_prefix,
+    std::uint64_t total,
+    std::size_t trailer_bytes,
+    std::vector<unsigned char>* out) {
+    if (out == nullptr || first_prefix > bytes.size() || total == 0u) {
+        return false;
+    }
+    // Two passes: walk the whole block chain structurally first (no allocation, no
+    // copying), copy only when it is consistent. The caller probes this from every
+    // byte between the table end and the data offset; on a truncated 2 MB parallel
+    // store the copying version made that scan a two-minute "hang" (fuzz 2026-09-03).
+    const auto walk = [&](std::vector<unsigned char>* dst) -> bool {
+        ArcPos p = first_prefix;
+        std::uint64_t acc = 0;
+        while (acc < total) {
+            ArcPos q = p;
+            std::uint64_t tag = 0;
+            if (!ReadLegacyVarint(bytes, &q, bytes.size(), &tag)) {
+                return false;
+            }
+            if ((tag & 0x0fu) != 0u) {
+                return false;  // stored blocks always carry flags == 0
+            }
+            const std::uint64_t len = tag >> 4u;
+            if (len == 0u || len > total - acc ||
+                static_cast<std::uint64_t>(bytes.size() - q) < len) {
+                return false;
+            }
+            const std::size_t ln = static_cast<std::size_t>(len);
+            if (dst != nullptr) {
+                bytes.AppendTo(dst, q, ln);
+            }
+            acc += len;
+            p = q + ln;
+            if (acc < total) {
+                if (trailer_bytes > bytes.size() - p) {
+                    return false;
+                }
+                p += trailer_bytes;  // skip the inter-block checksum trailer
+            }
+        }
+        return acc == total && p == bytes.size();
+    };
+    if (!walk(nullptr)) return false;
+    std::vector<unsigned char> buf;
+    buf.reserve(static_cast<std::size_t>(total));
+    if (!walk(&buf)) return false;
+    *out = std::move(buf);
+    return true;
+}
+
+bool ReadLegacyTableSpan(
+    const ByteView& bytes,
+    ArcPos* io_pos,
+    std::uint64_t* out_span) {
+    if (io_pos == nullptr || out_span == nullptr || *io_pos >= bytes.size()) {
+        return false;
+    }
+
+    const unsigned char b0 = bytes[*io_pos];
+    if ((b0 & 0x0fu) != 0x01u) {
+        return false;
+    }
+    *io_pos += 1u;
+
+    if ((b0 & 0x80u) == 0u) {
+        const unsigned hi = static_cast<unsigned>(b0 >> 4u);
+        if (hi < 2u) {
+            return false;
+        }
+        *out_span = static_cast<std::uint64_t>(hi - 2u);
+        return true;
+    }
+
+    if (*io_pos >= bytes.size()) {
+        return false;
+    }
+    const unsigned char b1 = bytes[*io_pos];
+    *io_pos += 1u;
+    *out_span = static_cast<std::uint64_t>(b0 >> 4u) + (static_cast<std::uint64_t>(b1) << 3u) - 2u;
+    return true;
+}
+
+bool IsLikelyLegacyPathByte(unsigned char c) {
+    // Legacy filenames are path-like text; reject control chars while allowing UTF-8 bytes.
+    return c >= 0x20u && c != 0x7fu;
+}
+
+bool LooksLikeLegacyFilenameTable(
+    const ByteView& bytes,
+    ArcPos table_start,
+    ArcPos table_end) {
+    if (table_start >= table_end || table_end > bytes.size()) {
+        return false;
+    }
+    ArcPos p = table_start;
+    std::size_t entry_count = 0;
+    while (p < table_end) {
+        std::uint64_t file_size = 0;
+        if (!ReadLegacyVarint(bytes, &p, table_end, &file_size)) {
+            return false;
+        }
+        const ArcPos name_end = bytes.FindByte(p, table_end, 0u);
+        if (name_end == table_end) {
+            return false;
+        }
+        if (name_end <= p) {
+            return false;
+        }
+        for (ArcPos i = p; i < name_end; ++i) {
+            if (!IsLikelyLegacyPathByte(bytes[i])) {
+                return false;
+            }
+        }
+        p = name_end + 1u;
+        ++entry_count;
+    }
+    return p == table_end && entry_count > 0;
+}
+
+bool ReadLegacyTableSpanFlexible(
+    const ByteView& bytes,
+    ArcPos* io_pos,
+    std::uint64_t* out_span) {
+    if (io_pos == nullptr || out_span == nullptr || *io_pos >= bytes.size()) {
+        return false;
+    }
+
+    const ArcPos base = *io_pos;
+    // Some legacy families carry one or two extra parameter bytes before filename-table span.
+    for (std::size_t skip = 0; skip <= 8u && base + skip < bytes.size(); ++skip) {
+        ArcPos p = base + skip;
+        std::uint64_t span = 0;
+        if (!ReadLegacyTableSpan(bytes, &p, &span)) {
+            continue;
+        }
+        const std::uint64_t table_len_u64 = span + 2u;
+        if (table_len_u64 > static_cast<std::uint64_t>(bytes.size() - p)) {
+            continue;
+        }
+        const ArcPos table_end = p + table_len_u64;
+        if (!LooksLikeLegacyFilenameTable(bytes, p, table_end)) {
+            continue;
+        }
+        *io_pos = p;
+        *out_span = span;
+        return true;
+    }
+    return false;
+}
+
+bool WriteLegacyTableSpan(std::uint64_t span, std::vector<unsigned char>* out_bytes) {
+    if (out_bytes == nullptr) {
+        return false;
+    }
+
+    // 1-byte form: (hi << 4) | 0x01, where span = hi - 2 and hi in [2,7].
+    if (span <= 5u) {
+        const unsigned char hi = static_cast<unsigned char>(span + 2u);
+        out_bytes->push_back(static_cast<unsigned char>((hi << 4u) | 0x01u));
+        return true;
+    }
+
+    // 2-byte form accepted by parser:
+    // span = (b0 >> 4) + (b1 << 3) - 2, with high bit of b0 set.
+    const std::uint64_t x = span + 2u;
+    const std::uint64_t hi = (x & 0x07u) + 0x08u;  // 8..15, keeps MSB set on b0.
+    if (x < hi) {
+        return false;
+    }
+    const std::uint64_t b1 = (x - hi) >> 3u;
+    if (b1 > 0xffu) {
+        return false;
+    }
+
+    const unsigned char b0 = static_cast<unsigned char>((hi << 4u) | 0x01u);
+    out_bytes->push_back(b0);
+    out_bytes->push_back(static_cast<unsigned char>(b1));
+    return true;
+}
+
+std::uint32_t ReadU32LE(const unsigned char* p) {
+    return static_cast<std::uint32_t>(p[0]) |
+           (static_cast<std::uint32_t>(p[1]) << 8u) |
+           (static_cast<std::uint32_t>(p[2]) << 16u) |
+           (static_cast<std::uint32_t>(p[3]) << 24u);
+}
+
+void AppendU32LE(std::uint32_t value, std::vector<unsigned char>* out_bytes) {
+    if (out_bytes == nullptr) {
+        return;
+    }
+    out_bytes->push_back(static_cast<unsigned char>(value & 0xffu));
+    out_bytes->push_back(static_cast<unsigned char>((value >> 8u) & 0xffu));
+    out_bytes->push_back(static_cast<unsigned char>((value >> 16u) & 0xffu));
+    out_bytes->push_back(static_cast<unsigned char>((value >> 24u) & 0xffu));
+}
+
+bool InverseBwt(
+    const unsigned char* last_column,
+    std::size_t size,
+    std::size_t primary_index,
+    std::vector<unsigned char>* out_data) {
+    if (last_column == nullptr || out_data == nullptr) {
+        return false;
+    }
+    out_data->clear();
+
+    if (size == 0u) {
+        return primary_index == 0u;
+    }
+    if (primary_index >= size) {
+        return false;
+    }
+
+    std::array<std::uint32_t, 256> counts{};
+    for (std::size_t i = 0; i < size; ++i) {
+        ++counts[last_column[i]];
+    }
+
+    std::array<std::uint32_t, 256> starts{};
+    std::uint32_t acc = 0;
+    for (std::size_t c = 0; c < starts.size(); ++c) {
+        starts[c] = acc;
+        acc += counts[c];
+    }
+
+    std::array<std::uint32_t, 256> seen{};
+    std::vector<std::uint32_t> rank(size, 0u);
+    for (std::size_t i = 0; i < size; ++i) {
+        const unsigned char c = last_column[i];
+        ++seen[c];
+        rank[i] = seen[c];
+    }
+
+    out_data->resize(size);
+    std::size_t row = primary_index;
+    for (std::size_t k = size; k > 0u; --k) {
+        const unsigned char c = last_column[row];
+        (*out_data)[k - 1u] = c;
+        row = static_cast<std::size_t>(starts[c] + rank[row] - 1u);
+        if (k > 1u && row >= size) {
+            out_data->clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ForwardBwt(
+    const std::vector<unsigned char>& input,
+    std::vector<unsigned char>* out_last_column,
+    std::uint32_t* out_primary_index) {
+    if (out_last_column == nullptr || out_primary_index == nullptr) {
+        return false;
+    }
+
+    out_last_column->clear();
+    *out_primary_index = 0u;
+
+    const std::size_t n = input.size();
+    if (n == 0u) {
+        return true;
+    }
+    if (n > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
+
+    std::vector<std::size_t> suffixes(n, 0u);
+    std::iota(suffixes.begin(), suffixes.end(), 0u);
+
+    const auto cmp = [&input, n](std::size_t a, std::size_t b) -> bool {
+        if (a == b) {
+            return false;
+        }
+        for (std::size_t k = 0; k < n; ++k) {
+            const unsigned char ca = input[(a + k) % n];
+            const unsigned char cb = input[(b + k) % n];
+            if (ca != cb) {
+                return ca < cb;
+            }
+        }
+        return false;
+    };
+    std::sort(suffixes.begin(), suffixes.end(), cmp);
+
+    out_last_column->resize(n);
+    bool primary_found = false;
+    for (std::size_t rank = 0; rank < n; ++rank) {
+        const std::size_t start = suffixes[rank];
+        if (start == 0u) {
+            *out_primary_index = static_cast<std::uint32_t>(rank);
+            primary_found = true;
+        }
+        (*out_last_column)[rank] = input[(start + n - 1u) % n];
+    }
+
+    return primary_found;
+}
+
+// C++ port of the NanoZip 0.09a `-co`/`-cO` prefilter decoder (orig 0x0809a250 +
+// core 0x080acb90). Produces the BWT last-column buffer from the archive's
+// prefilter substream. Validated byte-for-byte against emulator ground truth.
+struct LegacyPrefilterRangeCoder {
+    const unsigned char* src_cur = nullptr;
+    const unsigned char* src_end = nullptr;
+    std::uint32_t high = 0xFFFFFFFFu;
+    std::uint32_t low = 0;
+    std::uint32_t code = 0;
+    std::array<std::uint16_t, 32> probs{};
+
+    void Init(const unsigned char* begin, const unsigned char* end) {
+        src_cur = begin;
+        src_end = end;
+        high = 0xFFFFFFFFu;
+        low = 0;
+        code = 0;
+        probs.fill(static_cast<std::uint16_t>(0x8000u));
+        for (int i = 0; i < 4; ++i) {
+            const std::uint8_t b = (src_cur < src_end) ? *src_cur++ : 0u;
+            code = (code << 8u) | b;
+        }
+    }
+
+    void Renormalize() {
+        while (((high ^ low) & 0xFF000000u) == 0u) {
+            const std::uint8_t b = (src_cur < src_end) ? *src_cur++ : 0u;
+            code = (code << 8u) | b;
+            low <<= 8u;
+            high = (high << 8u) | 0xFFu;
+        }
+    }
+
+    int DecodeBit(int prob_idx) {
+        const std::uint32_t prob = probs[prob_idx];
+        const std::uint32_t range_size = high - low;
+        const std::uint32_t bound = low + ((range_size >> 12u) * (prob >> 4u));
+        int bit;
+        if (code <= bound) {
+            bit = 1;
+            high = bound;
+        } else {
+            bit = 0;
+            low = bound + 1u;
+        }
+        const std::uint32_t delta = (((static_cast<std::uint32_t>(bit) << 16u) - prob + 0x80u) & 0xFFFFFFFFu) >> 8u;
+        probs[prob_idx] = static_cast<std::uint16_t>((prob + delta) & 0xFFFFu);
+        Renormalize();
+        return bit;
+    }
+
+    int DecodeBitRaw() {
+        const std::uint32_t range_size = high - low;
+        const std::uint32_t bound = low + ((range_size >> 12u) << 11u);
+        int bit;
+        if (code <= bound) {
+            bit = 1;
+            high = bound;
+        } else {
+            bit = 0;
+            low = bound + 1u;
+        }
+        Renormalize();
+        return bit;
+    }
+
+    std::uint32_t DecodeRunExtra(int run_len) {
+        const int limit = (run_len == 0) ? 1 : (1 << (run_len < 4 ? run_len : 4));
+        std::uint32_t value_acc = (run_len != 0) ? 1u : 0u;
+        int tree_idx = 1;
+        while (true) {
+            const int bit = DecodeBit(tree_idx + limit);
+            tree_idx = (tree_idx << 1) | bit;
+            value_acc = (value_acc << 1) | static_cast<std::uint32_t>(bit);
+            if (tree_idx >= limit) {
+                break;
+            }
+        }
+        const int max_v = run_len > 1 ? run_len : 1;
+        if (max_v <= 4) {
+            return value_acc;
+        }
+        const int k = run_len - 4;
+        std::uint32_t base = value_acc << k;
+        std::uint32_t raw = 0;
+        for (int i = 0; i < k; ++i) {
+            raw = (raw << 1) | static_cast<std::uint32_t>(DecodeBitRaw());
+        }
+        return base + raw;
+    }
+};
+
+bool DecodeLegacyPrefilterStream(
+    const unsigned char* src,
+    std::size_t byte_copy_count,
+    LegacyPrefilterRangeCoder& rc,
+    std::size_t expected_out_size,
+    std::vector<unsigned char>* out_data) {
+    if (src == nullptr || out_data == nullptr) {
+        return false;
+    }
+    out_data->clear();
+    out_data->reserve(expected_out_size);
+
+    std::size_t p = 0;
+    std::size_t n = byte_copy_count;
+    std::uint32_t edx = 0;
+
+    while (n > 0u) {
+        bool re_enter = false;
+        while (n > 0u) {
+            edx = (edx << 8u) & 0xFFFFu;
+            const std::uint8_t dl = src[p++];
+            --n;
+            edx = (edx & 0xFF00u) | dl;
+            out_data->push_back(dl);
+            const std::uint8_t dh = static_cast<std::uint8_t>((edx >> 8u) & 0xFFu);
+            if (dl != dh) {
+                continue;
+            }
+            if (n == 0u) {
+                break;
+            }
+            const std::uint8_t dl2 = src[p++];
+            --n;
+            edx = (edx & 0xFF00u) | dl2;
+            out_data->push_back(dl2);
+            if (dl2 != dh) {
+                continue;
+            }
+            if (n == 0u) {
+                break;
+            }
+            const std::uint8_t run_byte = dh;
+            int iters = 0;
+            while (n > 0u) {
+                ++iters;
+                --n;
+                const std::uint8_t cur = src[p++];
+                if (cur != run_byte) {
+                    --p;
+                    ++n;
+                    break;
+                }
+            }
+            const int run_len = iters - 1;
+            if (run_len > 30) {
+                return false;
+            }
+            const std::uint32_t extra = rc.DecodeRunExtra(run_len);
+            if (out_data->size() + extra > expected_out_size + 16u) {
+                return false;
+            }
+            for (std::uint32_t i = 0; i < extra; ++i) {
+                out_data->push_back(run_byte);
+            }
+            edx = run_byte;
+            re_enter = true;
+            break;
+        }
+        if (!re_enter) {
+            break;
+        }
+    }
+    return true;
+}
+
+bool LoadSourcesRawData(
+    const std::vector<SourceFile>& sources,
+    std::vector<unsigned char>* out_data,
+    std::string* out_error_message) {
+    if (out_data == nullptr) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "internal error: null raw-data output";
+        }
+        return false;
+    }
+    out_data->clear();
+
+    std::uint64_t total = 0u;
+    for (const SourceFile& src : sources) {
+        if (src.size > (std::numeric_limits<std::uint64_t>::max() - total)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "input size overflow while loading source data";
+            }
+            return false;
+        }
+        total += src.size;
+    }
+    if (total > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "input too large for in-memory native encoder path";
+        }
+        return false;
+    }
+
+    out_data->reserve(static_cast<std::size_t>(total));
+    std::vector<char> buffer(kBufferSize);
+    for (const SourceFile& src : sources) {
+        std::ifstream in(src.source_path, std::ios::binary);
+        if (!in) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "cannot read input file: " + src.source_path.string();
+            }
+            return false;
+        }
+        while (in) {
+            in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) {
+                break;
+            }
+            const std::size_t old_size = out_data->size();
+            const std::size_t add = static_cast<std::size_t>(got);
+            if (add > std::numeric_limits<std::size_t>::max() - old_size) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "input too large for in-memory native encoder path";
+                }
+                return false;
+            }
+            out_data->resize(old_size + add);
+            std::memcpy(out_data->data() + static_cast<std::ptrdiff_t>(old_size), buffer.data(), add);
+        }
+        if (in.bad()) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "cannot read input file: " + src.source_path.string();
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool WriteSourcesRawData(
+    const std::vector<SourceFile>& sources,
+    std::ostream* out,
+    std::string* out_error_message) {
+    if (out == nullptr) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "internal error: null output stream";
+        }
+        return false;
+    }
+
+    std::vector<char> buffer(kBufferSize);
+    for (const SourceFile& src : sources) {
+        std::ifstream in(src.source_path, std::ios::binary);
+        if (!in) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "cannot read input file: " + src.source_path.string();
+            }
+            return false;
+        }
+        while (in) {
+            in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) {
+                break;
+            }
+            out->write(buffer.data(), got);
+            if (!*out) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "write failure while building archive";
+                }
+                return false;
+            }
+        }
+        if (in.bad()) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "cannot read input file: " + src.source_path.string();
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+std::uint8_t LegacyChecksumTag(ChecksumMode mode) {
+    switch (mode) {
+        case ChecksumMode::kCrc16:
+            return 0x26u;
+        case ChecksumMode::kCrc32:
+            return 0x47u;
+        case ChecksumMode::kFletcher16:
+        case ChecksumMode::kFletcher32:
+            return 0x45u;
+        case ChecksumMode::kNone:
+        default:
+            return 0u;
+    }
+}
+
+ChecksumMode LegacyNormalizeChecksumModeForCompression(ChecksumMode requested) {
+    // In legacy headers, 0x05 maps to NanoZip's Fletcher32 variant even for CLI -hf.
+    if (requested == ChecksumMode::kFletcher16) {
+        return ChecksumMode::kFletcher32;
+    }
+    return requested;
+}
+
+std::uint8_t LegacyChecksumHeaderByte(ChecksumMode mode) {
+    switch (mode) {
+        case ChecksumMode::kFletcher32:
+            return 0x05u;
+        case ChecksumMode::kCrc16:
+            return 0x06u;
+        case ChecksumMode::kCrc32:
+            return 0x07u;
+        case ChecksumMode::kNone:
+        case ChecksumMode::kFletcher16:
+        default:
+            return 0u;
+    }
+}
+
+std::size_t LegacyChecksumBytesPerFile(ChecksumMode mode) {
+    switch (mode) {
+        case ChecksumMode::kCrc16:
+            return 2u;
+        case ChecksumMode::kCrc32:
+        case ChecksumMode::kFletcher16:
+        case ChecksumMode::kFletcher32:
+            return 4u;
+        case ChecksumMode::kNone:
+        default:
+            return 0u;
+    }
+}
+
+bool BuildLegacyChecksumBytes(
+    const std::vector<SourceFile>& sources,
+    ChecksumMode mode,
+    std::vector<unsigned char>* out_bytes,
+    std::string* out_error_message) {
+    if (out_bytes == nullptr) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "internal error: null checksum output";
+        }
+        return false;
+    }
+
+    out_bytes->clear();
+    const std::size_t bytes_per_file = LegacyChecksumBytesPerFile(mode);
+    if (bytes_per_file == 0u || sources.empty()) {
+        return true;
+    }
+
+    for (const SourceFile& src : sources) {
+        std::uint32_t checksum = 0;
+        if (!ComputeFileChecksum(src.source_path, mode, &checksum)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "cannot checksum file: " + src.source_path.string();
+            }
+            return false;
+        }
+
+        if (bytes_per_file == 2u) {
+            out_bytes->push_back(static_cast<unsigned char>(checksum & 0xffu));
+            out_bytes->push_back(static_cast<unsigned char>((checksum >> 8u) & 0xffu));
+        } else {
+            out_bytes->push_back(static_cast<unsigned char>(checksum & 0xffu));
+            out_bytes->push_back(static_cast<unsigned char>((checksum >> 8u) & 0xffu));
+            out_bytes->push_back(static_cast<unsigned char>((checksum >> 16u) & 0xffu));
+            out_bytes->push_back(static_cast<unsigned char>((checksum >> 24u) & 0xffu));
+        }
+    }
+    return true;
+}
+
+// The bare compressor name the original prints in its banner. LegacyCompressorLabel
+// below appends a diagnostic "[legacy m=..,p0=..,p1=..]" suffix that the original has
+// no equivalent of, so the banner uses this instead.
+
+std::string LegacyCompressorLabel(std::uint8_t method, std::uint8_t method_p0, std::uint8_t method_p1) {
+    std::string base = "unknown";
+    if (method == 0x2bu || method == 0x3bu || method == 0x4bu) {
+        switch (method_p0) {
+            case 0u:
+                base = "none";
+                break;
+            case 1u:
+                base = "nz_lzpf";
+                break;
+            case 2u:
+                base = "nz_lzpf_large";
+                break;
+            case 3u:
+                base = "nz_lzhd";
+                break;
+            case 4u:
+                base = "nz_lzhds";
+                break;
+            case 5u:
+                base = "nz_optimum1";
+                break;
+            case 6u:
+                base = "nz_optimum2";
+                break;
+            case 7u:
+                base = "nz_cm";
+                break;
+            default:
+                base = "unknown";
+                break;
+        }
+    }
+
+    std::ostringstream oss;
+    oss << base << " [legacy m=" << static_cast<unsigned>(method)
+        << ",p0=" << static_cast<unsigned>(method_p0)
+        << ",p1=" << static_cast<unsigned>(method_p1) << "]";
+    return oss.str();
+}
+
+std::string LegacyCompressorName(std::uint8_t method, std::uint8_t method_p0) {
+    const std::string full = LegacyCompressorLabel(method, method_p0, 0u);
+    const std::size_t br = full.find(" [");
+    return (br == std::string::npos) ? full : full.substr(0, br);
+}
+
+
+const char* LegacyPayloadModeLabel(LegacyPayloadMode mode) {
+    switch (mode) {
+        case LegacyPayloadMode::kStore:
+            return "store";
+        case LegacyPayloadMode::kLiteralOnly:
+            return "literal-only";
+        case LegacyPayloadMode::kCompressed:
+            return "compressed";
+        case LegacyPayloadMode::kUnknown:
+        default:
+            return "unknown";
+    }
+}
+
+// Decode one nz_lzpf member: a chain of [stream] segments beginning at
+// `first_block_pos` (the first lzpf block header — for the single-stream layout
+// this is just past the leading stream tag; for a parallel-container type-0
+// chunk it is the chunk start), the first segment spanning `first_stream_len`
+// bytes, producing `total` output bytes. The true sliding-window dict capacity
+// is not recoverable from the header, so this tries each candidate capacity and
+// returns the first decode for which verify(decoded) is true. Returns true and
+// fills *out on success; returns false (out untouched) otherwise. This is the
+// shared core behind both single-stream and parallel-container lzpf decode.
+template <typename Verify>
+bool DecodeLzpfMember(
+    const ByteView& bytes,
+    ArcPos first_block_pos,
+    ArcPos first_stream_len,
+    std::uint64_t total,
+    bool is_variant_b,
+    unsigned method_p1,
+    bool derived_cap_only,
+    Verify&& verify,
+    std::vector<unsigned char>* out,
+    // Optional: decode straight into this caller-owned buffer of `total` bytes
+    // (a parallel container's slice of the assembled output) instead of into a
+    // fresh zeroed vector that is then copied -- two passes over the output
+    // saved. With it, `verify` takes (const unsigned char*, std::size_t) and
+    // *out is left empty on success.
+    unsigned char* direct_out = nullptr,
+    // The archive was cut inside this member: decode the bytes that exist, as
+    // the original does (its truncation reports come from that stub decode).
+    bool allow_truncated = false,
+    // Bytes of whole members (segments) completed by the first candidate: what
+    // the original has flushed when a later segment fails.
+    std::size_t* out_member_done = nullptr,
+    // Parallel-container stream: the original's worker clamps a block that
+    // overshoots its slice or reads past its record and carries on; the report
+    // then comes from the next block header (4, 2), not from the overrun (6, 3).
+    bool lenient = false,
+    // Where this member's input ends inside `bytes` (0 = the whole buffer): lets a
+    // parallel worker decode its record in place instead of copying it out.
+    // ArcPos -- it is a FILE offset when the record is decoded in place.
+    ArcPos input_end = 0u,
+    // Hand each block's output over as it is produced instead of assembling the
+    // member. The output buffer then rolls (one block at a time, grown to the
+    // largest block seen), so a 280 MB slice costs a megabyte. Requires
+    // `derived_cap_only` -- a second dictionary candidate would have to redo
+    // output already handed over -- and a `verify` that accepts anything, since
+    // there is no assembled buffer left to check. `out`/`direct_out` are unused.
+    const std::function<void(const unsigned char*, std::size_t)>* stream_out = nullptr,
+    // With `stream_out`: hand the output over one whole MEMBER (data record) at a
+    // time instead of block by block, and drop the member in flight when the
+    // decode fails. That is the single-container original's unit: flipped inside
+    // a record, it writes exactly the records before it (4 194 304 bytes for a
+    // flip 88 % into record 4 of a 1 MB-record chain, not the ~0.9 MB of blocks
+    // before the flip). The buffer grows to the largest member instead of
+    // rolling, which is at most 1 MB for any archive the original writes.
+    bool stream_members = false) {
+    const ArcPos in_end = (input_end != 0u && input_end <= bytes.size()) ? input_end : bytes.size();
+    // A corrupt header can declare any output size, and the buffer below IS that
+    // size, so an implausible one reached the allocator: ASan aborted with
+    // "allocation size too big" (fuzz case pmf_F_F_flip6, 0xf5593c90c96797 bytes
+    // declared) and a release build reported "Out of memory!", where the original
+    // calls the archive corrupt -- code 4 on that same case. The original never
+    // tries: its output is a fixed ring and it meets the corruption in a block
+    // header instead. This reader assembles the whole output in memory, so an
+    // output it could never hold is undecodable by construction; refusing it as
+    // the corrupt stream it is beats asking the allocator. The ceiling is a flat
+    // 1 TB rather than a ratio of the input, because lzpf legitimately turns a
+    // few KB into hundreds of MB and no ratio is safe.
+    if (total > (std::uint64_t{1} << 40)) return false;
+    progress::Scope pscope;
+    if (first_block_pos + first_stream_len > in_end) {
+        if (!allow_truncated || first_block_pos >= in_end) return false;
+        first_stream_len = in_end - first_block_pos;
+    }
+    // NZOPT_TRACE_LZPF=1 dumps one line per lzpf block (mode, size, prefilter
+    // header fields) plus the decline point — the fastest way to tell whether a
+    // failing member even reaches the stereo prefilter path.
+    const bool trace_lzpf = (NZ_ENV("NZOPT_TRACE_LZPF") != nullptr);
+    auto decode_lzpf_header = [&](ArcPos& pos, std::uint32_t& out_uvar9) -> bool {
+        if (pos >= in_end) return false;
+        std::uint8_t b0 = bytes[pos++];
+        std::uint32_t v = static_cast<std::uint32_t>(b0) ^ (b0 & 0x80u);
+        if ((b0 & 0x80u) != 0u) {
+            if (pos >= in_end) return false;
+            std::uint8_t b1 = bytes[pos++];
+            v = (static_cast<std::uint32_t>(b1) ^ (b1 & 0x80u)) * 0x80u + 0x80u + v;
+            if ((b1 & 0x80u) != 0u) {
+                if (pos >= in_end) return false;
+                std::uint8_t b2 = bytes[pos++];
+                v = static_cast<std::uint32_t>(b2) * 0x4000u + 0x4000u + v;
+            }
+        }
+        out_uvar9 = v;
+        return true;
+    };
+
+    const std::size_t window_left_pad = 4u;
+    // The dict capacity is DERIVED from the codec record's p1 byte, which is a
+    // mantissa/exponent "byte float" -- the same encoding the -cc window size
+    // uses: m = (p1+1) & 0xf, s = (p1+1) >> 4, and if s then m = (m+16) << (s-1);
+    // capacity = m << 16. It is linear in p1 for small values and exponential
+    // above, which is why a plain "(p1+1) * 64 KiB" fits every small archive and
+    // breaks on a large one (p1=38 means 46 * 64 KiB, not 39).
+    //
+    // This used to be a SEARCH over five guesses -- ceil/floor of total over
+    // 64 KiB and over 128 KiB, plus (p1+1)*64 KiB -- kept honest by checking each
+    // decode against the stored checksum. That worked only because a wrong
+    // capacity is harmless until the window wraps, and it could not work at all
+    // for an archive written with -hn or -nm, which stores no checksum to
+    // adjudicate with: those declined outright. The derived value was verified
+    // as the ONLY candidate against the 60-file real corpus, the synthetic suite
+    // and the multi-file suite, all unchanged.
+    std::vector<std::size_t> cap_candidates;
+    {
+        const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
+        unsigned mant = xp1 & 0x0fu;
+        const unsigned exp_bits = xp1 >> 4u;
+        if (exp_bits) mant = (mant + 16u) << (exp_bits - 1u);
+        const std::size_t derived = static_cast<std::size_t>(mant) << 16u;
+        if (derived != 0u) cap_candidates.push_back(derived);
+        // The old guesses stay as a fallback for a shape the derived value might
+        // not cover -- but only where a checksum can adjudicate between them,
+        // which is exactly where they were safe before.
+        // Not during the self-check: the original's reader has no such guesses,
+        // so an archive only they could read is not one it can read.
+        if (!derived_cap_only && !nzr::selfcheck::Recorder::Get().Strict()) {
+            const std::size_t t = static_cast<std::size_t>(total);
+            const std::size_t u64 = t / 0x10000u;
+            const std::size_t u128 = t / 0x20000u;
+            const std::size_t cands[] = {
+                ((t + 0xffffu) / 0x10000u) * 0x10000u,
+                u64 * 0x10000u,
+                (u128 + 1u) * 0x20000u,
+                u128 * 0x20000u,
+            };
+            for (std::size_t c : cands) {
+                if (c == 0u) continue;
+                bool dup = false;
+                for (std::size_t e : cap_candidates) if (e == c) { dup = true; break; }
+                if (!dup) cap_candidates.push_back(c);
+            }
+        }
+        if (cap_candidates.empty()) cap_candidates.push_back(0x10000u);
+    }
+    const std::size_t window_wrap_threshold = 0x8000u;  // 32 KiB
+    const std::size_t window_tail_slack = 0x8000u;      // FUN_080b6bb0 memset reach
+    const std::size_t window_initial_cursor = 4u;
+
+    // On total failure `out` receives the output of the members (streams) that
+    // decoded completely under the first candidate: the original flushes per
+    // member, so those files are on disk when it reports the error.
+    std::vector<unsigned char> first_prefix;
+    bool first_candidate = true;
+    for (std::size_t cap_idx = 0; cap_idx < cap_candidates.size(); ++cap_idx) {
+        const std::size_t window_capacity = cap_candidates[cap_idx];
+        pscope.Restart();
+        std::size_t member_done = 0;
+        ArcPos stream_data_end = first_block_pos + first_stream_len;
+        std::vector<std::uint8_t> window_alloc(
+            window_left_pad + window_capacity + window_tail_slack, 0);
+        std::uint8_t* const window = window_alloc.data() + window_left_pad;
+        // Rolling output: `decoded_store` holds [decoded_base, total_written) and
+        // is handed over and reset whenever the next block would not fit.
+        const bool rolling = (stream_out != nullptr);
+        static constexpr std::size_t kLzpfRollUnit = 0x100000u;
+        std::size_t total_written = 0;
+        std::vector<unsigned char> decoded_store;
+        std::size_t decoded_base = 0;
+        unsigned char* decoded = direct_out;
+        if (rolling) {
+            decoded_store.assign(kLzpfRollUnit, 0);
+            decoded = decoded_store.data();
+        } else if (decoded == nullptr) {
+            decoded_store.assign(static_cast<std::size_t>(total), 0);
+            decoded = decoded_store.data();
+        }
+        // Make room for the next `need` output bytes, handing over what is already
+        // in the buffer first. A block larger than the unit grows it; the buffer
+        // never shrinks, so it settles at the largest block of the stream.
+        const auto roll_room = [&](std::size_t need) {
+            if (!rolling) return;
+            if (total_written - decoded_base + need <= decoded_store.size()) return;
+            if (stream_members) {
+                // A member goes out whole: grow, keeping what it holds so far.
+                const std::size_t used = total_written - decoded_base;
+                decoded_store.resize(std::max(decoded_store.size() * 2u, used + need));
+                decoded = decoded_store.data();
+                return;
+            }
+            if (total_written > decoded_base)
+                (*stream_out)(decoded_store.data(), total_written - decoded_base);
+            decoded_base = total_written;
+            if (need > decoded_store.size()) decoded_store.assign(need, 0);
+            decoded = decoded_store.data();
+        };
+        // Where an ABSOLUTE output offset lands in the buffer.
+        const auto at_out = [&](std::size_t abs) { return decoded + (abs - decoded_base); };
+        auto run_verify = [&]() -> bool {
+            if (rolling) return true;   // nothing assembled to check; the sink checks the slice
+            if constexpr (std::is_invocable_v<Verify, const unsigned char*, std::size_t>)
+                return verify(static_cast<const unsigned char*>(decoded), static_cast<std::size_t>(total));
+            else
+                return verify(decoded_store);
+        };
+        std::vector<std::int32_t> hash_table(
+            is_variant_b ? std::size_t{0x1000000u} : std::size_t{8192u}, std::int32_t{3});
+        std::vector<std::uint8_t> byte_buffer_b(
+            is_variant_b ? std::size_t{0x2000u} : std::size_t{0u}, 0);
+        std::size_t window_cursor = window_initial_cursor;
+        bool window_tail_dirty = true;   // +0x1005c, set by the reset FUN_080b6c60
+        ArcPos input_pos = first_block_pos;
+        bool decode_ok = true;
+        std::size_t blk_idx = 0;
+        // The prefilter state object (FUN_080b1600). -cf configures order01 = 4,
+        // -cF order01 = 8, both with nstages = 1 -- GDB-measured immediates at the
+        // two callers. -cd/-cD use nstages = 3 (and -cD order01 = 32), which is why
+        // this is now an explicit context rather than two loose predictors.
+        nzr::lzpf::PrefilterContext pf_ctx;
+        pf_ctx.Configure(is_variant_b ? 8u : 4u, 1u);
+        nzr::lzpf::LmsObject pf_lms_ch1{};
+        nzr::lzpf::LmsObject pf_lms_ch2{};
+        pf_lms_ch1.Init();
+        pf_lms_ch2.Init();
+        // The image model: the (uVar9 & 7) == 4 block with bit 3 set runs
+        // FUN_080a9ca0 on the dispatcher's image object (param_1 + 0x121f0) instead
+        // of the prefilter core. One per stream, reset after every non-prefilter
+        // block (FUN_080b6170) and kept across chunk boundaries -- the encode
+        // oracle's `gray.tif a.txt pic.tga` decoded the TGA from the TIFF's rings
+        // without the reset. -cf and -cF share the profile (GDB: flags 0x00, all
+        // five planes order 16).
+        nzr::audio::NzImageModel lzpf_img;
+        lzpf_img.Configure(0x00u, 16u, 16u, true);
+        while (total_written < total) {
+            if (input_pos >= stream_data_end) {
+                if (input_pos != stream_data_end) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+                member_done = total_written;
+                // A member is complete: it is out even if reading the next
+                // record's tag fails, as it is in the original.
+                if (stream_members && total_written > decoded_base) {
+                    (*stream_out)(decoded_store.data(), total_written - decoded_base);
+                    decoded_base = total_written;
+                }
+                // Consume any inter-stream checksum record (tag 0x45/0x47/0x26
+                // + width) before the next stream tag.
+                while (input_pos < in_end) {
+                    const std::uint8_t tb = bytes[input_pos];
+                    std::size_t tw;
+                    if      (tb == 0x45u) tw = 4u;
+                    else if (tb == 0x47u) tw = 4u;
+                    else if (tb == 0x26u) tw = 2u;
+                    else break;
+                    if (input_pos + 1u + tw > in_end) break;
+                    input_pos += 1u + tw;
+                }
+                std::uint64_t next_tag = 0;
+                if (lenient && input_pos >= in_end) { decode_ok = false; break; }   // input simply ran out: the sink reports the codec's short-end status
+                if (!ReadLegacyVarint(bytes, &input_pos, in_end, &next_tag) ||
+                    (next_tag & 0x0fu) != 0u) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+                std::uint64_t next_bytes = next_tag >> 4u;
+                if (next_bytes != 0u && allow_truncated &&
+                    next_bytes > static_cast<std::uint64_t>(in_end - input_pos))
+                    next_bytes = static_cast<std::uint64_t>(in_end - input_pos);
+                if (next_bytes == 0u ||
+                    next_bytes > static_cast<std::uint64_t>(in_end - input_pos)) {
+                    nzr::derr::SetAt(2u, input_pos); decode_ok = false; break;
+                }
+                stream_data_end = input_pos + static_cast<std::size_t>(next_bytes);
+            }
+            std::uint32_t uvar9 = 0;
+            if (!decode_lzpf_header(input_pos, uvar9)) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+            const bool mode_prefilter = ((uvar9 & 7u) == 4u);
+            const bool mode_literal = !mode_prefilter && ((uvar9 & 2u) == 0u);
+            const bool mode_lz77_side = !mode_prefilter && (uvar9 & 2u) && (uvar9 & 1u);
+            // Raw-bytecode LZ77 (FUN_08097570: (uVar9 & 2) set, (uVar9 & 1) clear):
+            // the LZ77 opcode stream is the input bytes directly — no u16 count,
+            // no arith side stream. The dispatcher consumes opcodes until the
+            // block output is produced and reports how many input bytes it read.
+            const bool mode_lz77_raw = !mode_prefilter && (uvar9 & 2u) && !(uvar9 & 1u);
+            nz_trace::Construct("lzpf_block mode=%s bit3=%u", mode_prefilter ? "prefilter" : mode_literal ? "literal" : mode_lz77_side ? "lz77_side" : "lz77_raw", (uvar9 >> 3) & 1u);
+            // Sliding-window wrap (legacy FUN_080b6bb0): when fewer than 32 KiB
+            // remain, reset the cursor to 0 -- and zero [cursor, cap+0x8000) only
+            // on the FIRST wrap. The zeroing is gated by +0x1005c, which only the
+            // reset (FUN_080b6c60) sets and the first wrap clears; every later lap
+            // keeps the previous lap's bytes past the cursor, and a stale hash
+            // entry can match into them. Zeroing every lap decoded those matches
+            // as zeros: 9 files, 229 KB, -cF -m64m (a 64 KB window, 3 laps)
+            // failed the last file's checksum 7 bytes in, while the original read
+            // it. The encoder has the same gate (State::Wrap).
+            // The comparison is the original's: `cap < cursor + 0x8000`, which a
+            // 0x8001-byte block ending one past the capacity still trips.
+            if (window_capacity < window_cursor + window_wrap_threshold) {
+                if (window_tail_dirty) {
+                    window_tail_dirty = false;
+                    std::memset(window + window_cursor, 0,
+                                window_capacity + window_tail_slack - window_cursor);
+                }
+                window_cursor = 0;
+            }
+            if (mode_prefilter) {
+                const std::uint32_t uvar18 = (uvar9 >> 3u) & 1u;   // 1 = image block
+                std::uint64_t block_out_size = uvar9 >> 4u;
+                if (block_out_size == 0u) block_out_size = 0x8000u;
+                if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
+                if (total_written + block_out_size > total) {
+                    // lenient (parallel worker): the original reports this as 2, not 3.
+                    nzr::derr::SetAt(lenient ? 2u : 3u, input_pos); decode_ok = false; break;
+                }
+                const std::size_t block_start_in_window = window_cursor;
+                const std::size_t avail_in = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
+                // `stream_data_end` is a header field: on a cut archive the block
+                // claims more input than the file holds. Decline instead of
+                // reading past the end -- which is what the old
+                // `bytes.data() + input_pos` did silently, and what the range
+                // request now makes visible by handing back nothing.
+                if (bytes.Span(input_pos, avail_in) == nullptr) {
+                    nzr::derr::SetAt(2u, input_pos); decode_ok = false; break;
+                }
+                const std::uint8_t pf_hdr = bytes[input_pos];
+                const std::uint32_t pf_channels = (pf_hdr >> 1u) % 3u;
+                const bool is_stereo_pf = (pf_channels != 0u);
+                const std::size_t pf_consumed = (uvar18 != 0u)
+                    ? lzpf_img.Decode(bytes.Span(input_pos, avail_in), avail_in,
+                                      window + block_start_in_window,
+                                      static_cast<std::size_t>(block_out_size))
+                    : nzr::lzpf::DecodePrefilterStream(
+                          bytes.Span(input_pos, avail_in), avail_in,
+                          window + block_start_in_window,
+                          static_cast<std::size_t>(block_out_size),
+                          is_stereo_pf, &pf_ctx,
+                          is_stereo_pf ? &pf_lms_ch1 : nullptr,
+                          is_stereo_pf ? &pf_lms_ch2 : nullptr);
+                if (trace_lzpf) {
+                    const std::uint32_t c1 = (pf_hdr >> 1u) / 3u;
+                    const std::uint32_t wq = c1 / 5u;
+                    const std::uint32_t wr = c1 - wq * 5u;
+                    const unsigned sw = wr ? (unsigned)((((wr - 1u) >> 1u) + 1u) + 1u) : 1u;
+                    const unsigned en = wr ? (unsigned)((wr - 1u) & 1u) : 0u;
+                    fprintf(stderr,
+                            "[lzpf] blk#%zu pf out=%llu hdr=%02x ch=%u fa=%u sw=%u end=%u "
+                            "pfx=%u consumed=%zu\n",
+                            blk_idx, (unsigned long long)block_out_size,
+                            (unsigned)pf_hdr, pf_channels, (unsigned)(pf_hdr & 1u),
+                            sw, en, wq, pf_consumed);
+                }
+                ++blk_idx;
+                if (pf_consumed == 0) { nzr::derr::SetAt(5u, input_pos); decode_ok = false; break; }
+                input_pos += pf_consumed;
+                window_cursor += static_cast<std::size_t>(block_out_size);
+                roll_room(static_cast<std::size_t>(block_out_size));
+                std::memcpy(at_out(total_written), window + block_start_in_window,
+                            static_cast<std::size_t>(block_out_size));
+                // Backfill hash_table for the prefilter block's window bytes.
+                // The real dispatcher FUN_08097570 calls FUN_080b6d90 at the end
+                // of the prefilter branch too, not just after literal blocks --
+                // and a prefilter block DOES publish window content that a later
+                // LZ77 block can match into. Without this, those matches read the
+                // table's untouched init value and the LZ block decodes wrong
+                // (summer.php: blocks 0-2 byte-exact, first divergence 951 bytes
+                // into block 3, the first lz-side block after a prefilter block).
+                // A prefilter block has (uvar9 & 7) == 4, so uvar9 & 1 == 0 --
+                // the SPARSE variant (every 101 bytes, stopping 100 short of the
+                // block end), matching the literal path's own uvar9&1 == 0 case.
+                {
+                    const std::size_t bstart = block_start_in_window;
+                    const std::size_t bend = block_start_in_window + static_cast<std::size_t>(block_out_size);
+                    const std::size_t hstop = (bend > 100u) ? (bend - 100u) : bstart;
+                    for (std::size_t hp = bstart; hp < hstop; hp += 101u) {
+                        std::uint32_t hw;
+                        std::memcpy(&hw, window + hp - (is_variant_b ? 3u : 2u), 4);
+                        const std::uint32_t h = is_variant_b ? (hw & 0xffffffu) : (hw & 0x1fffu);
+                        hash_table[h] = static_cast<std::int32_t>(hp);
+                    }
+                    if (is_variant_b) {
+                        std::memset(byte_buffer_b.data(), 0, byte_buffer_b.size());
+                    }
+                }
+                total_written += static_cast<std::size_t>(block_out_size);
+                progress::Add(block_out_size);
+                continue;
+            }
+            if (!mode_literal && !mode_lz77_side && !mode_lz77_raw) { nzr::derr::SetAt(5u, input_pos); decode_ok = false; break; }
+            if (trace_lzpf) {
+                fprintf(stderr, "[lzpf] blk#%zu %s uvar9=%u out=%llu\n", blk_idx,
+                        mode_literal ? "lit" : (mode_lz77_side ? "lz-side" : "lz-raw"),
+                        uvar9, (unsigned long long)(uvar9 >> 3u));
+            }
+            ++blk_idx;
+            // Any non-prefilter block (literal or LZ77) resets the whole audio-model
+            // context (both per-channel LPC predictors AND both LMS objects) -- confirmed
+            // by GDB against the real binary (FUN_08095d90 breakpoint, st_2ch24b48000_
+            // scifi.wav): the per-channel predictor object's address is stable across all
+            // 16 prefilter-block calls in the stream (same param_1 pointer throughout, so
+            // state is never reallocated), yet its entering state (predicted_value +
+            // factors[4]) is exactly zero for every prefilter block immediately preceded
+            // by a literal block, and non-zero (carried forward) for every prefilter block
+            // immediately preceded by ANOTHER prefilter block with no literal in between --
+            // a 16-for-16 exact match across this fixture's block sequence. FUN_080b1950
+            // (the model-init routine) resets both LPC (6 channel slots, FUN_080bdac0 x6)
+            // and LMS (FUN_080be670 + FUN_080beb60) together as a single primitive, which
+            // is the natural candidate for what actually fires here; LMS reset piggybacks
+            // on that same evidence (no fixture in this corpus ever has lms_enable=1 to
+            // test it directly, but leaving LMS state stale while LPC resets would be an
+            // odd asymmetry the real binary's bundled reset function does not exhibit).
+            pf_ctx.ResetAll();
+            pf_lms_ch1.Init();
+            pf_lms_ch2.Init();
+            lzpf_img.Reset();   // FUN_080b6170 rides along (LAB_0805ab47 of the encoder's driver)
+            std::uint64_t block_out_size = uvar9 >> 3u;
+            if (block_out_size == 0u) block_out_size = 0x8000u;
+            if (block_out_size > 0x8001u) { nzr::derr::SetAt(4u, input_pos); decode_ok = false; break; }
+            if (total_written + block_out_size > total) {
+                nzr::derr::SetAt(lenient ? 2u : 3u, input_pos); decode_ok = false; break;   // see above
+            }
+            // Exe un-transform (uvar9 bit 2). The real dispatcher
+            // FUN_08097570 does, for every NON-prefilter block:
+            //     if ((uVar9 & 4) != 0)
+            //         FUN_080c0540(param_3, *param_4, param_3, param_1[0x4018], -1);
+            //     param_1[0x4018] += *param_4;
+            // i.e. the same x86 E8/E9 call/jmp address filter the -cd path
+            // already runs for its own chunk flag &4 (NzCdExeUnfilter), driven
+            // by a running output-position counter seeded at 4. This path never
+            // applied it at all, so every E8/E9 displacement in an executable
+            // was left in the encoder's absolute form -- e.g. batnball.exe kept
+            // 0x00000410 where the file has 0x0000000b.
+            //
+            // Critically it filters the OUTPUT COPY ONLY: the window keeps the
+            // unfiltered bytes, because later matches reference the unfiltered
+            // window (the real code copies window -> param_3 first and filters
+            // param_3 in place). Filtering the window would corrupt them.
+            // The prefilter branch (uvar9 & 7) == 4 is NOT covered: it has its
+            // own position-counter update in the original and never reaches
+            // this branch.
+            auto apply_exe_filter = [&](std::size_t out_off, std::size_t n) {
+                if ((uvar9 & 4u) == 0u) return;
+                nzr::cd::NzCdExeUnfilter(at_out(out_off), static_cast<std::uint32_t>(n),
+                                static_cast<std::uint32_t>(out_off + 4u));
+            };
+            if (mode_literal) {
+                // A block that consumes more input than its stream holds is the
+                // original's status 6 (FUN_08097e20, checked after the block).
+                std::size_t lit_avail = static_cast<std::size_t>(block_out_size);
+                if (input_pos + block_out_size > stream_data_end) {
+                    if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                    lit_avail = static_cast<std::size_t>(stream_data_end - input_pos);   // the rest of the block stays as it is
+                if (bytes.Span(input_pos, lit_avail) == nullptr) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+                }
+                const std::size_t block_start_in_window = window_cursor;
+                std::memcpy(window + block_start_in_window, bytes.Span(input_pos, lit_avail), lit_avail);
+                roll_room(static_cast<std::size_t>(block_out_size));
+                std::memcpy(at_out(total_written), bytes.Span(input_pos, lit_avail), lit_avail);
+                // A clamped literal block leaves the rest of its output untouched;
+                // it read as zeros out of the zero-filled member buffer, so say so
+                // (the rolling buffer carries the previous block's bytes there).
+                if (lit_avail < static_cast<std::size_t>(block_out_size))
+                    std::memset(at_out(total_written) + lit_avail, 0,
+                                static_cast<std::size_t>(block_out_size) - lit_avail);
+                window_cursor += static_cast<std::size_t>(block_out_size);
+                // Backfill hash_table for the literal bytes just written
+                // (legacy FUN_080b6d90 / FUN_080b6cf0, called after every
+                // literal block — NOT called for LZ77 blocks, which insert
+                // per-opcode inline instead). Without this, later blocks that
+                // reference a hash bucket only ever touched during a literal
+                // run read the table's untouched init value (3) instead of a
+                // real offset, corrupting f6/f8/medium-match copies.
+                // (uvar9 & 1) selects: 0 -> sparse (every 101 bytes, stopping
+                // 100 bytes short of the block end), 1 -> dense (every byte).
+                {
+                    const std::size_t bstart = block_start_in_window;
+                    const std::size_t bend = block_start_in_window + static_cast<std::size_t>(block_out_size);
+                    const std::size_t step = (uvar9 & 1u) ? 1u : 101u;
+                    const std::size_t hstop = (uvar9 & 1u) ? bend : (bend > 100u ? bend - 100u : bstart);
+                    for (std::size_t pos = bstart; pos < hstop; pos += step) {
+                        // memcpy rather than a uint32_t* cast: `pos` walks the
+                        // window byte by byte, so these loads are unaligned and
+                        // the cast form is UB (UBSan flags it). Same instruction
+                        // on x86, defined everywhere.
+                        std::uint32_t hw;
+                        std::memcpy(&hw, window + pos - (is_variant_b ? 3u : 2u), 4);
+                        const std::uint32_t h = is_variant_b ? (hw & 0xffffffu) : (hw & 0x1fffu);
+                        hash_table[h] = static_cast<std::int32_t>(pos);
+                    }
+                    // Variant B additionally resets the entire byte_buffer_8k
+                    // side-table to 0 after every literal block (legacy
+                    // FUN_080b6c20, called unconditionally from the tail of
+                    // both FUN_080b6d90/FUN_080b6cf0's variant-B branch).
+                    if (is_variant_b) {
+                        std::memset(byte_buffer_b.data(), 0, byte_buffer_b.size());
+                    }
+                }
+                apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
+                input_pos += lit_avail;
+                total_written += static_cast<std::size_t>(block_out_size);
+                progress::Add(block_out_size);
+                continue;
+            }
+            // Obtain the LZ77 opcode bytecode: either arith-decoded from a
+            // [u16 count][arith] side stream, or the raw input bytes directly.
+            const std::uint8_t* bc_ptr = nullptr;
+            std::size_t bc_len = 0;
+            std::vector<std::uint8_t> bytecode;  // owns arith-decoded bytes
+            std::size_t* raw_consumed_ptr = nullptr;
+            std::size_t raw_consumed = 0;
+            if (mode_lz77_side) {
+                if (input_pos + 2u > stream_data_end) {
+                    if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                    input_pos = stream_data_end;   // no side stream left: the next header read reports
+                    continue;
+                }
+                const std::uint16_t side_count =
+                    static_cast<std::uint16_t>(bytes[input_pos]) |
+                    (static_cast<std::uint16_t>(bytes[input_pos + 1u]) << 8u);
+                input_pos += 2u;
+                const std::size_t arith_size = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
+                if (bytes.Span(input_pos, arith_size) == nullptr) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+                bytecode.assign(side_count + 16u, 0);
+                const std::size_t consumed = nzr::lzpf::DecodeArithBuffer(
+                    bytes.Span(input_pos, arith_size), arith_size,
+                    bytecode.data(), side_count, /*max_len=*/12);
+                if (consumed == 0 || consumed > arith_size) {
+                    if (!lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+                    input_pos += arith_size;   // clamp to the record; the bytecode decoded so far is used
+                } else {
+                    input_pos += consumed;
+                }
+                bc_ptr = bytecode.data();
+                bc_len = side_count;
+            } else {  // mode_lz77_raw
+                bc_len = static_cast<std::size_t>(stream_data_end - input_pos);   // within one block
+                bc_ptr = bytes.Span(input_pos, bc_len);
+                if (bc_ptr == nullptr) { nzr::derr::SetAt(2u, input_pos); decode_ok = false; break; }
+                raw_consumed_ptr = &raw_consumed;
+            }
+            const std::size_t block_start_in_window = window_cursor;
+            std::int32_t last_lz_dest = -1;
+            const bool dispatch_ok = is_variant_b
+                ? nzr::lzpf::DecodeLz77VariantB(
+                      bc_ptr, bc_len, window, window_capacity,
+                      &window_cursor, static_cast<std::size_t>(block_out_size),
+                      hash_table.data(), byte_buffer_b.data(), &last_lz_dest, raw_consumed_ptr)
+                : nzr::lzpf::DecodeLz77VariantA(
+                      bc_ptr, bc_len, window, window_capacity,
+                      &window_cursor, static_cast<std::size_t>(block_out_size),
+                      hash_table.data(), &last_lz_dest, raw_consumed_ptr);
+            if (!dispatch_ok && !lenient) { nzr::derr::SetAt(6u, input_pos); decode_ok = false; break; }
+            // lenient: the original's dispatcher copies bounded garbage and moves on.
+            if (mode_lz77_raw) input_pos += raw_consumed;
+            // The original does not check that the LZ77 block filled its slot; on
+            // garbage it copies the slot out and moves to the next header, which is
+            // where its report comes from. Same here (the slot is bounded).
+            window_cursor = block_start_in_window + static_cast<std::size_t>(block_out_size);
+            roll_room(static_cast<std::size_t>(block_out_size));
+            std::memcpy(at_out(total_written), window + block_start_in_window,
+                        static_cast<std::size_t>(block_out_size));
+            apply_exe_filter(total_written, static_cast<std::size_t>(block_out_size));
+            total_written += static_cast<std::size_t>(block_out_size);
+                progress::Add(block_out_size);
+        }
+        // Hand over whatever is still in the rolling buffer -- on the way out of a
+        // clean stream and on the way out of a broken one alike: the original
+        // flushes a block the moment it has it (measured on a damaged -cf -p4
+        // container: it writes 110 of 114 MB where a member-at-a-time reader
+        // writes 1), so a failing block loses only itself.
+        // (Per member: only a decode that finished completes its last member; a
+        // failed one loses the member it was in.)
+        if (rolling && total_written > decoded_base && (!stream_members || decode_ok)) {
+            (*stream_out)(decoded_store.data(), total_written - decoded_base);
+            decoded_base = total_written;
+        }
+        if (trace_lzpf) {
+            if (const char* dp = NZ_ENV("NZOPT_DUMP_LZPF")) {
+                if (rolling) { /* the output is gone: nothing to dump */ }
+                else {
+                char path[512];
+                snprintf(path, sizeof(path), "%s.cap%zu", dp, window_capacity);
+                if (FILE* fp = fopen(path, "wb")) {
+                    fwrite(decoded, 1, total_written, fp);
+                    fclose(fp);
+                }
+                }
+            }
+            fprintf(stderr, "[lzpf] cap=%zu blocks=%zu ok=%d written=%zu/%llu verify=%d\n",
+                    window_capacity, blk_idx, (int)decode_ok, total_written,
+                    (unsigned long long)total,
+                    (decode_ok && total_written == total) ? (int)run_verify() : -1);
+        }
+        const bool this_is_first = first_candidate;
+        if (first_candidate) {
+            first_candidate = false;
+            if (out_member_done != nullptr) *out_member_done = member_done;
+        }
+        if (decode_ok && total_written == total && run_verify()) {
+            // Which dictionary capacity actually decoded: candidate 0 is the value
+            // DERIVED from the codec record's p1 byte, 1..4 are the legacy guesses
+            // kept as a fallback. If a corpus sweep never reports a candidate above
+            // 0, the guesses can go (see the note next to cap_candidates).
+            nz_trace::Construct("lzpf_cap candidate=%zu of=%zu p1=%u variant=%c",
+                                cap_idx, cap_candidates.size(), method_p1, is_variant_b ? 'B' : 'A');
+            if (direct_out != nullptr || rolling) { if (out != nullptr) out->clear(); }
+            else *out = std::move(decoded_store);
+            pscope.Commit();
+            return true;
+        }
+        // The members the first candidate completed are what the original has
+        // flushed when a later one fails. Kept only now that this candidate has
+        // failed: it used to be copied before the verdict, so every successful
+        // decode of a multi-record chain paid a copy of nearly its whole output
+        // (127 MB of a 128 MB file). The store is this candidate's own, so it is
+        // trimmed and moved rather than copied.
+        if (this_is_first && member_done > 0 && member_done < total && direct_out == nullptr && !rolling) {
+            decoded_store.resize(member_done);
+            // Give back the rest of the allocation: `resize` keeps the capacity
+            // of the whole output, which the candidates still to run would pay
+            // for on top of their own. This copies member_done bytes -- what the
+            // old code copied -- but only on this failing path.
+            decoded_store.shrink_to_fit();
+            first_prefix = std::move(decoded_store);
+        }
+    }
+    if (out != nullptr && !first_prefix.empty()) *out = std::move(first_prefix);
+    return false;
+}
+
+// Where DecodeOptimumBlockSequence puts each decoded block.
+//
+// This used to be a plain `std::vector<unsigned char>*` that grew to hold the
+// WHOLE stream output -- 280 MB per worker on a 4.5 GB archive, times every
+// worker in flight, which is most of why this reader needed 8.9 GB where the
+// original needs 278 MB. The sequence only ever APPENDS to it and asks for its
+// size (param15's match sources come from the decoder's ring, not from here --
+// see the param15 note in TryDecodeLegacyOptimum), so a consumer can take each
+// block and drop it. `size()` keeps meaning "output produced so far", which is
+// what the post-filter output caps are measured against.
+class OptimumOut {
+public:
+    explicit OptimumOut(std::vector<unsigned char>* v)
+        : vec_(v), total_(v != nullptr ? v->size() : 0u) {}
+    explicit OptimumOut(std::function<void(const unsigned char*, std::size_t)> sink)
+        : sink_(std::move(sink)) {}
+    // 64-bit: a decoded output can exceed 4 GB, and a 32-bit size_t here made
+    // the produced count wrap right after the 4 GB mark -- the decode then ran
+    // on with a nonsense "remaining output" and failed a few blocks later.
+    std::uint64_t size() const { return total_; }
+    void Append(const unsigned char* p, std::size_t n) {
+        if (n == 0u) return;
+        if (vec_ != nullptr) vec_->insert(vec_->end(), p, p + n);
+        else sink_(p, n);
+        total_ += n;
+    }
+    bool streaming() const { return vec_ == nullptr; }
+    void Clear() { if (vec_ != nullptr) { vec_->clear(); total_ = 0; } }
+    void Reserve(std::uint64_t n) {
+        if (vec_ != nullptr && n <= vec_->max_size()) vec_->reserve(static_cast<std::size_t>(n));
+    }
+    // Drop anything past `n`. Only the buffered path can: a streamed byte is
+    // already on disk, and the sink clamps to the slice's own length anyway.
+    void TruncateTo(std::uint64_t n) {
+        if (vec_ != nullptr && n < total_) { vec_->resize(static_cast<std::size_t>(n)); total_ = n; }
+    }
+    const std::vector<unsigned char>* buffer() const { return vec_; }
+private:
+    std::vector<unsigned char>* vec_ = nullptr;
+    std::function<void(const unsigned char*, std::size_t)> sink_;
+    std::uint64_t total_ = 0;
+};
+
+// Forward declaration: defined further below (near TryDecodeLegacyOptimum,
+// which it was extracted from), but also needed here by the -co parallel-
+// container branch inside TryParseLegacyCnArchive. Templated on the decoder
+// type since it now also serves -cO's NzOptimum2LzDecoder (single-container
+// path only, in TryDecodeLegacyOptimum) -- the parallel-container branch
+// below only ever instantiates it with NzOptimumLzDecoder (-co parallel
+// containers; parallel -cO containers are wired too, see TryParseLegacyCnArchive).
+// The padded tail of a cut archive (LegacyCnContext::pad_from), for the block
+// loop below while TryDecodeLegacyOptimum runs. Only a block's HEADER FIELDS
+// may come from the padding: a block whose payload reaches it stops there with
+// the short end, exactly as before the padding existed -- which is what the
+// original reports (-co cut 1000 to 40 000 bytes into its last block: 25600;
+// decoding the zeros gave 26368).
+static thread_local ArcPos t_opt_pad_from = ~ArcPos{0};
+
+template <typename OptimumDecoder>
+static bool DecodeOptimumBlockSequence(
+    // The block records as a RANGE SOURCE, not a pointer at a buffer: a single
+    // container's payload can be the whole archive, and copying it flat is what
+    // a 32-bit build cannot afford. Every read below is bounded by a header
+    // field, so a window (or a splice) can serve them all.
+    const ByteView& src,
+    // Payload offsets, NOT size_t: a single container's payload is the whole
+    // archive, so on a 32-bit build these wrap just short of 4 GB -- the decode
+    // then walks off the end of a perfectly good stream.
+    ArcPos blocks_begin,
+    ArcPos blocks_end,
+    std::uint64_t total_size_hint,
+    OptimumDecoder& dec,
+    nzr::audio::NzAudioPred& audio,
+    nzr::audio::NzImageModel& image,
+    NzExeFilter& exe,
+    // Everything the stream has produced so far, as a count plus a sink for the
+    // new bytes (see OptimumOut). param15's absolute offsets index the decoder's
+    // RING, not this: param1 (the delta filter) rewrites almost every byte, so a
+    // param15 match sourced from the final output copies the wrong bytes into the
+    // block AND into the LZ window.
+    OptimumOut* out_data);
+
+// Per-codec profiles of the two side models the optimum family carries.
+// Audio (GDB-read at FUN_080a5330's entry): the decoder object's flag byte is
+// -co 0x13 / -cO 0x03 -- -co is the one whose bit 4 is SET, so it runs
+// FUN_08096e20 (the LMS) instead of FUN_08096160 and reads two 3-bit shifts
+// biased +7 rather than two 4-bit shifts biased +0x10; plane orders -co
+// 64/8/8, -cO 96/8/8; stereo param -co 4, -cO 8; -co uses the bit-count
+// decoder class B. Image (GDB-read at FUN_080a90c0's entry): -co flags 0x07,
+// -cO 0x0f, both planes 32/48; -co bit-count class B. `p0` is the method's
+// first parameter byte (5 = -co, 6 = -cO).
+static void ConfigureOptimumModels(std::uint32_t p0, nzr::audio::NzAudioPred& aud,
+                                   nzr::audio::NzImageModel& img) {
+    if (p0 == 5u) {
+        aud.SetContextFlags(0x13u); aud.SetPlaneOrders(64u, 8u, 8u); aud.SetStereoParam(4u); aud.SetBitcountVariantB(true);
+        img.Configure(0x07u, 32u, 48u, true);
+    } else {
+        aud.SetContextFlags(0x03u); aud.SetPlaneOrders(96u, 8u, 8u); aud.SetStereoParam(8u);
+        img.Configure(0x0fu, 32u, 48u, false);
+    }
+}
+
+std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n);
+void StageMark(const char* what);
+
+bool TryParseLegacyCnArchive(
+    const std::string& archive_path,
+    LegacyCnContext* out_context,
+    std::string* out_error_message) {
+    if (out_context == nullptr) {
+        return false;
+    }
+
+    std::ifstream input(archive_path, std::ios::binary);
+    if (!input) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Cannot open archive!";
+        }
+        return false;
+    }
+
+    // The archive is mapped, not copied (see ArchiveBytes): the parse and every
+    // decoder only read it, and a 2 GB archive would otherwise be 2 GB of
+    // anonymous memory. The mapping is SHARED with the context so it can outlive
+    // this function -- the decoders run after the parse returns, and a payload
+    // they can read through the mapping is a payload nobody has to copy.
+    input.close();
+    auto archive_ptr = std::make_shared<ArchiveBytes>();
+    ArchiveBytes& archive = *archive_ptr;
+    if (!archive.Open(archive_path)) {
+        if (out_error_message != nullptr)
+            *out_error_message = archive.oom() ? "Out of memory!" : "Cannot open archive!";
+        return false;
+    }
+    ByteView bytes = archive.View();
+    StageMark("archive read");
+    // A self-extracting archive (`w32c`) is a Windows PE stub with the archive
+    // appended; the original opens those by seeking past the image (FUN_080b0e50),
+    // and so does `l`/`x`/`t` here. Everything below indexes `bytes`, so dropping
+    // the stub up front keeps every offset consistent.
+    if (bytes.size() > 0x40u && bytes[0] == 'M' && bytes[1] == 'Z') {
+        const std::size_t probe_n = bytes.size() < 4096u ? static_cast<std::size_t>(bytes.size()) : 4096u;
+        const ArcPos off = LegacySfxDataOffset(bytes.Span(0u, probe_n), probe_n);
+        if (NZ_ENV("NZ_VERBOSE_NATIVE")) std::fprintf(stderr, "[native] PE stub: archive data offset %zu of %zu\n", off, bytes.size());
+        if (off > 1u && off < bytes.size()) bytes = bytes.subview(off);
+    }
+    if (bytes.size() < 24u) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
+    }
+
+    if (bytes[0] != kMagicPrefix[0] || bytes[1] != kMagicPrefix[1]) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "File is not a NanoZip archive.";
+        }
+        return false;
+    }
+    if (std::memcmp(bytes.Span(2u, kKnownSignatureBytes), kKnownSignature, kKnownSignatureBytes) != 0) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "File is not a NanoZip archive.";
+        }
+        return false;
+    }
+
+    ArcPos pos = 2u + kKnownSignatureBytes;
+    if (pos + 3u > bytes.size() || bytes[pos] != 0x1fu || bytes[pos + 1u] != 0x0fu || bytes[pos + 2u] != 0x09u) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Legacy header prefix is not recognized.";
+        }
+        return false;
+    }
+    pos += 3u;
+
+    // Scan chunk-tagged records to extract checksum mode, codec params, and
+    // filename-table span.  NZ serialises the header as a sequence of
+    // [varint (size<<4)|type] [size-byte payload] chunks.  When the initial
+    // lower nibble of the varint is 15, one extra byte follows the varint to
+    // encode the real type and a stream ID.
+    //
+    // Single-stream archives:
+    //   [type-5 size-0 checksum] [type-11 size-2..4 codec] [type-1 size-N table]
+    //
+    // Parallel archives (-p10 etc.) have one type-5/type-11/type-1 record per
+    // parallel stream.  Each per-stream type-1 table contains the PARTIAL
+    // (per-stream) uncompressed size for each logical file; the true total is
+    // the sum across all streams.  We scan all chunks to accumulate totals.
+    ChecksumMode checksum_mode = ChecksumMode::kNone;
+    bool checksum_verification_supported = true;
+    unsigned char method = 0u, method_p0 = 0u, method_p1 = 0u, method_p2 = 0u;
+    int cm_a_bits = 28, cm_b_bits = 25;
+    std::uint32_t cm_window_size = 1024u * 1024u;
+    ArcPos table_start = 0u, table_end = 0u;
+    bool found_codec = false, found_table = false;
+    // Every filename table, in record order, tagged with its stream id. A
+    // multi-file archive hands its files to the compressor in blocks and emits
+    // one table per block, so reading only the first loses every file after the
+    // first block; a parallel container additionally puts some files ONLY in a
+    // non-main stream's table.
+    // {stream, begin, end} -- begin/end are FILE offsets, so ArcPos: a filename
+    // table of a >4 GB archive sits past what a 32-bit size_t holds.
+    std::vector<std::array<ArcPos, 3>> all_tables;
+    // Per table, whether a type-10 (slice offset) record follows it in its
+    // stream: that is the original's "this entry is a slice of a file split
+    // across streams" flag (entry byte 0x21 & 0x10), set on EVERY slice of such
+    // a file, the offset-0 one included. It decides the listing order below.
+    std::vector<bool> table_has_off;
+    std::map<unsigned, std::size_t> last_table_of_stream;   // stream -> index into all_tables
+    // Per-file attribute records ({stream, type, begin, end}), in record order.
+    // ArcPos, not size_t: `begin`/`end` are FILE offsets, and a 4.6 GB archive's
+    // records run past what a 32-bit size_t can hold.
+    std::vector<std::array<ArcPos, 4>> attr_records;
+    // Start of the first main-stream type-0 record == end of the leading
+    // metadata run (the offset the single-file path uses as payload_start).
+    ArcPos first_data_record = 0u;
+    bool found_first_data = false;
+    // Every main-stream data record, as [record_begin, record_end). In a
+    // multi-block archive the next block's table/mtime/perm/checksum records sit
+    // BETWEEN two data records, so the payload is not one contiguous run.
+    //
+    // ArcPos, NOT size_t. These are FILE offsets: on a 32-bit build every record
+    // past the 4 GB mark wrapped here, and the splice map built from them then
+    // read the archive 2^32 bytes short. On the reporter's 4.6 GB -cO archive
+    // that showed up as a decode that ran 535 segments -- 4280 MiB of correct
+    // output -- and then read its next stream tag at (offset - 2^32), got a
+    // nibble that was not 0, and called the archive corrupt (code 100).
+    std::vector<std::pair<ArcPos, ArcPos>> data_records;
+    // The same records' PAYLOAD ranges (header excluded), whole records only:
+    // a stored archive's content is their concatenation.
+    std::vector<std::pair<ArcPos, ArcPos>> data_payloads;
+    // Any record belonging to a non-zero stream => parallel (-pN) container,
+    // which has its own framing and must not be spliced.
+    bool has_parallel_streams = false;
+    // Accumulated file sizes across all per-stream type-1 tables.
+    std::map<std::string, std::uint64_t> size_accum;
+    // Which streams' tables mention each path; more than one means the file is
+    // split across parallel streams and has no whole-file checksum.
+    std::map<std::string, std::set<unsigned>> path_streams;
+    bool truncated_input = false;
+    // The record framing itself ran off the end of the file, or the first data
+    // record is shorter than the codec's first block header: the original never
+    // gets a decoder started and its reader reports "Unexpected end of file."
+    bool eof_before_decode = false;
+    // A data record whose header is complete (its payload may be cut off).
+    bool saw_data_record = false;
+    bool cut_first_data_record = false;
+    // A main-stream data record whose header is whole but whose payload the end
+    // of the file cuts off: where its bytes start and how many it declares. A
+    // stored archive needs it (the original writes such a record at its full
+    // length and reads on; see the store branch below).
+    bool cut_data_valid = false;
+    ArcPos cut_data_begin = 0;
+    std::uint64_t cut_data_declared = 0;
+
+    // Every record consumes at least one byte, so `pos` alone bounds the loop --
+    // but "at least one byte" is not enough of a bound on the tables this walk
+    // fills. A record tag of 0x00 reads as type 0, size 0, so a file of zeros
+    // yields one empty data record per byte: on a 4.3 GB one that is 4.3 billion
+    // entries in data_records, tens of GB of them, and the process is killed
+    // before it can call the archive corrupt. An earlier cap of 1024 records was
+    // a real bug (a 2.29 GB -cf container carries 16 streams x ~144 records, and
+    // the walker stopped half-way, so the parser folded 8 streams into one
+    // undecodable slice), so the cap here is set where no archive can reach it:
+    // codecs cut a data record per block, 1 MB at a time in -cf, which puts an
+    // 8 TB archive at 8 million records. Past that the file is not an archive
+    // this reader can walk, and saying so beats being killed.
+    const std::size_t kMaxRecords = 8u * 1024u * 1024u;
+    bool too_many_records = false;
+    for (std::size_t guard = 0; guard <= bytes.size() && pos < bytes.size(); ++guard) {
+        if (guard >= kMaxRecords) { too_many_records = true; break; }
+        const ArcPos record_begin = pos;
+        std::uint64_t r64 = 0u;
+        if (!ReadLegacyVarint(bytes, &pos, bytes.size(), &r64)) {
+            truncated_input = eof_before_decode = true;
+            break;
+        }
+        // The record tag is (size << 4) | type, so a payload of 256 MB or more
+        // makes it 2^32 or larger. Narrowing it to 32 bits turned a 256 MB data
+        // record's tag into a plain zero -- type 0, size 0 -- and the walk then
+        // read the payload as records: reported by a user on a 4.5 GB archive of
+        // one video file, and reproducible with `a -cn` on any 256 MB input. The
+        // other four record walkers in this file already keep the full width and
+        // only narrow the type nibble, which truncation cannot touch.
+        unsigned ctype   = static_cast<unsigned>(r64) & 0x0fu;
+        unsigned cstream = 0u;
+        std::size_t csize = static_cast<std::size_t>(r64 >> 4u);
+
+        if (ctype == 15u) {
+            if (pos >= bytes.size()) { truncated_input = eof_before_decode = true; break; }
+            unsigned ext = static_cast<unsigned>(bytes[pos++]);
+            if (ext >= 0xf8u) {
+                if (pos >= bytes.size()) { truncated_input = eof_before_decode = true; break; }
+                ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[pos++]) + 248u;
+            }
+            ctype   = ext & 0x0fu;
+            cstream = ext >> 4u;
+            if (cstream == 0u) ctype += 15u;
+        }
+
+        if (ctype == 0u && found_codec) saw_data_record = true;
+        if (ctype == 10u && found_codec) {
+            const auto lt = last_table_of_stream.find(cstream);
+            if (lt != last_table_of_stream.end() && lt->second < table_has_off.size())
+                table_has_off[lt->second] = true;
+        }
+
+        if (pos + csize > bytes.size()) {
+            truncated_input = true;
+            psink::MarkTruncated();
+            // Nothing ever reached the decoder: the cut is in a metadata record
+            // (or in a data record the codec cannot even start on), so the
+            // failure comes from the reader and is "Unexpected end of file."
+            // Measured over m_<codec>.nz cut byte by byte: with the first data
+            // record's header whole, -cn/-cd/-cD/-cf/-cF already report their own
+            // status, while -cc/-co/-cO still need the 5 bytes of a block header.
+            const bool cut_in_data = (ctype == 0u && cstream == 0u && found_codec);
+            if (!found_first_data &&
+                (!cut_in_data ||
+                 ((method_p0 == 5u || method_p0 == 6u || method_p0 == 7u) &&
+                  bytes.size() - pos < 5u)))
+                eof_before_decode = true;
+            // The original hands the decoder whatever bytes of the cut-off data
+            // record exist (its reports on truncated archives -- 4096, 1024, 1536,
+            // the lzhds assertion -- come from decoding that stub), so keep it.
+            if (ctype == 0u && cstream == 0u && found_codec && pos < bytes.size())
+                data_records.push_back({record_begin, bytes.size()});
+            // A cut inside the FIRST data record: whatever the decoder makes of
+            // the stub, the original reports its family's short-end status --
+            // 4 for -cd/-cD, 2 for -cf/-cF, 100 for the CM family -- shifted,
+            // since it is the last record. Measured byte by byte and at 15
+            // points across the first record of m_<codec>.nz, all eight codecs:
+            // constant there, garbage-dependent beyond it. (Dropping the stub
+            // instead, as the parallel workers do, was tried: it matches less.)
+            if (cut_in_data && !found_first_data) cut_first_data_record = true;
+            if (cut_in_data) { cut_data_valid = true; cut_data_begin = pos; cut_data_declared = csize; }
+            // A filename table cut off by the end of the file: the original
+            // reads the names that fit and then reports the truncation the way
+            // it reports any other one ("Archive corrupted. Unexpected end of
+            // file." after printing the first entry's name), so take the table
+            // as far as it goes instead of rejecting the archive.
+            if (ctype == 1u && cstream == 0u && found_codec && !found_table && pos < bytes.size()) {
+                table_start = pos;
+                table_end = bytes.size();
+                found_table = true;
+                all_tables.push_back({0u, pos, bytes.size()});
+                table_has_off.push_back(false);
+            }
+            break;
+        }
+        const bool is_main = (cstream == 0u);
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] @%zu ctype=%u cstream=%u csize=%zu codec=%d table=%d\n",
+                         pos, ctype, cstream, (size_t)csize, (int)found_codec, (int)found_table);
+
+        // Checksum indicator: zero-payload main-stream chunk.
+        // Direct (single-stream): type 5/6/7.
+        // Extended (multi-stream): type 20/21/22 = 15+5/6/7 with stream=0.
+        if (is_main && csize == 0u) {
+            if      (ctype == 5u || ctype == 20u) checksum_mode = ChecksumMode::kFletcher32;
+            else if (ctype == 6u || ctype == 21u) checksum_mode = ChecksumMode::kCrc16;
+            else if (ctype == 7u || ctype == 22u) checksum_mode = ChecksumMode::kCrc32;
+        }
+
+        // Per-file attribute records, and the first main-stream data record.
+        if (found_codec) {
+            if (csize > 0u && (ctype == 2u || ctype == 3u || ctype == 4u || ctype == 5u ||
+                               ctype == 6u || ctype == 7u || ctype == 8u || ctype == 9u)) {
+                attr_records.push_back({static_cast<std::size_t>(cstream),
+                                        static_cast<std::size_t>(ctype), pos, pos + csize});
+            } else if (ctype == 0u && is_main) {
+                if (!found_first_data) {
+                    first_data_record = record_begin;
+                    found_first_data = true;
+                }
+                data_records.push_back({record_begin, pos + csize});
+                data_payloads.push_back({pos, pos + csize});
+            }
+        }
+        if (!is_main) {
+            has_parallel_streams = true;
+        }
+
+        // Codec params: type 11, main stream.  Payload: [p0] [p1] [extras...].
+        // method byte = (csize<<4)|11 = 0x2b (lzpf/lzhd), 0x3b (optimum), 0x4b (cm).
+        // Any stream's codec record will do: every worker of a parallel container
+        // writes the same parameters, and with -t1 the original emits the LAST
+        // worker's records first and stream 0's last -- so waiting for stream 0's
+        // record dropped every table and attribute record written before it (a
+        // sliced -cn -p3 archive was rejected as "Data corrupted while reading
+        // headers!" because only stream 0's files were counted).
+        if (!found_codec && ctype == 11u && csize >= 1u) {
+            method    = static_cast<unsigned char>((csize << 4u) | 11u);
+            method_p0 = bytes[pos];
+            method_p1 = (csize >= 2u) ? bytes[pos + 1u] : 0u;
+            // The THIRD byte is the block size the compressor settled on (the
+            // same mantissa/exponent byte-float as the window). It is what the
+            // "[N MB]" figure on the Compressor line is computed from -- the
+            // original sizes its primary buffer by the block, not the window --
+            // so an archive made with an explicit -m prints a smaller figure
+            // than its window alone would suggest. Measured on -co archives of
+            // one 3 MB input at -m8m/-m24m/-m32m/-m48m: 13/16/20/25 MB, exactly
+            // f(window from p1, primary = max(block from p2, 1 MB)).
+            method_p2 = (csize >= 3u) ? bytes[pos + 2u] : 0u;
+            // CM (p0=7, size>=4): payload[2]=B (unused), payload[3]=CD.
+            if (method == 0x4bu && method_p0 == 7u && csize >= 4u) {
+                const unsigned char cd_byte = bytes[pos + 3u];
+                cm_a_bits = static_cast<int>((cd_byte >> 4u) + 20u);
+                cm_b_bits = static_cast<int>((cd_byte & 0x0fu) + 18u);
+                const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
+                unsigned m = xp1 & 0x0fu;
+                const unsigned s = xp1 >> 4u;
+                if (s) m = (m + 16u) << (s - 1u);
+                cm_window_size = m << 16u;
+            }
+            pos += csize;
+            found_codec = true;
+        }
+        // Filename table: type 1 (any stream).  Accumulate per-filename sizes.
+        // For the main-stream chunk, also record table_start/table_end.
+        // Do NOT break early — parallel archives have type-1 chunks from every stream.
+        else if (ctype == 1u && csize >= 2u) {
+            // Accumulate sizes from this stream's table.
+            ArcPos tp = pos, tend = pos + csize;
+            while (tp < tend) {
+                std::uint64_t fsize = 0u;
+                if (!ReadLegacyVarint(bytes, &tp, tend, &fsize)) break;
+                const ArcPos nul_at = bytes.FindByte(tp, tend, 0u);
+                if (nul_at == tend) break;
+                const std::string fname = bytes.StringAt(tp, nul_at - tp);
+                size_accum[fname] += fsize;
+                path_streams[fname].insert(cstream);
+                tp = nul_at + 1u;
+            }
+            // Record the FIRST type-1 chunk as the canonical table, whatever
+            // stream it belongs to, and keep every one of them for the entry
+            // build. This only fixes the metadata/payload BOUNDARY: the entry
+            // list itself is built by walking all_tables with dedup below, so
+            // it stays complete either way.
+            //
+            // Requiring the main stream here was wrong. In a parallel (-pN)
+            // container every worker emits its own self-describing record run
+            // (type 5/11/1/10/2/4/5 then its type-0 data), and the ORDER of
+            // those runs follows thread scheduling, not the stream id. Most of
+            // the time stream 0 goes first; occasionally (about 1 run in 20 for
+            // -cn -p4 on a 1 MB file) all four stream ids are declared up front
+            // and the runs come out 3, 0, 2, 1. Skipping stream 3's table then
+            // adopted stream 0's, which sits AFTER stream 3's 250 KB data
+            // record -- so table_end landed inside the payload and the archive
+            // was rejected with "Data corrupted while reading headers!". The
+            // tables are per-stream copies, and the boundary we want is simply
+            // where the first metadata run ends.
+            if (found_codec) {
+                if (!found_table) {
+                    table_start = pos;
+                    table_end   = pos + csize;
+                    found_table = true;
+                }
+                all_tables.push_back({static_cast<std::size_t>(cstream), pos, pos + csize});
+                table_has_off.push_back(false);
+                last_table_of_stream[cstream] = all_tables.size() - 1u;
+            }
+            pos += csize;
+        }
+        else {
+            pos += csize;
+        }
+    }
+
+    if (too_many_records) {
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] BAIL record budget: %zu records inside %zu bytes\n",
+                         (size_t)kMaxRecords, bytes.size());
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
+    }
+
+    // An archive of NO files: every input was excluded (-x) or could not be
+    // opened. The original still writes the prologue and one stream header -- a
+    // checksum-kind record and the codec record, 27 or 28 bytes in all -- and
+    // no table and no data record. Its `t` and `x` read that back as
+    // "Decompressed 0 bytes" and its `l` as "Total of 0 files, 0 bytes.", with
+    // no compressor line (no data record, so no decompressor is ever created).
+    // This reader called it "Legacy filename table encoding is not recognized."
+    // With -pN it is one such header per worker (33 to 37 bytes), read the same.
+    if (found_codec && !found_table && !saw_data_record && !truncated_input) {
+        LegacyCnContext ctx;
+        ctx.archive_path = archive_path;
+        ctx.checksum_mode = checksum_mode;
+        ctx.checksum_verification_supported = checksum_verification_supported;
+        ctx.legacy_method = method;
+        ctx.legacy_method_p0 = method_p0;
+        ctx.legacy_method_p1 = method_p1;
+        ctx.legacy_method_p2 = method_p2;
+        ctx.native_payload_supported = true;
+        ctx.payload_mode = LegacyPayloadMode::kStore;
+        ctx.saw_data_record = false;
+        ctx.total_data_size = 0u;
+        *out_context = std::move(ctx);
+        if (out_error_message != nullptr) out_error_message->clear();
+        return true;
+    }
+    if (!found_codec || !found_table) {
+        if (out_error_message != nullptr) {
+            *out_error_message =
+                found_codec ? "Legacy filename table encoding is not recognized."
+                            : "Legacy stream family is not recognized.";
+        }
+        return false;
+    }
+
+    if (method != 0x2bu && method != 0x3bu && method != 0x4bu) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Legacy stream family is not recognized.";
+        }
+        return false;
+    }
+    bool native_store_payload = (method_p0 == 0u);   // cleared for a store cut inside a data record (below)
+
+    if (table_end > bytes.size()) {
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] BAIL table_end=%zu > size=%zu\n", (size_t)table_end, bytes.size());
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
+    }
+
+    std::vector<LegacyCnEntry> entries;
+    std::uint64_t total_data_size = 0;
+    // Walk every main-stream filename table, in order. A single-block archive
+    // has exactly one; a multi-block one has a table per block and its later
+    // files live only in the later tables. A parallel (-pN) container repeats a
+    // filename across streams, so a path already seen is skipped rather than
+    // duplicated -- its true size is restored from size_accum below.
+    std::map<std::string, std::size_t> path_index;
+    // Per stream, the entry indices its own tables name, in order: that stream's
+    // attribute records cover exactly those, in exactly that order.
+    std::map<unsigned, std::vector<std::size_t>> stream_named;
+    // Parallel to stream_named: whether that table entry is a slice of a split
+    // file (its table is followed by a type-10 offset record).
+    std::map<unsigned, std::vector<bool>> stream_split;
+    // Per stream, where each of its tables starts and how many entries that
+    // stream has named once the table is read: an attribute record belongs to
+    // the block of the last table before it (see ApplyLegacyAttributeRecords).
+    LegacyTableMarks table_marks;
+    for (std::size_t table_index = 0; table_index < all_tables.size(); ++table_index) {
+    const auto& table_span = all_tables[table_index];
+    const bool table_split = table_index < table_has_off.size() && table_has_off[table_index];
+    const unsigned table_stream = static_cast<unsigned>(table_span[0]);
+    ArcPos p = table_span[1];
+    const ArcPos table_end = table_span[2];
+    while (p < table_end) {
+        std::uint64_t file_size = 0;
+        if (!ReadLegacyVarint(bytes, &p, table_end, &file_size)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return false;
+        }
+
+        const ArcPos name_end = bytes.FindByte(p, table_end, 0u);
+        if (name_end == table_end) {
+            // The table itself was cut off: keep the entries that are complete
+            // (the original does, and then reports the truncation).
+            if (truncated_input && !entries.empty()) break;
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return false;
+        }
+
+        LegacyCnEntry e;
+        e.path = bytes.StringAt(p, name_end - p);
+        e.size = file_size;
+
+        p = name_end + 1u;
+        if (file_size > (std::numeric_limits<std::uint64_t>::max() - total_data_size)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return false;
+        }
+        // Only a PARALLEL container repeats a path, because a file is split
+        // into per-stream slices and each stream's table names it. A sequential
+        // archive that genuinely lists the same file twice must keep both
+        // entries -- the original lists and extracts both.
+        if (has_parallel_streams) {
+            const auto known = path_index.find(e.path);
+            if (known != path_index.end()) {
+                stream_named[table_stream].push_back(known->second);
+                stream_split[table_stream].push_back(table_split);
+                continue;
+            }
+        }
+        path_index.emplace(e.path, entries.size());
+        stream_named[table_stream].push_back(entries.size());
+        stream_split[table_stream].push_back(table_split);
+        total_data_size += file_size;
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[HDR] store size check: total_data_size=%llu size=%zu\n",
+                         (unsigned long long)total_data_size, bytes.size());
+        if (native_store_payload && total_data_size > bytes.size() &&
+            !(truncated_input && (cut_data_valid || !data_payloads.empty()))) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return false;
+        }
+        entries.push_back(std::move(e));
+    }
+
+    // A table cut off by the end of the file stops at its last whole entry, so
+    // the cursor does not reach table_end -- that is the shape the original
+    // lists and then reports as "Unexpected end of file", not a rejection.
+    if (p != table_end && !(truncated_input && !entries.empty())) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
+    }
+    table_marks[table_stream].push_back({table_span[1], stream_named[table_stream].size()});
+    }  // for each filename table
+
+    if (entries.empty()) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return false;
+    }
+
+    // Parallel archives (-pN): each stream emits its own type-1 table with the
+    // PARTIAL uncompressed size for that stream's portion of each file.  The
+    // size_accum map holds the sum across all streams for each filename.
+    // Override per-entry sizes from the main-stream table with the totals.
+    // Only in a PARALLEL container is a repeated path the same file in slices,
+    // so only there does summing the per-table sizes give the true size. A
+    // sequential archive that lists the same file twice has two entries of the
+    // real size; summing them reported each at double, and the total at double.
+    if (has_parallel_streams && !size_accum.empty()) {
+        for (auto& e : entries) {
+            auto it = size_accum.find(e.path);
+            if (it != size_accum.end() && it->second != e.size) {
+                total_data_size -= e.size;
+                e.size = it->second;
+                total_data_size += e.size;
+            }
+        }
+    }
+
+    // Multi-block compressed archives write one filename table per block.
+    // Scan forward past the first table for additional table_span+table pairs.
+    //
+    // The probe walks raw bytes looking for a [table_span][filename_table]
+    // shape. Compressed payload bytes are statistically noisy and can spoof
+    // that shape. We require scanner-added entry paths to be pure ASCII
+    // printable (0x20-0x7E) AND either contain a '/' separator OR be at
+    // least 6 characters with an extension dot. This rejects short random
+    // ASCII bursts that frequently appear inside compressed streams while
+    // still accepting real archive paths (which always include the source
+    // directory prefix in legacy `a` invocations).
+    auto path_looks_like_real_legacy_entry = [](const std::string& s) {
+        if (s.empty() || s.size() > 1024u) {
+            return false;
+        }
+        // Legacy `nz a` strips leading '/' from inputs, so absolute paths
+        // never appear in real archives. Reject them outright — they are a
+        // common shape for random-byte spoofs that happen to start with '/'.
+        if (s.front() == '/') {
+            return false;
+        }
+        // First byte must be alphanumeric, '.', '_', or '-' — anything else
+        // (punctuation, symbols) is overwhelmingly a spoof in random bytes.
+        const unsigned char first = static_cast<unsigned char>(s.front());
+        const bool first_ok =
+            (first >= '0' && first <= '9') ||
+            (first >= 'A' && first <= 'Z') ||
+            (first >= 'a' && first <= 'z') ||
+            first == '.' || first == '_' || first == '-';
+        if (!first_ok) {
+            return false;
+        }
+        bool has_slash = false;
+        bool has_dot = false;
+        for (unsigned char c : s) {
+            if (c < 0x20u || c > 0x7eu) {
+                return false;
+            }
+            if (c == '/') {
+                has_slash = true;
+            } else if (c == '.') {
+                has_dot = true;
+            }
+        }
+        if (has_slash) {
+            return true;
+        }
+        // No slash: require length >= 6 AND a dot (typical "name.ext" shape).
+        return s.size() >= 6u && has_dot;
+    };
+    bool multiblock_scanner_added_entries = false;
+    // Skip the heuristic multi-block table scanner for parallel (-pN) archives:
+    // size_accum already gives the true per-file size by summing every
+    // stream's own type-1 table (see above), so total_data_size is already
+    // correct here. The scanner's [table_span][filename_table] shape probe is
+    // explicitly documented as spoofable by noisy compressed bytes (see
+    // comment above `path_looks_like_real_legacy_entry`); running it anyway
+    // on a parallel container's many per-stream compressed chunks measurably
+    // produces false-positive phantom entries that corrupt total_data_size
+    // (observed: a 9 MB tar under -cf falsely gained a phantom 114-byte entry).
+    if (!native_store_payload && size_accum.empty()) {
+        ArcPos scan_pos = table_end;
+        while (scan_pos < bytes.size()) {
+            bool found_additional = false;
+            for (ArcPos probe = scan_pos; probe + 1u < bytes.size(); ++probe) {
+                const unsigned char bp = bytes[probe];
+                if ((bp & 0x0fu) != 0x01u) {
+                    continue;
+                }
+                ArcPos tp = probe;
+                std::uint64_t tspan = 0;
+                if (!ReadLegacyTableSpan(bytes, &tp, &tspan)) {
+                    continue;
+                }
+                const std::uint64_t tlen = tspan + 2u;
+                if (tlen < 4u || tlen > static_cast<std::uint64_t>(bytes.size() - tp)) {
+                    continue;
+                }
+                const ArcPos tend = tp + tlen;
+                if (!LooksLikeLegacyFilenameTable(bytes, tp, tend)) {
+                    continue;
+                }
+                // Validate each entry: file_size must be non-zero.
+                // We are inside the !native_store_payload branch, so sizes are
+                // decompressed lengths and may exceed the compressed archive size.
+                ArcPos vp = tp;
+                std::vector<LegacyCnEntry> add_entries;
+                bool valid = true;
+                while (vp < tend) {
+                    std::uint64_t fs = 0;
+                    if (!ReadLegacyVarint(bytes, &vp, tend, &fs) || fs == 0u) {
+                        valid = false;
+                        break;
+                    }
+                    const ArcPos ne = bytes.FindByte(vp, tend, 0u);
+                    if (ne == tend) {
+                        valid = false;
+                        break;
+                    }
+                    LegacyCnEntry ae;
+                    ae.path = bytes.StringAt(vp, ne - vp);
+                    ae.size = fs;
+                    if (!path_looks_like_real_legacy_entry(ae.path)) {
+                        valid = false;
+                        break;
+                    }
+                    if (fs > (std::numeric_limits<std::uint64_t>::max() - total_data_size)) {
+                        valid = false;
+                        break;
+                    }
+                    add_entries.push_back(std::move(ae));
+                    vp = ne + 1u;
+                }
+                if (!valid || vp != tend || add_entries.empty()) {
+                    continue;
+                }
+                for (LegacyCnEntry& ae : add_entries) {
+                    total_data_size += ae.size;
+                    entries.push_back(std::move(ae));
+                }
+                multiblock_scanner_added_entries = true;
+                scan_pos = tend;
+                found_additional = true;
+                break;
+            }
+            if (!found_additional) {
+                break;
+            }
+        }
+    }
+
+    std::uint64_t data_offset_u64 = 0;
+    ArcPos metadata_begin = table_end;
+    ArcPos metadata_end = bytes.size();
+    ArcPos payload_start = bytes.size();
+
+    // Preferred path: walk the metadata run as the record sequence it actually
+    // is (see ParseLegacyMetadataRun). This is the only path that reads
+    // per-entry checksums for MULTI-file archives -- without them the per-entry
+    // verification in RunLegacyCnExtractOrTest is skipped, which used to let a
+    // wrong decode be written out silently. When the walk does not fully
+    // understand the run we fall through to the older per-shape heuristics.
+    // In a parallel container the file ORDER is not record order. The original
+    // keeps one entry list per worker stream (in table order) and merges them
+    // into the global list one stream at a time, in stream-id order
+    // (FUN_080922a0, read with GDB on `l`: a watchpoint on the list head and a
+    // dump of both lists at every call, see the wiki's Reverse-Engineering
+    // notes). The merge walks the stream's list collecting a RUN; a slice of a
+    // split file (entry flag 0x10 = its table is followed by an offset record)
+    // ends the run: the run is spliced at the HEAD of the global list, keeping
+    // its internal order, and the slice itself is either ADDED to the entry of
+    // the same name already in the list (size summed, checksum zeroed -- the
+    // `n/a`) or, if none, starts the next run. Whatever is left at the end of
+    // the stream is spliced at the head too. So the listing is a sequence of
+    // reversed stream blocks, each block in table order, minus the slices that
+    // were already known. Verified on -p2/-p3/-p4 of one set and on the pmf_*
+    // fixtures; a sequential container has one stream and is unaffected.
+    if (has_parallel_streams && entries.size() > 1u) {
+        // Each run goes in at the head: kept in a list and joined last-first at
+        // the end, which is the same order without moving the list each time
+        // (with 30 000 entries the head inserts and the membership scan of the
+        // run were 6 % of an `a -cn`, through the self-check's read-back).
+        std::vector<std::vector<std::size_t>> runs;
+        std::vector<bool> present(entries.size(), false);
+        std::vector<std::size_t> in_run_of(entries.size(), 0);   // run number + 1 that holds the entry
+        for (const auto& kv : stream_named) {              // std::map: ascending stream id
+            const std::vector<std::size_t>& names = kv.second;
+            const auto fl = stream_split.find(kv.first);
+            std::vector<std::size_t> run;
+            const auto flush = [&]() {
+                if (run.empty()) return;
+                for (std::size_t idx : run) present[idx] = true;
+                runs.push_back(std::move(run));
+                run.clear();
+            };
+            for (std::size_t k = 0; k < names.size(); ++k) {
+                const std::size_t idx = names[k];
+                if (idx >= entries.size()) continue;
+                const bool split = fl != stream_split.end() && k < fl->second.size() && fl->second[k];
+                if (split) flush();
+                if (present[idx]) continue;                // merged into the entry already listed
+                if (in_run_of[idx] != runs.size() + 1u) { in_run_of[idx] = runs.size() + 1u; run.push_back(idx); }
+            }
+            flush();
+        }
+        std::vector<std::size_t> global;
+        for (auto it = runs.rbegin(); it != runs.rend(); ++it) global.insert(global.end(), it->begin(), it->end());
+        // Anything no stream table named (should not happen) keeps record order after it.
+        for (std::size_t i = 0; i < entries.size(); ++i)
+            if (!present[i]) global.push_back(i);
+        if (global.size() == entries.size()) {
+            std::vector<LegacyCnEntry> reordered;
+            reordered.reserve(global.size());
+            std::vector<std::size_t> remap(entries.size(), 0);
+            for (std::size_t k = 0; k < global.size(); ++k) {
+                remap[global[k]] = k;
+                reordered.push_back(entries[global[k]]);
+            }
+            entries.swap(reordered);
+            for (auto& kv : stream_named)
+                for (std::size_t& idx : kv.second)
+                    if (idx < remap.size()) idx = remap[idx];
+        }
+    }
+
+    std::set<std::string> split_paths;
+    for (const auto& kv : path_streams) {
+        if (kv.second.size() > 1u) split_paths.insert(kv.first);
+    }
+    // No attribute records at all is a legitimate answer, not a failure: -nm
+    // (and -nt -np -hn) produce exactly that. Treating it as a failure fell
+    // through to the old heuristics, one of which scans the metadata span for a
+    // 0x24 byte and calls it a permission tag -- so a stray 0x24 in the
+    // compressed payload made `l` print a 0664 column the original does not.
+    const bool metadata_run_parsed =
+        attr_records.empty() ||
+        // Read as one run per stream first -- how every layout that parsed
+        // before is read, parallel containers included, where a stream's single
+        // permission record covers all its tables at once. Only when that is not
+        // consistent, read each permission record as covering its own block
+        // (the -t1 multi-block layout, where a block of all-0600 files omits it).
+        // Nothing is written on a false return, so the second try starts clean.
+        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries) ||
+        ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries, &table_marks) ||
+        // A stored archive cut inside its data: the cut took the last blocks' records.
+        (truncated_input && method_p0 == 0u && (cut_data_valid || !data_payloads.empty()) &&
+         ApplyLegacyAttributeRecords(bytes, attr_records, stream_named, split_paths, &entries, &table_marks,
+                                     /*lenient_tail=*/true));
+    const ArcPos run_metadata_end = first_data_record;
+
+    // Some decodes run here, at parse time; the progress engine prints the
+    // "Archive / Threads / Compressor" header lazily from this snapshot, so it
+    // has to exist before the FIRST of them -- the parallel store assembly just
+    // below is one, and without this its header came out with an empty archive
+    // name and an `unknown` compressor.
+    const auto publish_snapshot = [&]() {
+        if (!progress::Active() || entries.empty()) return;
+        LegacyCnContext snap;
+        snap.archive_path = archive_path;
+        snap.legacy_method = method;
+        snap.legacy_method_p0 = method_p0;
+        snap.legacy_method_p1 = method_p1;
+        snap.legacy_method_p2 = method_p2;
+        snap.cm_a_bits = cm_a_bits;
+        snap.cm_b_bits = cm_b_bits;
+        snap.cm_window_size = cm_window_size;
+        if (has_parallel_streams) {
+            std::map<unsigned, LegacyParallelStream> pstreams;
+            if (ParseLegacyParallelStreams(bytes, &pstreams))
+                for (const auto& kv : pstreams)
+                    snap.parallel_p1.push_back(kv.second.hasparams ? kv.second.p1 : method_p1);
+        }
+        snap.entries.push_back(entries.front());
+        progress::Publish(snap);
+    };
+    publish_snapshot();
+
+    // For stored payloads (-cn) that split across several blocks, the raw file
+    // bytes are not a contiguous tail of the archive, so we assemble them here.
+    bool store_multiblock = false;
+    std::vector<unsigned char> store_blocks_buffer;
+    // The data records of a STORED archive, as one space: filled only by the
+    // data-record assembly site below, which is the one whose output is exactly
+    // their concatenation (the block-chain and parallel sites are not).
+    std::shared_ptr<SpliceMap> store_splice;
+
+    // A STORED archive cut inside a data record. The original's reader takes a
+    // record whose header is whole at its declared length -- the bytes the file
+    // no longer has come out as whatever its buffer held, stale memory (quirk 26)
+    // -- and reads on: with nothing after it the archive ends normally, that
+    // entry's checksum fails ("Checksum mismatch", "Decompressed <total>"); when
+    // the next record's header is what is missing it stops there with "Unexpected
+    // end of file", every complete record written. Measured on a five-file -cn
+    // archive cut by 1 to 200 010 bytes: the switch is exactly where the cut
+    // reaches the last record's header. Zeros stand in for the stale bytes; this
+    // reader used to refuse the whole archive ("Legacy stream prefix is not
+    // recognized." / "Data corrupted while reading headers!") and extract nothing.
+    bool store_cut_eof = false, store_cut_full = false;
+    std::vector<unsigned char> store_cut_buf;
+    std::vector<std::uint8_t> store_cut_ok;
+    if (native_store_payload && truncated_input && (cut_data_valid || !data_payloads.empty()) &&
+        !has_parallel_streams && total_data_size <= (std::uint64_t{1} << 40)) {
+        std::vector<unsigned char> sbuf;
+        for (const auto& dp : data_payloads) bytes.AppendTo(&sbuf, dp.first, dp.second - dp.first);
+        if (cut_data_valid) {
+            const std::uint64_t got = static_cast<std::uint64_t>(bytes.size() - cut_data_begin);
+            if (cut_data_begin < bytes.size()) bytes.AppendTo(&sbuf, cut_data_begin, bytes.size() - cut_data_begin);
+            if (cut_data_declared > got) {
+                // The bytes the file no longer has: the original reads every data
+                // record into ONE buffer from its start, so what it writes there
+                // is whatever the last earlier record that reached that far left
+                // behind -- zeros when none did (a fresh buffer). Measured exact
+                // on a two-record and a one-record -cn archive.
+                const std::size_t base = sbuf.size();
+                sbuf.resize(base + static_cast<std::size_t>(cut_data_declared - got), 0u);
+                std::uint64_t filled = got;   // offsets inside the record, [got, declared)
+                for (auto it = data_payloads.rbegin(); it != data_payloads.rend() && filled < cut_data_declared; ++it) {
+                    const std::uint64_t len = it->second - it->first;
+                    if (len <= filled) continue;
+                    const std::uint64_t upto = std::min<std::uint64_t>(len, cut_data_declared);
+                    const unsigned char* q = bytes.Span(it->first + filled, upto - filled);
+                    if (q != nullptr)
+                        std::memcpy(sbuf.data() + base + static_cast<std::size_t>(filled - got), q,
+                                    static_cast<std::size_t>(upto - filled));
+                    filled = upto;
+                }
+            }
+        }
+        if (sbuf.size() > total_data_size) sbuf.resize(static_cast<std::size_t>(total_data_size));
+        native_store_payload = false;
+        if (sbuf.size() == total_data_size) {
+            std::size_t bad = 0;
+            CheckEntries(entries, checksum_mode, checksum_verification_supported,
+                         sbuf.data(), sbuf.size(), &store_cut_ok, &bad);
+            if (bad == 0u) store_cut_ok.clear();
+            store_cut_full = true;
+        } else {
+            store_cut_eof = true;
+        }
+        store_cut_buf = std::move(sbuf);   // handed over with the decoders' outputs, below
+        nz_trace::Construct("store_assembly=cut_record %s", store_cut_eof ? "eof" : "padded");
+    }
+    if (native_store_payload) {
+        data_offset_u64 = static_cast<std::uint64_t>(bytes.size()) - total_data_size;
+        if (data_offset_u64 < table_end) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return false;
+        }
+        // ArcPos: a stored payload starts wherever the metadata ends, which on a
+        // >4 GB archive is past what a 32-bit size_t holds.
+        const ArcPos data_offset = data_offset_u64;
+
+        // Find stream-prefix varint immediately before payload.
+        const std::uint64_t expected_stream_len_tag = total_data_size << 4u;
+        ArcPos prefix_start = data_offset;
+        bool prefix_found = false;
+        const ArcPos scan_begin = (data_offset > 16u) ? (data_offset - 16u) : table_end;
+        for (ArcPos s = scan_begin; s < data_offset; ++s) {
+            ArcPos q = s;
+            std::uint64_t tag = 0;
+            if (!ReadLegacyVarint(bytes, &q, data_offset, &tag)) {
+                continue;
+            }
+            if (q == data_offset && tag == expected_stream_len_tag) {
+                prefix_start = s;
+                prefix_found = true;
+                break;
+            }
+        }
+        if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+            std::fprintf(stderr, "[PAR] store dispatch: total=%llu data_offset=%llu table_end=%llu prefix_found=%d entries=%zu\n",
+                         (unsigned long long)total_data_size, (unsigned long long)data_offset,
+                         (unsigned long long)table_end,
+                         (int)prefix_found, entries.size());
+        // A stored archive cut into several blocks carries, before each block,
+        // the table/mtime/permission records of the files that START in it
+        // (measured on the original: 65536 bytes + a 1-byte file gives a second
+        // table between the two DATA records). The block-chain scan below only
+        // knows blocks and checksum trailers, so it declined every such archive
+        // ("Legacy stream prefix is not recognized"). The record walk already
+        // has every main-stream data record: when their payloads add up to the
+        // declared total, the content is simply their concatenation.
+        if (!prefix_found && !has_parallel_streams && data_payloads.size() > 1u) {
+            std::uint64_t sum = 0;
+            for (const auto& dp : data_payloads) sum += dp.second - dp.first;
+            if (sum == total_data_size) {
+                // Describe the payload instead of concatenating it: a stored
+                // entry's records ARE the file, so a splice map over them reads
+                // exactly the same bytes for nothing. Copying them cost the whole
+                // output -- 4.3 GB on a 4.5 GB `-cn` archive, where the original
+                // uses 543 MB, and a 32-bit build simply said "Out of memory!".
+                store_splice = std::make_shared<SpliceMap>();
+                for (const auto& dp : data_payloads)
+                    store_splice->Add(dp.first, dp.second - dp.first);
+                store_multiblock = true;
+                metadata_end = data_records.front().first;
+                payload_start = data_records.front().first;
+                prefix_found = true;
+                nz_trace::Construct("store_assembly=data_records blocks=%zu", data_payloads.size());
+                if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site0 (data records) -> %zu\n", payload_start);
+            }
+        }
+        // A parallel store of nothing but empty files (`a -cn -p3` of five 0-byte
+        // files, which the original writes and reads) has no slice to assemble:
+        // every path below wants data and declined it with "Legacy stream
+        // prefix is not recognized", `l` included.
+        if (!prefix_found && has_parallel_streams && total_data_size == 0u && !entries.empty()) {
+            store_multiblock = true;
+            metadata_end = table_end;
+            payload_start = table_end;
+            prefix_found = true;
+            nz_trace::Construct("store_assembly=parallel_empty");
+        }
+        if (!prefix_found && entries.size() > 1u) {
+            // Parallel store holding several files: the slices are raw, so
+            // "decoding" a stream is copying its concatenated chunks.
+            std::map<unsigned, LegacyParallelStream> pstreams;
+            if (ParseLegacyParallelStreams(bytes, &pstreams, /*keep_cut_chunk=*/true) &&
+                AssembleParallelMultiFile(
+                    bytes, pstreams, entries, total_data_size,
+                    [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
+                        std::uint64_t out_size,
+                        const std::function<bool(const std::vector<unsigned char>&)>&,
+                        std::vector<unsigned char>* dst) {
+                        *dst = ConcatParallelChunks(bytes, chunks);
+                        if (dst->size() > out_size) dst->resize(static_cast<std::size_t>(out_size));
+                        return psink::Available() || psink::Committed() || dst->size() == out_size;
+                    },
+                    &store_blocks_buffer, psink::Available(), psink::Policy::kStore, 0u, psink::Family::kStore,
+                    checksum_mode != ChecksumMode::kNone)) {
+                nz_trace::Construct("store_assembly=parallel_multifile");
+                store_multiblock = true;
+                metadata_end = table_end;
+                payload_start = table_end;
+                if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site1 -> %zu\n", payload_start);
+                prefix_found = true;
+            }
+        }
+        if (!prefix_found && entries.size() == 1u &&  // see the offset note below
+            TryAssembleParallelStore(bytes, total_data_size, &store_blocks_buffer, &entries)) {
+            // Parallel (-pN) store: the slices are raw and scattered between the
+            // per-stream record sets, so neither the tail scan nor the block
+            // chain finds them. Every slice was checksum-verified.
+            store_multiblock = true;
+            metadata_end = table_end;
+            payload_start = table_end;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site2 -> %zu\n", payload_start);
+            prefix_found = true;
+            nz_trace::Construct("store_assembly=parallel_single");
+        }
+        if (!prefix_found) {
+            // Multi-block store: walk [varint len<<4|0][raw][checksum trailer]
+            // from the first block prefix (just past the per-file metadata) and
+            // assemble the raw payload. The trailer width follows checksum_mode
+            // (one tag byte + checksum bytes; none when checksums are disabled).
+            const std::size_t store_checksum_bytes =
+                (checksum_mode == ChecksumMode::kCrc16) ? 2u :
+                (checksum_mode == ChecksumMode::kNone) ? 0u : 4u;
+            const std::size_t store_trailer_bytes =
+                (checksum_mode == ChecksumMode::kNone) ? 0u : (1u + store_checksum_bytes);
+            // data_offset comes from the record walk and can point far past a truncated
+            // file; never scan beyond the bytes we have (fuzz 2026-09-03: a 2 MB store cut
+            // at 95 % made this loop run for minutes).
+            const ArcPos scan_end = std::min<ArcPos>(data_offset, bytes.size());
+            for (ArcPos s = table_end; s <= scan_end; ++s) {
+                if (TryAssembleStoredBlocks(bytes, s, total_data_size,
+                                            store_trailer_bytes, &store_blocks_buffer)) {
+                    nz_trace::Construct("store_assembly=block_chain trailer=%zu", store_trailer_bytes);
+                    store_multiblock = true;
+                    metadata_end = s;
+                    payload_start = s;
+                    if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site3 -> %zu\n", payload_start);
+                    break;
+                }
+            }
+            if (!store_multiblock) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "Legacy stream prefix is not recognized.";
+                }
+                return false;
+            }
+        } else {
+            metadata_end = prefix_start;
+            payload_start = data_offset;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site4 -> %zu\n", payload_start);
+        }
+        if (!store_multiblock) {
+
+        // Parse checksums from the end of metadata.  Only needed when the
+        // record walk above did not already provide them.
+        const std::size_t checksum_bytes_per_file = metadata_run_parsed ? 0u :
+            (checksum_mode == ChecksumMode::kCrc16) ? 2u :
+            (checksum_mode == ChecksumMode::kNone) ? 0u : 4u;
+
+        if (checksum_bytes_per_file > 0u) {
+            const std::size_t checksum_data_bytes = entries.size() * checksum_bytes_per_file;
+            if (metadata_end >= metadata_begin + checksum_data_bytes) {
+                ArcPos checksum_data_start = metadata_end - checksum_data_bytes;
+                bool has_tag = false;
+                if (entries.size() == 1u && checksum_data_start > metadata_begin) {
+                    const std::uint8_t expected_tag = LegacyChecksumTag(checksum_mode);
+                    if (bytes[checksum_data_start - 1u] == expected_tag) {
+                        checksum_data_start -= 1u;
+                        has_tag = true;
+                    }
+                }
+
+                ArcPos cp = checksum_data_start + (has_tag ? 1u : 0u);
+                if (cp + checksum_data_bytes <= metadata_end) {
+                    for (std::size_t i = 0; i < entries.size(); ++i) {
+                        std::uint32_t v = 0;
+                        if (checksum_bytes_per_file == 2u) {
+                            v = static_cast<std::uint32_t>(bytes[cp]) |
+                                (static_cast<std::uint32_t>(bytes[cp + 1u]) << 8u);
+                        } else {
+                            v = bytes.U32At(cp);
+                        }
+                        entries[i].checksum = v;
+                        entries[i].has_checksum = true;
+                        cp += checksum_bytes_per_file;
+                    }
+                    metadata_end = checksum_data_start;
+                }
+            }
+        }
+        }  // if (!store_multiblock)
+    }
+
+    // Dumps the front metadata run, which is where the entry tags (mtime 0x42,
+    // permissions 0x24, checksum 0x45/0x47/0x26) are expected to sit contiguously.
+    if (NZ_ENV("NZOPT_TRACE_META")) {
+        fprintf(stderr, "[META] entries=%zu metadata=[%zu,%zu) cksum_mode=%d bytes=",
+                entries.size(), metadata_begin, metadata_end, (int)checksum_mode);
+        for (ArcPos k = metadata_begin; k < metadata_end && k < metadata_begin + 32u; ++k)
+            fprintf(stderr, "%02x ", bytes[k]);
+        fprintf(stderr, "\n");
+    }
+    if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] flags: run_parsed=%d store=%d found_first=%d attr_records=%zu run_end=%zu\n",
+                                            (int)metadata_run_parsed, (int)native_store_payload, (int)found_first_data, attr_records.size(), run_metadata_end);
+    // Best-effort metadata extraction (single-file path is the most reliable).
+    if (metadata_run_parsed) {
+        // Attributes already filled from the record run. For single-file
+        // compressed families the old path also derived payload_start from the
+        // end of the metadata records; run_metadata_end is that same offset
+        // (the type-0 record header), just located by parsing instead of by
+        // tag sniffing.
+        if (!native_store_payload && found_first_data) {
+            payload_start = run_metadata_end;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site5 -> %zu\n", payload_start);
+        }
+    } else if (entries.size() == 1u && metadata_end > metadata_begin) {
+        ArcPos mp = metadata_begin;
+        if (metadata_end >= mp + 5u && bytes[mp] == 0x42u) {
+            entries[0].mtime_unix = static_cast<std::int64_t>(bytes.U32At(mp + 1u));
+            entries[0].has_mtime = true;
+            mp += 5u;
+        }
+        if (metadata_end >= mp + 3u && bytes[mp] == 0x24u) {
+            if (bytes[mp + 1u] == 0xb4u && bytes[mp + 2u] == 0x01u) {
+                entries[0].permissions = 0664u;
+            } else {
+                entries[0].permissions = 0644u;
+            }
+            entries[0].has_permissions = true;
+            mp += 3u;
+        }
+        if (!entries[0].has_checksum && checksum_mode != ChecksumMode::kNone && metadata_end > mp) {
+            const std::uint8_t tag = bytes[mp];
+            if ((tag == 0x45u || tag == 0x47u) && metadata_end >= mp + 5u) {
+                entries[0].checksum = bytes.U32At(mp + 1u);
+                entries[0].has_checksum = true;
+                mp += 5u;
+            } else if (tag == 0x26u && metadata_end >= mp + 3u) {
+                entries[0].checksum = static_cast<std::uint32_t>(bytes[mp + 1u]) |
+                                      (static_cast<std::uint32_t>(bytes[mp + 2u]) << 8u);
+                entries[0].has_checksum = true;
+                mp += 3u;
+            }
+        }
+        if (!native_store_payload) {
+            payload_start = mp;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site6 -> %zu\n", payload_start);
+        }
+    } else if (metadata_end > metadata_begin) {
+        // Multi-file legacy metadata is still partially unknown; expose conservative defaults.
+        const bool has_timestamp_tag = ((bytes[metadata_begin] & 0x0fu) == 0x02u);
+        const bool has_perm_tag =
+            bytes.FindByte(metadata_begin, metadata_end, 0x24u) != metadata_end;
+        for (LegacyCnEntry& e : entries) {
+            if (has_perm_tag) {
+                e.permissions = 0664u;
+                e.has_permissions = true;
+            }
+            if (has_timestamp_tag && metadata_begin + 5u <= metadata_end) {
+                e.mtime_unix = static_cast<std::int64_t>(bytes.U32At(metadata_begin + 1u));
+                e.has_mtime = true;
+            }
+        }
+    }
+
+    if (!native_store_payload && payload_start == bytes.size() && metadata_begin < bytes.size()) {
+        // For compressed legacy families, locate the first [stream_tag][...]
+        // varint that follows the per-file metadata trailer.
+        //
+        // Limit the search window: the stream prefix sits immediately after
+        // the per-file metadata trailer, which is at most a few dozen bytes
+        // (timestamps, perms, optional checksums for N entries). Without
+        // this cap, random compressed bytes deep in the payload sometimes
+        // decode as a stream-length tag matching EOF, putting payload_start
+        // past the real start and making the checksum-trailer reader pull
+        // garbage.
+        //
+        // Single-block (single-file) archives have stream_bytes == EOF
+        // distance, so we prefer that match. Multi-block archives chain
+        // multiple sub-streams, so the first block's prefix won't match
+        // EOF — fall back to the first plausible stream-tag varint.
+        const ArcPos kMaxMetadataTrailerBytes = 256u;
+        const ArcPos search_end =
+            std::min<ArcPos>(bytes.size(), metadata_begin + kMaxMetadataTrailerBytes);
+        ArcPos fallback_start = bytes.size();
+        for (ArcPos s = metadata_begin; s < search_end; ++s) {
+            ArcPos q = s;
+            std::uint64_t tag = 0;
+            if (!ReadLegacyVarint(bytes, &q, bytes.size(), &tag)) {
+                continue;
+            }
+            if ((tag & 0x0fu) != 0u) {
+                continue;
+            }
+            const std::uint64_t stream_bytes = tag >> 4u;
+            if (stream_bytes == 0u ||
+                stream_bytes > static_cast<std::uint64_t>(bytes.size() - q)) {
+                continue;
+            }
+            if (q + static_cast<std::size_t>(stream_bytes) == bytes.size()) {
+                payload_start = s;
+                if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site7 -> %zu\n", payload_start);
+                fallback_start = bytes.size();
+                break;
+            }
+            if (fallback_start == bytes.size()) {
+                fallback_start = s;
+            }
+        }
+        if (payload_start == bytes.size() && fallback_start != bytes.size()) {
+            payload_start = fallback_start;
+            if (NZ_ENV("NZ_TRACE_PS")) std::fprintf(stderr, "[PS] site8 -> %zu\n", payload_start);
+        }
+    }
+
+    // Multi-file archives — including ones that fit in a single filename
+    // table — scatter per-block checksums between compressed sub-streams.
+    // The "contiguous trailer of N*4 bytes before payload_start" heuristic
+    // reads neighboring metadata or compressed bytes as if they were
+    // checksums and rejects correctly extracted data on mismatch. Better
+    // to show 00000000 than to falsely fail extraction.
+    //
+    // ParseLegacyMetadataRun does not guess: it only reports success when the
+    // whole record run parsed and the checksum record covered exactly one
+    // value per entry. When it did, the values are the real ones and the
+    // per-entry verification must run — that verification is what stops a
+    // wrong multi-file decode from being written out silently.
+    if (!metadata_run_parsed && (multiblock_scanner_added_entries || entries.size() > 1u)) {
+        checksum_verification_supported = false;
+    }
+    // Skip this fallback for single-file archives — the tagged scan above
+    // (0x45/0x47/0x26) is authoritative there. The unguarded "trailer at
+    // payload_start" read picks up perm/mtime bytes as a fake checksum on
+    // methods like cc/co that don't emit one.
+    // Also skip for multi-file (handled by has_checksum=false above).
+    if (false &&
+        !native_store_payload &&
+        !multiblock_scanner_added_entries &&
+        entries.size() > 1u &&
+        checksum_mode != ChecksumMode::kNone &&
+        payload_start < bytes.size() &&
+        payload_start > metadata_begin) {
+        const std::size_t checksum_bytes_per_file = LegacyChecksumBytesPerFile(checksum_mode);
+        if (checksum_bytes_per_file > 0u) {
+            const std::size_t checksum_data_bytes = entries.size() * checksum_bytes_per_file;
+            if (payload_start >= metadata_begin + checksum_data_bytes) {
+                ArcPos checksum_data_start = payload_start - checksum_data_bytes;
+                bool has_tag = false;
+                if (entries.size() == 1u && checksum_data_start > metadata_begin) {
+                    const std::uint8_t expected_tag = LegacyChecksumTag(checksum_mode);
+                    if (bytes[checksum_data_start - 1u] == expected_tag) {
+                        checksum_data_start -= 1u;
+                        has_tag = true;
+                    }
+                }
+
+                ArcPos cp = checksum_data_start + (has_tag ? 1u : 0u);
+                if (cp + checksum_data_bytes <= payload_start) {
+                    std::vector<std::uint32_t> candidate_values;
+                    candidate_values.reserve(entries.size());
+                    bool plausible = true;
+                    ArcPos scan_cp = cp;
+                    for (std::size_t i = 0; i < entries.size(); ++i) {
+                        std::uint32_t v = 0;
+                        if (checksum_bytes_per_file == 2u) {
+                            v = static_cast<std::uint32_t>(bytes[scan_cp]) |
+                                (static_cast<std::uint32_t>(bytes[scan_cp + 1u]) << 8u);
+                        } else {
+                            v = bytes.U32At(scan_cp);
+                        }
+                        // Fletcher32 never finalizes with either half at zero
+                        // (both s1 and s2 are clamped to 0xffff before packing).
+                        if (checksum_mode == ChecksumMode::kFletcher32 &&
+                            ((v & 0xffff0000u) == 0u || (v & 0x0000ffffu) == 0u)) {
+                            plausible = false;
+                            break;
+                        }
+                        candidate_values.push_back(v);
+                        scan_cp += checksum_bytes_per_file;
+                    }
+                    if (plausible) {
+                        for (std::size_t i = 0; i < entries.size(); ++i) {
+                            entries[i].checksum = candidate_values[i];
+                            entries[i].has_checksum = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool native_literal_payload = false;
+    ArcPos literal_data_offset = 0;
+    std::size_t literal_data_size = 0;
+    bool literal_data_owned = false;
+    ByteBuffer literal_data_buffer;
+    const auto validate_literal_candidate = [&](ArcPos offset) -> bool {
+        if (offset > bytes.size()) {
+            return false;
+        }
+        if (total_data_size > static_cast<std::uint64_t>(bytes.size() - offset)) {
+            return false;
+        }
+        ArcPos cursor = offset;
+        for (const LegacyCnEntry& e : entries) {
+            if (e.size > static_cast<std::uint64_t>(bytes.size() - cursor)) {
+                return false;
+            }
+            cursor += static_cast<std::size_t>(e.size);
+        }
+        return static_cast<std::uint64_t>(cursor) == static_cast<std::uint64_t>(offset) + total_data_size;
+    };
+    const auto validate_literal_candidate_with_checksums = [&](ArcPos offset) -> bool {
+        if (!validate_literal_candidate(offset)) {
+            return false;
+        }
+        if (!checksum_verification_supported) {
+            return true;
+        }
+
+        ArcPos cursor = offset;
+        for (const LegacyCnEntry& e : entries) {
+            if (e.size > static_cast<std::uint64_t>(bytes.size() - cursor)) {
+                return false;
+            }
+
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            if (e.has_checksum) {
+                const unsigned char* q = bytes.Span(cursor, n);
+                if (q == nullptr) return false;   // the entry claims more than the archive holds
+                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, q, n);
+                if (got != e.checksum) {
+                    return false;
+                }
+            }
+            cursor += n;
+        }
+
+        return true;
+    };
+    const auto validate_decoded_candidate_p = [&](const unsigned char* cdata, std::size_t csize) -> bool {
+        if (static_cast<std::uint64_t>(csize) != total_data_size)
+            return false;
+        std::size_t cursor = 0;
+        for (const LegacyCnEntry& e : entries) {
+            if (e.size > static_cast<std::uint64_t>(csize - cursor))
+                return false;
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            if (e.has_checksum && checksum_verification_supported) {
+                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, cdata + cursor, n);
+                if (got != e.checksum)
+                    return false;
+            }
+            cursor += n;
+        }
+        return cursor == csize;
+    };
+    const auto validate_decoded_candidate = [&](const std::vector<unsigned char>& candidate) -> bool {
+        return validate_decoded_candidate_p(candidate.data(), candidate.size());
+    };
+    // Option (c) for damaged archives: a candidate whose decode completed (sizes
+    // add up) but whose per-entry checksums do not all match is kept as a
+    // fallback; if no fully verified candidate turns up, it is adopted and the
+    // extractor writes the good entries and reports the bad ones. Always returns
+    // false so the adopting branch is skipped at the call site.
+    ByteBuffer partial_candidate;
+    std::vector<std::uint8_t> partial_ok;
+    // A decode that failed part-way: the output of the members completed before
+    // the failure. Adopted with ctx.decode_failed when nothing better turns up.
+    std::vector<unsigned char> partial_prefix;
+    const auto record_partial_b = [&](ByteBuffer& candidate) -> bool {
+        if (!partial_candidate.empty() ||
+            static_cast<std::uint64_t>(candidate.size()) != total_data_size) return false;
+        std::vector<std::uint8_t> ok; std::size_t bad = 0;
+        if (CheckEntries(entries, checksum_mode, checksum_verification_supported, candidate.data(), candidate.size(), &ok, &bad) && bad > 0) {
+            partial_candidate = std::move(candidate);
+            partial_ok = std::move(ok);
+        }
+        return false;
+    };
+    // Parallel sink (psink): hand a single-file container's streams over. Each
+    // stream is one slice of entry 0 at its output offset.
+    const auto publish_single = [&](const auto& list, const std::vector<std::uint64_t>& dest) -> bool {
+        std::vector<psink::Stream> streams;
+        for (std::size_t di = 0; di < list.size(); ++di) {
+            const auto* st = list[di];
+            psink::Stream ps;
+            psink::Slice sl;
+            sl.entry = 0u; sl.file_off = di < dest.size() ? dest[di] : st->ooff; sl.len = st->osz;
+            sl.cmode = st->cmode; sl.cval = st->cval; sl.has_cksum = (st->cmode != ChecksumMode::kNone);
+            sl.group = 0u;
+            ps.slices.push_back(sl);
+            ps.cut = st->cut;
+            streams.push_back(std::move(ps));
+        }
+        const psink::Family fam =
+            (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) ? psink::Family::kLzpf :
+            (method == 0x2bu) ? psink::Family::kCd :
+            (method == 0x3bu && method_p0 == 5u) ? psink::Family::kCo :
+            (method == 0x3bu) ? psink::Family::kCO : psink::Family::kCm;
+        const psink::Policy pol = (fam == psink::Family::kCd) ? psink::Policy::kGroup : psink::Policy::kProduced;
+        return psink::Publish(entries, std::move(streams), pol, (fam == psink::Family::kCd) ? std::uint64_t{0x100000u} : 0u, fam);
+    };
+    // The sink wrote (or, for `t`, verified) the container: nothing to assemble.
+    const auto sink_adopt = [&]() -> bool {
+        if (!psink::Committed()) return false;
+        native_literal_payload = true;
+        literal_data_offset = 0u; literal_data_size = 0u; literal_data_owned = true;
+        literal_data_buffer.clear();
+        return true;
+    };
+    const auto record_partial = [&](std::vector<unsigned char>& candidate) -> bool {
+        ByteBuffer b(std::move(candidate));
+        const bool r = record_partial_b(b);
+        if (!partial_candidate.empty() && partial_candidate.data() == b.data()) return r;  // moved
+        candidate.assign(b.data(), b.data() + b.size());   // give it back
+        return r;
+    };
+
+    // A multi-block archive interleaves the next block's table/mtime/perm/
+    // checksum records BETWEEN its data records, so the raw tail is not a valid
+    // stream chain -- a chain walker reaching the end of one member lands on a
+    // filename table. Splice the main-stream data records back together once,
+    // for both the chain decoders and ctx.data. Left empty when the records are
+    // already adjacent (every single-block archive and every contiguous chain)
+    // and for parallel containers, which have their own framing.
+    auto spliced_map = std::make_shared<SpliceMap>();
+    {
+        bool data_contiguous = true;
+        for (std::size_t i = 1; i < data_records.size(); ++i) {
+            if (data_records[i].first != data_records[i - 1u].second) {
+                data_contiguous = false;
+                break;
+            }
+        }
+        if (!data_contiguous && !has_parallel_streams) {
+            for (const auto& dr : data_records) {
+                spliced_map->Add(dr.first, dr.second - dr.first);
+            }
+            if (NZ_ENV("NZ_TRACE_PARSTREAM")) {
+                std::fprintf(stderr, "[SPLICE] records=%zu bytes=%llu head=", data_records.size(),
+                             (unsigned long long)spliced_map->total);
+                const ByteView sv = bytes.Spliced(spliced_map.get());
+                for (ArcPos k = 0; k < 12 && k < sv.size(); ++k) std::fprintf(stderr, "%02x", sv[k]);
+                std::fprintf(stderr, " first_rec=(%zu,%zu)\n", data_records[0].first, data_records[0].second);
+            }
+        }
+    }
+
+    publish_snapshot();
+    if (!native_store_payload && !entries.empty() && payload_start <= bytes.size()) {
+                // Parallel multi-stream container (header flag byte 0x0f, used by
+                // the multi-threaded encoder for inputs >~8 MB). The output is cut
+                // into N independent nz_lzpf streams; each is serialised as a group
+                // of chunk records keyed by a stream id:
+                //   type-1  = slice output size      (varint, first field)
+                //   type-10 = slice output offset    (u32 LE, first 4 of 8 bytes)
+                //   type-5/7/6 = slice checksum       (Fletcher32 / crc32 / crc16)
+                //   type-0  = the compressed lzpf stream (block headers, no tag)
+                // We decode each type-0 stream into its slice (verifying it against
+                // the slice checksum, which also selects the dict capacity), place
+                // it at its offset, and require the slices to tile the whole output
+                // exactly. Every byte is checksum-verified, so a wrong decode is
+                // rejected rather than emitted.
+                if (!native_literal_payload &&
+                    method == 0x2bu &&
+                    (method_p0 == 1u || method_p0 == 2u)) {
+                    ArcPos magic = bytes.size();
+                    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+                        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+                            magic = q; break;
+                        }
+                    }
+                    // A parallel container's type-10 offset is the slice's
+                    // offset WITHIN ITS FILE, not within the output: in a
+                    // two-file archive both files have a slice at offset 0, and
+                    // one stream can carry slices of two different files. These
+                    // paths tile straight into the whole output, which is only
+                    // the same thing when the archive holds ONE file. Tiling a
+                    // multi-file one would overlap the files, and the per-entry
+                    // check cannot catch it -- a file split across streams has
+                    // no whole-file checksum to verify against. So decline.
+                    // The record right after the magic is a type-15 (stream-id extension)
+                    // one in a parallel container and a plain type in a sequential
+                    // one. Testing the whole byte for 0x0f only worked while a
+                    // checksum record came first: `-hn` writes none, so the first
+                    // record is a 2-byte extension (0x2f) and every parallel
+                    // container without checksums was declined.
+                    if (magic != bytes.size() && (bytes[magic + 3u] & 0x0fu) == 0x0fu &&
+                        entries.size() == 1u) {
+                        const bool is_variant_b = (method_p0 == 2u);
+                        struct PStream {
+                            // A stream's compressed payload may be split across
+                            // several type-0 chunks (one per ~1 MB output sub-
+                            // stream); they form one logical lzpf stream and are
+                            // concatenated before decode.
+                            std::vector<std::pair<ArcPos, ArcPos>> chunks;
+                            bool cut = false;   // its last data record was cut off by the end of the file
+                            std::uint64_t osz = 0, ooff = 0;
+                            ChecksumMode cmode = ChecksumMode::kNone;
+                            std::uint32_t cval = 0;
+                            bool hasoff = false, hassz = false;
+                        };
+                        std::map<unsigned, PStream> ps;
+                        ArcPos p = magic + 3u;
+                        bool parse_ok = true;
+                        for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
+                            std::uint64_t r = 0;
+                            if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
+                            unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+                            unsigned sid = 0u;
+                            ArcPos csz = r >> 4u;
+                            if (ct == 15u) {
+                                if (p >= bytes.size()) { parse_ok = false; break; }
+                                unsigned ext = bytes[p++];
+                                if (ext >= 0xf8u) {
+                                    if (p >= bytes.size()) { parse_ok = false; break; }
+                                    ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+                                }
+                                ct = ext & 0x0fu;
+                                sid = ext >> 4u;
+                                if (sid == 0u) ct += 15u;
+                            }
+                            bool cut_rec = false;
+                            if (p + csz > bytes.size()) {
+                                // A data record cut by the end of the file: the original's
+                                // reader never hands it to the worker, whose stream then
+                                // simply ends short (measured: the cut slot writes nothing
+                                // of that record and reports its short-end status).
+                                if (ct != 0u || p >= bytes.size()) { parse_ok = false; break; }
+                                csz = bytes.size() - p; cut_rec = true;
+                            }
+                            PStream& s = ps[sid];
+                            if (ct == 1u && csz >= 2u) {
+                                ArcPos tp = p; std::uint64_t v = 0;
+                                if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 10u && csz >= 4u) {
+                                s.ooff = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                                s.hasoff = true;
+                            } else if (ct == 5u && csz == 4u) {
+                                s.cmode = ChecksumMode::kFletcher32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 7u && csz == 4u) {
+                                s.cmode = ChecksumMode::kCrc32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 6u && csz == 2u) {
+                                s.cmode = ChecksumMode::kCrc16;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                            } else if (ct == 0u && csz > 0u) {
+                                if (!cut_rec) s.chunks.emplace_back(p, csz); else s.cut = true;
+                            }
+                            p += csz;
+                        }
+                        bool use_sink = psink::Available();
+                        ByteBuffer assembled = use_sink ? ByteBuffer() : ByteBuffer::Uninitialized(static_cast<std::size_t>(total_data_size));
+                        std::vector<std::atomic<bool>> slice_done(ps.size());
+                        for (auto& d : slice_done) d.store(false, std::memory_order_relaxed);
+                        bool all_ok = parse_ok && !ps.empty();
+                        std::vector<PStream*> plist;
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
+                        for (auto& kv : ps) {
+                            PStream& s = kv.second;
+                            if (s.chunks.empty() && !s.cut) continue;
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!s.hassz ||   // no offset record = the whole file, offset 0
+                                
+                                (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
+                                s.ooff + s.osz > total_data_size) { all_ok = false; break; }
+                            plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
+                        }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
+                        if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
+                            PStream& s = *plist[idx];
+                            // One record (the usual case) is decoded in place; several are
+                            // concatenated first.
+                            //
+                            // A SpliceMap would save this copy (the whole compressed slice:
+                            // 78 MB per worker on a 1.2 GB -cf container, 155 MB on a
+                            // 2.5 GB -cF one) -- but not here. lzpf asks for "the rest of
+                            // the member" as one range on every block (`arith_size`, and
+                            // `bc_len` in the raw-bytecode mode), and a spliced range that
+                            // straddles records is GATHERED: 78 MB re-assembled per block,
+                            // measured at ~100x slower. Saving it needs a bound on what a
+                            // block can consume, which the block header does not carry.
+                            std::vector<unsigned char> payload;
+                            ArcPos plen = 0;
+                            for (const auto& c : s.chunks) plen += c.second;
+                            const bool in_place = (s.chunks.size() == 1u);
+                            if (!in_place) {
+                                payload.reserve(static_cast<std::size_t>(plen));
+                                for (const auto& c : s.chunks)
+                                    bytes.AppendTo(&payload, c.first, c.second);
+                            }
+                            const ByteView pin = in_place ? bytes : ByteView(payload);
+                            // ArcPos: `pbeg` is a FILE offset when the record is
+                            // decoded in place, so a >4 GB archive wraps it.
+                            const ArcPos pbeg = in_place ? s.chunks.front().first : 0u;
+                            const ArcPos plen_in = in_place ? s.chunks.front().second : payload.size();
+                            const ArcPos pend = in_place ? pbeg + plen_in : 0u;
+                            const ChecksumMode cm = s.cmode;
+                            const std::uint32_t cv = s.cval;
+                            auto slice_verify = [&](const unsigned char* dec, std::size_t n) -> bool {
+                                return ComputeBufferChecksum(cm, dec, n) == cv;
+                            };
+                            std::vector<unsigned char> unused;
+                            if (use_sink) {
+                                // The original knows its dictionary capacity and verifies
+                                // nothing while decoding: one candidate, the sink checks the
+                                // slice and writes whatever came out.
+                                psink::StreamBegin(idx);
+                                std::size_t mdone = 0;
+                                const auto accept_all = [](const unsigned char*, std::size_t) { return true; };
+                                const bool roll = psink::AcceptsIncremental();
+                                // Rolling: the slice's output never exists whole -- each
+                                // block goes to the sink as the decoder produces it, which
+                                // is also what the original's worker does with it.
+                                const std::function<void(const unsigned char*, std::size_t)> to_sink =
+                                    [&](const unsigned char* p, std::size_t n) { psink::StreamWrite(idx, p, n); };
+                                std::vector<unsigned char> sbuf(roll ? std::size_t{0}
+                                                                     : static_cast<std::size_t>(s.osz));
+                                const bool okd = DecodeLzpfMember(pin, pbeg, plen_in, s.osz,
+                                                                  is_variant_b, method_p1, /*derived_cap_only=*/true, accept_all, &unused,
+                                                                  roll ? nullptr : sbuf.data(), false, &mdone, /*lenient=*/true, pend,
+                                                                  roll ? &to_sink : nullptr);
+                                psink::StreamEnd(idx, sbuf.empty() ? nullptr : sbuf.data(), okd ? s.osz : mdone, okd,
+                                                 !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
+                                return okd;
+                            }
+                            // Straight into this stream's slice (DisjointCover proved the
+                            // slices tile the output before any thread started).
+                            const std::uint64_t s_dest = pdest[idx];
+                            if (s_dest + s.osz > assembled.size()) return false;
+                            if (!DecodeLzpfMember(pin, pbeg, plen_in, s.osz,
+                                                  is_variant_b, method_p1, /*derived_cap_only=*/false, slice_verify, &unused,
+                                                  assembled.data() + static_cast<std::size_t>(s_dest), false, nullptr, false, pend)) return false;
+                            slice_done[idx].store(true, std::memory_order_relaxed);
+                            return true;
+                        });
+                        // `assembled` is empty when the sink took the container (and stays
+                        // empty if the sink then declined to publish), so check the buffer,
+                        // not the intent.
+                        if (!all_ok && !assembled.empty()) {
+                            // The buffer is uninitialised: give the slices that did not
+                            // complete the zeros the zero-filled vector used to hold.
+                            for (std::size_t q = 0; q < plist.size(); ++q)
+                                if (!slice_done[q].load(std::memory_order_relaxed))
+                                    std::memset(assembled.data() + static_cast<std::size_t>(pdest[q]), 0, static_cast<std::size_t>(plist[q]->osz));
+                        }
+                        StageMark("streams decoded");
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate_p(assembled.data(), assembled.size()) || record_partial_b(assembled))) {
+                            StageMark("validated");
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
+                // `-cd/-cD` parallel multi-stream container (same header flag
+                // byte 0x0f / same chunk-record scheme as the -cf/-cF parallel
+                // container above, used by the multi-threaded encoder for
+                // inputs >~8 MB). The stream-descriptor parsing loop below is
+                // byte-for-byte identical to the -cf/-cF branch (shared
+                // infrastructure, not lzpf-specific); only the per-stream
+                // downstream decode differs: each of a stream's type-0 chunk
+                // records is one raw nz_cd (DecLZ) block (unlike -cf/-cF's
+                // lzpf bitstream, a -cd stream's chunks are NOT continuous and
+                // need no concatenation), decoded with NzCdDecodeStream one
+                // chunk at a time into a FRESH per-stream ring (confirmed:
+                // each parallel-encoder thread owned its own nz_cd instance /
+                // ring, unlike the single-container case in
+                // TryDecodeLegacyLzhd which shares one ring across the whole
+                // archive). The ring is sized round(slice_osz/0x10000)*0x10000
+                // (min 0x10000), matching the single-container formula but
+                // applied per-slice. Every slice is checksum-verified before
+                // being placed into the assembled output, so a wrong decode
+                // is rejected rather than emitted.
+                if (!native_literal_payload &&
+                    method == 0x2bu &&
+                    (method_p0 == 3u || method_p0 == 4u)) {
+                    ArcPos magic = bytes.size();
+                    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+                        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+                            magic = q; break;
+                        }
+                    }
+                    // A parallel container's type-10 offset is the slice's
+                    // offset WITHIN ITS FILE, not within the output: in a
+                    // two-file archive both files have a slice at offset 0, and
+                    // one stream can carry slices of two different files. These
+                    // paths tile straight into the whole output, which is only
+                    // the same thing when the archive holds ONE file. Tiling a
+                    // multi-file one would overlap the files, and the per-entry
+                    // check cannot catch it -- a file split across streams has
+                    // no whole-file checksum to verify against. So decline.
+                    // The record right after the magic is a type-15 (stream-id extension)
+                    // one in a parallel container and a plain type in a sequential
+                    // one. Testing the whole byte for 0x0f only worked while a
+                    // checksum record came first: `-hn` writes none, so the first
+                    // record is a 2-byte extension (0x2f) and every parallel
+                    // container without checksums was declined.
+                    if (magic != bytes.size() && (bytes[magic + 3u] & 0x0fu) == 0x0fu &&
+                        entries.size() == 1u) {
+                        struct PCdStream {
+                            // Each entry is one raw nz_cd block: (offset, size)
+                            // into `bytes`, decoded in order into the slice.
+                            std::vector<std::pair<ArcPos, ArcPos>> chunks;
+                            bool cut = false;   // its last data record was cut off by the end of the file
+                            std::uint64_t osz = 0, ooff = 0;
+                            ChecksumMode cmode = ChecksumMode::kNone;
+                            std::uint32_t cval = 0;
+                            bool hasoff = false, hassz = false;
+                            std::uint8_t p1 = 0; bool hasparams = false;  // own type-11 record
+                        };
+                        std::map<unsigned, PCdStream> ps;
+                        ArcPos p = magic + 3u;
+                        bool parse_ok = true;
+                        for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
+                            std::uint64_t r = 0;
+                            if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
+                            unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+                            unsigned sid = 0u;
+                            ArcPos csz = r >> 4u;
+                            if (ct == 15u) {
+                                if (p >= bytes.size()) { parse_ok = false; break; }
+                                unsigned ext = bytes[p++];
+                                if (ext >= 0xf8u) {
+                                    if (p >= bytes.size()) { parse_ok = false; break; }
+                                    ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+                                }
+                                ct = ext & 0x0fu;
+                                sid = ext >> 4u;
+                                if (sid == 0u) ct += 15u;
+                            }
+                            bool cut_rec = false;
+                            if (p + csz > bytes.size()) {
+                                // A data record cut by the end of the file: the original's
+                                // reader never hands it to the worker, whose stream then
+                                // simply ends short (measured: the cut slot writes nothing
+                                // of that record and reports its short-end status).
+                                if (ct != 0u || p >= bytes.size()) { parse_ok = false; break; }
+                                csz = bytes.size() - p; cut_rec = true;
+                            }
+                            PCdStream& s = ps[sid];
+                            if (ct == 1u && csz >= 2u) {
+                                ArcPos tp = p; std::uint64_t v = 0;
+                                if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 11u && csz >= 1u) {
+                                s.p1 = (csz >= 2u) ? bytes[p + 1u] : 0u;
+                                s.hasparams = true;
+                            } else if (ct == 10u && csz >= 4u) {
+                                s.ooff = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                                s.hasoff = true;
+                            } else if (ct == 5u && csz == 4u) {
+                                s.cmode = ChecksumMode::kFletcher32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 7u && csz == 4u) {
+                                s.cmode = ChecksumMode::kCrc32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 6u && csz == 2u) {
+                                s.cmode = ChecksumMode::kCrc16;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                            } else if (ct == 0u && csz > 0u) {
+                                if (!cut_rec) s.chunks.emplace_back(p, csz); else s.cut = true;
+                            }
+                            p += csz;
+                        }
+                        bool use_sink = psink::Available();
+                        std::vector<unsigned char> assembled(
+                            use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
+                        bool all_ok = parse_ok && !ps.empty();
+                        static constexpr std::size_t kCdWindowPad = 16u;
+                        static constexpr std::size_t kCdOutUnit = 0x100000u;      // rolling unit = the sink's quantum
+                        static constexpr std::size_t kCdOutHeadroom = 0x10000u;   // room for the chunk in flight
+                        std::vector<PCdStream*> plist;
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
+                        for (auto& kv : ps) {
+                            PCdStream& s = kv.second;
+                            if (s.chunks.empty() && !s.cut) continue;
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!s.hassz ||   // no offset record = the whole file, offset 0
+                                
+                                (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
+                                s.ooff + s.osz > total_data_size) { all_ok = false; break; }
+                            plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
+                        }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
+                        if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
+                            PCdStream& s = *plist[idx];
+                            const std::size_t slice_total = static_cast<std::size_t>(s.osz);
+                            // With the sink the slice's output never has to exist whole:
+                            // it is handed over a unit at a time and the buffer rolls.
+                            // Without it the in-memory path still slices one buffer back
+                            // into files, so it keeps the whole slice.
+                            //
+                            // The headroom is what lets the unit boundary fall anywhere:
+                            // NzCdDecodeStream stops STARTING chunks at `soft`, but any
+                            // chunk it did start still has the full buffer to finish in,
+                            // so no chunk is ever cut at a unit edge. A chunk's output is
+                            // at most 0x8000 bytes (its compact size is a 0x8001-capped
+                            // varint and the text pipeline chunks 32 KB of final output),
+                            // so 64 KB of headroom is twice what any chunk can need.
+                            const bool roll = use_sink && psink::AcceptsIncremental();
+                            const std::size_t buf_cap =
+                                roll ? std::min<std::size_t>(kCdOutUnit + kCdOutHeadroom,
+                                                             slice_total ? slice_total : std::size_t{1})
+                                     : slice_total;
+                            std::vector<unsigned char> slice_buf(kCdWindowPad + buf_cap, 0u);
+                            unsigned char* const slice_window = slice_buf.data() + kCdWindowPad;
+                            // Each stream is a FRESH nz_cd instance: its own ring (sized from its
+                            // own p1), its own -cD context table and image model.
+                            const std::uint32_t sring_units = LegacyCdRingUnitsFromP1(
+                                s.hasparams ? s.p1 : static_cast<std::uint8_t>(method_p1));
+                            const std::uint32_t sring_size = sring_units * 0x10000u;
+                            std::vector<std::uint8_t> sring(sring_size, 0u);
+                            std::uint32_t sring_pos = 0u;
+                            const bool s_is_lzhds = (method_p0 == 4u);
+                            std::vector<std::uint8_t> s_lzhds_ctx;
+                            std::uint32_t s_lzhds_ctx_index = 0u;
+                            std::uint8_t* s_lzhds_ctx_ptr = nullptr;
+                            if (s_is_lzhds) {
+                                s_lzhds_ctx.assign(nzr::cd::kLzhdsCtxTableSize, 0u);
+                                nzr::cd::NzLzhdsInitCtxTable(s_lzhds_ctx.data());
+                                s_lzhds_ctx_ptr = s_lzhds_ctx.data();
+                            }
+                            std::uint64_t pwritten = 0u;
+                            nzr::audio::NzImageModel s_img;
+                            s_img.Configure(0x02u, 16u, 16u, true);
+                            // Prefilter (0xc) sub-chunk state, per stream like everything else
+                            // (a 400 MB -cd -p8 archive declined without it: the first 0xc chunk
+                            // of a worker stream had nothing to decode into).
+                            nzr::lzpf::PrefilterContext s_pf; s_pf.Configure(s_is_lzhds ? 32u : 8u, 3u);
+                            nzr::lzpf::LmsObject s_lms1{}, s_lms2{}; s_lms1.Init(); s_lms2.Init();
+                            if (use_sink) psink::StreamBegin(idx);
+                            for (const auto& c : s.chunks) {
+                                if (pwritten >= slice_total) break;
+                                const std::uint8_t* blk_in = bytes.Span(c.first, c.second);
+                                if (blk_in == nullptr) break;
+                                // One data record, decoded in units when rolling. The ring,
+                                // the -cD context table and the prefilter/LMS/image state
+                                // all live across the calls, so N unit calls are byte-for-
+                                // byte the one call this used to be.
+                                std::size_t in_off = 0u;
+                                bool step_failed = false;
+                                while (in_off < c.second && pwritten < slice_total) {
+                                    // clamped, not narrowed -- see the note on block_cap below
+                                    const std::uint64_t blk_left =
+                                        static_cast<std::uint64_t>(slice_total) - pwritten;
+                                    std::uint32_t blk_cap, blk_soft;
+                                    if (roll) {
+                                        const std::uint64_t room = std::min<std::uint64_t>(buf_cap, blk_left);
+                                        blk_cap = static_cast<std::uint32_t>(room);
+                                        blk_soft = (room > kCdOutHeadroom)
+                                                       ? static_cast<std::uint32_t>(room - kCdOutHeadroom)
+                                                       : blk_cap;
+                                    } else {
+                                        blk_cap = blk_left > 0xffffffffull ? 0xffffffffu
+                                                                           : static_cast<std::uint32_t>(blk_left);
+                                        blk_soft = 0u;
+                                    }
+                                    std::size_t consumed = 0u;
+                                    std::uint32_t produced = nzr::cd::NzCdDecodeStream(
+                                        blk_in + in_off, c.second - in_off,
+                                        roll ? slice_window : slice_window + pwritten, blk_cap,
+                                        sring.data(), sring_size, &sring_pos,
+                                        static_cast<std::uint32_t>(pwritten),
+                                        s_is_lzhds, s_lzhds_ctx_ptr, &s_lzhds_ctx_index,
+                                        &s_pf, &s_lms1, &s_lms2, &s_img, blk_soft, &consumed);
+                                    if (produced == 0u) { step_failed = true; break; }
+                                    if (roll) psink::StreamWrite(idx, slice_window, produced);
+                                    pwritten += produced;
+                                    progress::Add(produced);
+                                    if (consumed == 0u) break;       // no input progress: stop the record
+                                    in_off += consumed;
+                                    if (!roll) break;                // one call covers the whole record
+                                }
+                                if (step_failed) {
+                                    if (use_sink) psink::StreamEnd(idx, slice_window, pwritten, false,
+                                                                   nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
+                                    return false;
+                                }
+                            }
+                            if (use_sink) {
+                                // Ran out of chunks before the slice was full: the sink reports
+                                // the codec's short-end status.
+                                const bool okd = pwritten == slice_total;
+                                psink::StreamEnd(idx, slice_window, pwritten, okd,
+                                                 !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u);
+                                return okd;
+                            }
+                            if (pwritten != slice_total) return false;
+                            if (ComputeBufferChecksum(s.cmode, slice_window, slice_total) != s.cval) return false;
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
+                                        slice_window, slice_total);   // buffered path: buf_cap == slice_total
+                            return true;
+                        });
+                        StageMark("streams decoded");
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                            StageMark("validated");
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
+                // `-co`/`-cO` (nz_optimum1/nz_optimum2, method_p0==5 or 6)
+                // parallel multi-stream container (same header flag 0x0f /
+                // same generic chunk-record scheme as the -cf/-cF and -cd/-cD
+                // parallel branches above; shared infrastructure, not
+                // codec-specific). Empirically confirmed for -co (real
+                // 8-15MB archives, GDB-free -- just byte inspection + the
+                // checksum gate as arbiter; -cO's parallel envelope is
+                // identical, only the per-stream engine differs): each
+                // stream's type-0 chunk(s) contain the SAME "sequence of
+                // block records" body that TryDecodeLegacyOptimum's
+                // single-container path decodes after its own leading
+                // stream_tag varint -- i.e. a chunk begins directly with a
+                // block's payload_size (u32 LE), NOT with another stream_tag,
+                // and (unlike -cd/-cD, where a chunk is exactly one block) a
+                // single chunk here can itself contain several back-to-back
+                // block records. Each parallel stream gets its own FRESH
+                // decoder instance (mirrors -cd/-cD's "each encoder thread
+                // owned its own subengine instance" finding), but all
+                // streams share the archive-wide window capacity derived
+                // from method_p1 -- there is only one such byte in the whole
+                // container header, so every stream almost certainly used
+                // the same ring size; a wrong guess here would simply make
+                // DecodeOptimumBlockSequence fail or the per-slice checksum
+                // mismatch, so it's safe to try. The decoder TYPE (-co's
+                // NzOptimumLzDecoder vs -cO's NzOptimum2LzDecoder) is fixed
+                // for the whole archive (method_p0 doesn't vary per stream),
+                // so it's selected once via a type-erased closure rather
+                // than duplicating this whole loop per type.
+                // Parallel (-pN) `-cc`: each stream is an INDEPENDENT CM decode
+                // of its own slice -- feeding all four streams' chunks to one
+                // decoder (which is what the flat chunk walk does, since it just
+                // skips the records it does not know) shares state across slices
+                // that never shared it. Rebuild each stream's chunks as a normal
+                // record chain, decode it with a fresh context, and tile by the
+                // type-10 offsets. Every slice is checked against its own
+                // checksum, so a wrong layout cannot produce output.
+                // Parallel container holding SEVERAL files: one generic path
+                // for every codec, differing only in how a stream's chunk chain
+                // is turned into that stream's output. See
+                // AssembleParallelMultiFile for why the single-file tiling paths
+                // below cannot be reused.
+                if (!native_literal_payload && has_parallel_streams && entries.size() > 1u) {
+                    std::map<unsigned, LegacyParallelStream> pstreams;
+                    if (ParseLegacyParallelStreams(bytes, &pstreams) && pstreams.size() > 1u) {
+                        std::vector<unsigned char> assembled;
+                        bool got = false;
+                        if (method == 0x4bu && method_p0 == 7u) {
+                            got = AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>&,
+                                    std::vector<unsigned char>* dst) {
+                                    LegacyCnContext sub;
+                                    sub.legacy_method = method;
+                                    sub.legacy_method_p0 = method_p0;
+                                    sub.legacy_method_p1 = method_p1;
+                                    sub.cm_a_bits = cm_a_bits;
+                                    sub.cm_b_bits = cm_b_bits;
+                                    sub.cm_window_size = cm_window_size;
+                                    sub.total_data_size = out_size;
+                                    std::vector<unsigned char> subdata;
+                                    for (const auto& c : chunks) {
+                                        WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
+                                        bytes.AppendTo(&subdata, c.first, c.second);
+                                    }
+                                    sub.data = std::move(subdata);
+                                    std::string err;
+                                    OptimumOut dst_out(dst);
+                                    return TryDecodeLegacyCm(sub, &dst_out, &err);
+                                },
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kCm,
+                                 checksum_mode != ChecksumMode::kNone);
+                        } else if (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) {
+                            // Each type-0 chunk IS one delimited nz_cd block, so
+                            // they are decoded one at a time threading a ring
+                            // that is fresh PER STREAM (each worker owned its
+                            // own instance), sized from that stream's output.
+                            const bool s_is_lzhds = (method_p0 == 4u);
+                            got = AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>&,
+                                    std::vector<unsigned char>* dst) {
+                                    // Ring from the OWNING stream's p1 (found by
+                                    // its chunk list; see LegacyCdRingUnitsFromP1).
+                                    std::uint8_t sp1 = static_cast<std::uint8_t>(method_p1);
+                                    for (const auto& kv : pstreams)
+                                        if (&kv.second.chunks == &chunks && kv.second.hasparams) { sp1 = kv.second.p1; break; }
+                                    const std::uint32_t units = LegacyCdRingUnitsFromP1(sp1);
+                                    const std::uint32_t ring_size = units * 0x10000u;
+                                    nzr::ZeroedBytes ring(ring_size);   // zero, untouched
+                                    std::uint32_t ring_pos = 0u;
+                                    std::vector<std::uint8_t> ctx;
+                                    std::uint32_t ctx_index = 0u;
+                                    std::uint8_t* ctx_ptr = nullptr;
+                                    if (s_is_lzhds) {
+                                        ctx.assign(nzr::cd::kLzhdsCtxTableSize, 0u);
+                                        nzr::cd::NzLzhdsInitCtxTable(ctx.data());
+                                        ctx_ptr = ctx.data();
+                                    }
+                                    dst->assign(static_cast<std::size_t>(out_size), 0u);
+                                    std::size_t written = 0u;
+                                    nzr::audio::NzImageModel s_img;
+                                    s_img.Configure(0x02u, 16u, 16u, true);
+                                    nzr::lzpf::PrefilterContext s_pf; s_pf.Configure(s_is_lzhds ? 32u : 8u, 3u);
+                                    nzr::lzpf::LmsObject s_lms1{}, s_lms2{}; s_lms1.Init(); s_lms2.Init();
+                                    for (const auto& c : chunks) {
+                                        if (written >= out_size) break;
+                                        const std::uint32_t produced = nzr::cd::NzCdDecodeStream(
+                                            bytes.Span(c.first, c.second),
+                                            static_cast<std::uint32_t>(c.second),
+                                            dst->data() + written,
+                                            static_cast<std::uint32_t>(out_size - written),
+                                            ring.data(), ring_size, &ring_pos,
+                                            static_cast<std::uint32_t>(written),
+                                            s_is_lzhds, ctx_ptr, &ctx_index,
+                                            &s_pf, &s_lms1, &s_lms2, &s_img);
+                                        if (produced == 0u) { dst->resize(written); return false; }
+                                        written += produced;
+                                        progress::Add(produced);
+                                    }
+                                    if (written != out_size) dst->resize(written);
+                                    return written == out_size;
+                                },
+                                &assembled, psink::Available(), psink::Policy::kGroup, std::uint64_t{0x100000u}, psink::Family::kCd,
+                                 checksum_mode != ChecksumMode::kNone);
+                        } else if (method == 0x3bu && (method_p0 == 5u || method_p0 == 6u)) {
+                            const std::uint32_t wcap =
+                                nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
+                            got = (wcap != 0u) && AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>&,
+                                    std::vector<unsigned char>* dst) {
+                                    const std::vector<unsigned char> in =
+                                        ConcatParallelChunks(bytes, chunks);
+                                    if (in.empty()) return false;
+                                    nzr::audio::NzAudioPred aud;
+                                    nzr::audio::NzImageModel img;
+                                    ConfigureOptimumModels(method_p0, aud, img);
+                                    NzExeFilter exe;
+                                    OptimumOut ow(dst);
+                                    const ByteView in_view(in.data(), in.size());
+                                    if (method_p0 == 5u) {
+                                        nzr::optimum::NzOptimumLzDecoder dec(wcap);
+                                        return DecodeOptimumBlockSequence(in_view, 0u, in.size(),
+                                                                          out_size, dec, aud, img, exe, &ow);
+                                    }
+                                    nzr::optimum2::NzOptimum2LzDecoder dec(wcap);
+                                    const bool r = DecodeOptimumBlockSequence(in_view, 0u, in.size(),
+                                                                              out_size, dec, aud, img, exe, &ow);
+                                    return r;
+                                },
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u,
+                                method_p0 == 5u ? psink::Family::kCo : psink::Family::kCO,
+                                 checksum_mode != ChecksumMode::kNone);
+                        } else if (method == 0x2bu && (method_p0 == 1u || method_p0 == 2u)) {
+                            const bool vb = (method_p0 == 2u);
+                            got = AssembleParallelMultiFile(
+                                bytes, pstreams, entries, total_data_size,
+                                [&](const std::vector<std::pair<ArcPos, ArcPos>>& chunks,
+                                    std::uint64_t out_size,
+                                    const std::function<bool(const std::vector<unsigned char>&)>& accept,
+                                    std::vector<unsigned char>* dst) {
+                                    const bool one = (chunks.size() == 1u);
+                                    const std::vector<unsigned char> in = one ? std::vector<unsigned char>() : ConcatParallelChunks(bytes, chunks);
+                                    if (!one && in.empty()) return false;
+                                    const ByteView pin = one ? bytes : ByteView(in);
+                                    const ArcPos pbeg = one ? chunks.front().first : 0u;   // FILE offset
+                                    const ArcPos plen_in = one ? chunks.front().second : in.size();
+                                    const bool sinking = psink::Available() || psink::Committed();
+                                    std::size_t mdone = 0;
+                                    const bool okd = DecodeLzpfMember(pin, pbeg, plen_in, out_size, vb,
+                                                                      method_p1, /*derived_cap_only=*/sinking,
+                                                                      accept, dst, nullptr, false, &mdone, /*lenient=*/sinking,
+                                                                      one ? pbeg + plen_in : 0u);
+                                    if (!okd && sinking) dst->resize(mdone);   // completed members only
+                                    return okd;
+                                },
+                                &assembled, psink::Available(), psink::Policy::kProduced, 0u, psink::Family::kLzpf,
+                                 checksum_mode != ChecksumMode::kNone);
+                        }
+                        StageMark("streams decoded");
+                        if (sink_adopt()) {
+                        } else if (got && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                            StageMark("validated");
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
+                if (!native_literal_payload && method == 0x4bu && method_p0 == 7u &&
+                    entries.size() == 1u) {  // see the offset note above
+                    std::map<unsigned, LegacyParallelStream> pstreams;
+                    if (ParseLegacyParallelStreams(bytes, &pstreams) && pstreams.size() > 1u) {
+                        bool use_sink = psink::Available();
+                        std::vector<unsigned char> assembled(
+                            use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
+                        bool all_ok = true;
+                        std::vector<const LegacyParallelStream*> plist;
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
+                        for (const auto& kv : pstreams) {
+                            const LegacyParallelStream& st = kv.second;
+                            if (st.chunks.empty() && !st.cut) continue;
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!st.hassz ||   // no offset record = the whole file, offset 0
+                                
+                                (st.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
+                                st.ooff > total_data_size ||
+                                st.osz > total_data_size - st.ooff) { all_ok = false; break; }
+                            plist.push_back(&st); pranges.emplace_back(st.ooff, st.osz);
+                        }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
+                        if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
+                            const LegacyParallelStream& st = *plist[idx];
+                            LegacyCnContext sub;
+                            sub.legacy_method = method;
+                            sub.legacy_method_p0 = method_p0;
+                            sub.legacy_method_p1 = method_p1;
+                            sub.cm_a_bits = cm_a_bits;
+                            sub.cm_b_bits = cm_b_bits;
+                            sub.cm_window_size = cm_window_size;
+                            sub.total_data_size = st.osz;
+                            std::vector<unsigned char> subdata;
+                            std::uint64_t last_rec = 0;
+                            for (const auto& c : st.chunks) {
+                                last_rec = subdata.size();
+                                WriteLegacyVarint(static_cast<std::uint64_t>(c.second) << 4u, &subdata);
+                                bytes.AppendTo(&subdata, c.first, c.second);
+                            }
+                            if (use_sink && st.chunks.size() > 1u) psink::SetLastRecordStart(idx, last_rec);
+                            sub.data = std::move(subdata);
+                            std::vector<unsigned char> slice;
+                            OptimumOut slice_out(&slice);
+                            std::string sub_err;
+                            if (use_sink) {
+                                psink::StreamBegin(idx);
+                                const bool okd = TryDecodeLegacyCm(sub, &slice_out, &sub_err) && slice.size() == st.osz;
+                                if (slice.size() > st.osz) slice.resize(static_cast<std::size_t>(st.osz));
+                                const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
+                                psink::StreamEnd(idx, slice.data(), slice.size(), okd, clean);
+                                return okd;
+                            }
+                            if (!TryDecodeLegacyCm(sub, &slice_out, &sub_err) ||
+                                slice.size() != st.osz ||
+                                ComputeBufferChecksum(st.cmode, slice.data(), slice.size()) != st.cval) {
+                                return false;
+                            }
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
+                                        slice.data(), slice.size());
+                            return true;
+                        });
+                        StageMark("streams decoded");
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                            StageMark("validated");
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
+                if (!native_literal_payload &&
+                    method == 0x3bu &&
+                    (method_p0 == 5u || method_p0 == 6u)) {
+                    ArcPos magic = bytes.size();
+                    for (std::size_t q = 0; q + 4u <= bytes.size(); ++q) {
+                        if (bytes[q] == 0x1fu && bytes[q + 1u] == 0x0fu && bytes[q + 2u] == 0x09u) {
+                            magic = q; break;
+                        }
+                    }
+                    // A parallel container's type-10 offset is the slice's
+                    // offset WITHIN ITS FILE, not within the output: in a
+                    // two-file archive both files have a slice at offset 0, and
+                    // one stream can carry slices of two different files. These
+                    // paths tile straight into the whole output, which is only
+                    // the same thing when the archive holds ONE file. Tiling a
+                    // multi-file one would overlap the files, and the per-entry
+                    // check cannot catch it -- a file split across streams has
+                    // no whole-file checksum to verify against. So decline.
+                    // The record right after the magic is a type-15 (stream-id extension)
+                    // one in a parallel container and a plain type in a sequential
+                    // one. Testing the whole byte for 0x0f only worked while a
+                    // checksum record came first: `-hn` writes none, so the first
+                    // record is a 2-byte extension (0x2f) and every parallel
+                    // container without checksums was declined.
+                    if (magic != bytes.size() && (bytes[magic + 3u] & 0x0fu) == 0x0fu &&
+                        entries.size() == 1u) {
+                        struct POptStream {
+                            // Each entry is one contiguous block-record range
+                            // (offset, size) into `bytes`; usually just one,
+                            // but concatenated in order if a stream is ever
+                            // split across more than one type-0 chunk.
+                            std::vector<std::pair<ArcPos, ArcPos>> chunks;
+                            bool cut = false;   // its last data record was cut off by the end of the file
+                            std::uint64_t osz = 0, ooff = 0;
+                            ChecksumMode cmode = ChecksumMode::kNone;
+                            std::uint32_t cval = 0;
+                            bool hasoff = false, hassz = false;
+                        };
+                        std::map<unsigned, POptStream> ps;
+                        ArcPos p = magic + 3u;
+                        bool parse_ok = true;
+                        for (std::size_t guard = 0; guard <= bytes.size() && p < bytes.size(); ++guard) {
+                            std::uint64_t r = 0;
+                            if (!ReadLegacyVarint(bytes, &p, bytes.size(), &r)) { parse_ok = false; break; }
+                            unsigned ct = static_cast<unsigned>(r) & 0x0fu;
+                            unsigned sid = 0u;
+                            ArcPos csz = r >> 4u;
+                            if (ct == 15u) {
+                                if (p >= bytes.size()) { parse_ok = false; break; }
+                                unsigned ext = bytes[p++];
+                                if (ext >= 0xf8u) {
+                                    if (p >= bytes.size()) { parse_ok = false; break; }
+                                    ext = (ext & 7u) + 8u * static_cast<unsigned>(bytes[p++]) + 248u;
+                                }
+                                ct = ext & 0x0fu;
+                                sid = ext >> 4u;
+                                if (sid == 0u) ct += 15u;
+                            }
+                            bool cut_rec = false;
+                            if (p + csz > bytes.size()) {
+                                // A data record cut by the end of the file: the original's
+                                // reader never hands it to the worker, whose stream then
+                                // simply ends short (measured: the cut slot writes nothing
+                                // of that record and reports its short-end status).
+                                if (ct != 0u || p >= bytes.size()) { parse_ok = false; break; }
+                                csz = bytes.size() - p; cut_rec = true;
+                            }
+                            POptStream& s = ps[sid];
+                            if (ct == 1u && csz >= 2u) {
+                                ArcPos tp = p; std::uint64_t v = 0;
+                                if (ReadLegacyVarint(bytes, &tp, p + csz, &v)) { s.osz = v; s.hassz = true; }
+                            } else if (ct == 10u && csz >= 4u) {
+                                s.ooff = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                                s.hasoff = true;
+                            } else if (ct == 5u && csz == 4u) {
+                                s.cmode = ChecksumMode::kFletcher32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 7u && csz == 4u) {
+                                s.cmode = ChecksumMode::kCrc32;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 2u]) << 16u) |
+                                         (static_cast<std::uint32_t>(bytes[p + 3u]) << 24u);
+                            } else if (ct == 6u && csz == 2u) {
+                                s.cmode = ChecksumMode::kCrc16;
+                                s.cval = static_cast<std::uint32_t>(bytes[p]) |
+                                         (static_cast<std::uint32_t>(bytes[p + 1u]) << 8u);
+                            } else if (ct == 0u && csz > 0u) {
+                                if (!cut_rec) s.chunks.emplace_back(p, csz); else s.cut = true;
+                            }
+                            p += csz;
+                        }
+                        const std::uint32_t popt_window_capacity =
+                            nzr::optimum::NzOptimumLzWindowSizeFromP1(method_p1);
+                        // Type-erased "decode one block-record range" closure: the
+                        // decoder TYPE is fixed for the whole archive (method_p0
+                        // doesn't vary per stream), so pick it once here rather
+                        // than duplicating the per-stream loop body per type.
+                        std::function<bool(const unsigned char*, std::size_t, std::size_t,
+                                            std::uint64_t, OptimumOut*)> decode_seq;   // (record, len, hint, out)
+                        if (method_p0 == 5u) {
+                            decode_seq = [popt_window_capacity](
+                                const unsigned char* raw, std::size_t b, std::size_t e,
+                                std::uint64_t hint, OptimumOut* out) {
+                                nzr::optimum::NzOptimumLzDecoder sdec(popt_window_capacity);
+                                const ByteView rec_view(raw, e);
+                                nzr::audio::NzAudioPred saud;
+                                nzr::audio::NzImageModel simg;
+                                ConfigureOptimumModels(5u, saud, simg);
+                                NzExeFilter sexe;
+                                return DecodeOptimumBlockSequence(rec_view, b, e, hint, sdec, saud, simg, sexe, out);
+                            };
+                        } else {
+                            decode_seq = [popt_window_capacity](
+                                const unsigned char* raw, std::size_t b, std::size_t e,
+                                std::uint64_t hint, OptimumOut* out) {
+                                nzr::optimum2::NzOptimum2LzDecoder sdec(popt_window_capacity);
+                                const ByteView rec_view(raw, e);
+                                nzr::audio::NzAudioPred saud;
+                                nzr::audio::NzImageModel simg;
+                                ConfigureOptimumModels(6u, saud, simg);
+                                NzExeFilter sexe;
+                                return DecodeOptimumBlockSequence(rec_view, b, e, hint, sdec, saud, simg, sexe, out);
+                            };
+                        }
+                        // A per-stream decoder whose state (ring, audio, image and exe
+                        // filter) persists across CALLS, so the stream's chunk
+                        // records can be decoded one at a time straight out of the
+                        // mapped archive instead of being concatenated into one
+                        // buffer first. Measured on a real 1.6 GB -co container:
+                        // every type-0 record holds exactly one block (467 records,
+                        // 467 blocks, every record boundary is a block start), which
+                        // is what our own writer emits too -- but an archive where a
+                        // block straddles two records would fail here, so the caller
+                        // rewinds the stream and falls back to the concatenated
+                        // path rather than calling such an archive corrupt.
+                        struct StreamDecoder {
+                            std::function<bool(const unsigned char*, std::size_t, std::uint64_t, OptimumOut*)> run;
+                        };
+                        const auto make_stream_decoder = [popt_window_capacity, method_p0]() {
+                            StreamDecoder sd;
+                            auto aud = std::make_shared<nzr::audio::NzAudioPred>();
+                            auto img = std::make_shared<nzr::audio::NzImageModel>();
+                            ConfigureOptimumModels(method_p0, *aud, *img);
+                            auto exe = std::make_shared<NzExeFilter>();
+                            if (method_p0 == 5u) {
+                                auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(popt_window_capacity);
+                                sd.run = [dec, aud, img, exe](const unsigned char* rec, std::size_t len,
+                                                              std::uint64_t hint, OptimumOut* out) {
+                                    return DecodeOptimumBlockSequence(ByteView(rec, len), 0u, len, hint, *dec, *aud, *img, *exe, out);
+                                };
+                            } else {
+                                auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(popt_window_capacity);
+                                sd.run = [dec, aud, img, exe](const unsigned char* rec, std::size_t len,
+                                                              std::uint64_t hint, OptimumOut* out) {
+                                    return DecodeOptimumBlockSequence(ByteView(rec, len), 0u, len, hint, *dec, *aud, *img, *exe, out);
+                                };
+                            }
+                            return sd;
+                        };
+                        bool use_sink = psink::Available();
+                        std::vector<unsigned char> assembled(
+                            use_sink ? std::size_t{0} : static_cast<std::size_t>(total_data_size), 0);
+                        bool all_ok = parse_ok && !ps.empty() && popt_window_capacity != 0u;
+                        std::vector<POptStream*> plist;
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> pranges;
+                        for (auto& kv : ps) {
+                            POptStream& s = kv.second;
+                            if (s.chunks.empty() && !s.cut) continue;
+                            // A slice with no checksum is only unverifiable when the
+                            // archive HAS checksums; `-hn` writes none at all, and the
+                            // original decodes such a container like any other, so the
+                            // gate follows the archive's mode, not the slice's.
+                            if (!s.hassz ||   // no offset record = the whole file, offset 0
+                                
+                                (s.cmode == ChecksumMode::kNone && checksum_mode != ChecksumMode::kNone) ||
+                                s.ooff + s.osz > total_data_size) { all_ok = false; break; }
+                            plist.push_back(&s); pranges.emplace_back(s.ooff, s.osz);
+                        }
+                        StageMark("records walked");
+                        std::vector<std::uint64_t> pdest(pranges.size(), 0u);
+                        for (std::size_t q = 0; q < pranges.size(); ++q) pdest[q] = pranges[q].first;
+                        // The in-memory path needs the slices to tile the output, since it
+                        // slices one buffer back into files. The SINK does not: it writes
+                        // each stream where that stream says, which is what the original's
+                        // workers do -- and a file listed twice in one archive
+                        // (`nz a x.nz f f`) relies on it. The encoder then writes one entry
+                        // whose size covers both copies but gives both the SAME offsets
+                        // (measured on `-co -p4` over one 50 KB file twice: four streams at
+                        // 0, 25000, 0, 25000 for a 100 000-byte entry), so the copies
+                        // overwrite each other and the extracted file is one copy long
+                        // while the footer still counts every decoded byte.
+                        if (all_ok && !use_sink && !DisjointCover(pranges, total_data_size)) all_ok = false;
+                        if (use_sink) { use_sink = all_ok && publish_single(plist, pdest); if (!use_sink && assembled.empty()) all_ok = false; }
+                        // One worker stream per thread (see ParallelForEach); every stream
+                        // writes its own disjoint slice of `assembled`.
+                        if (all_ok) all_ok = ParallelForEach(plist.size(), [&](std::size_t idx) -> bool {
+                            POptStream& s = *plist[idx];
+                            // With the sink the stream's output goes straight to
+                            // the files a block at a time and is dropped -- this
+                            // buffer is only for the assemble-in-memory path.
+                            // Holding every worker's whole output at once is what
+                            // made a 4.5 GB archive cost 8.9 GB of resident memory
+                            // where the original holds 278 MB.
+                            std::vector<unsigned char> slice;
+                            if (!use_sink) slice.reserve(static_cast<std::size_t>(s.osz));
+                            bool sok = true;
+                            std::uint64_t streamed = 0;
+                            if (use_sink) {
+                                psink::StreamBegin(idx);
+                                if (s.chunks.size() > 1u) {
+                                    std::uint64_t off = 0;
+                                    for (std::size_t q = 0; q + 1u < s.chunks.size(); ++q) off += s.chunks[q].second;
+                                    psink::SetLastRecordStart(idx, off);
+                                }
+                            }
+                            const auto make_out = [&]() {
+                                return use_sink
+                                    ? OptimumOut([idx, &streamed, &s](const unsigned char* p, std::size_t n) {
+                                          // Never hand over more than the slice declares:
+                                          // the tail of an overrunning block is dropped
+                                          // exactly as the buffered path's resize did.
+                                          if (streamed >= s.osz) return;
+                                          const std::uint64_t room = s.osz - streamed;
+                                          const std::size_t take = n < room ? n : static_cast<std::size_t>(room);
+                                          psink::StreamWrite(idx, p, take);
+                                          streamed += take;
+                                      })
+                                    : OptimumOut(&slice);
+                            };
+                            OptimumOut ow = make_out();
+                            if (s.chunks.size() == 1u) {
+                                const auto& c = s.chunks.front();
+                                const unsigned char* one = bytes.Span(c.first, c.second);
+                                sok = one != nullptr &&
+                                      decode_seq(one, 0u, c.second, s.osz, &ow);
+                            } else {
+                                // Fast path: one record at a time, straight out of
+                                // the mapped archive. Concatenating them first cost a
+                                // copy of the stream's whole compressed payload --
+                                // ~100 MB per worker on this container, every worker
+                                // at once.
+                                StreamDecoder sd = make_stream_decoder();
+                                sok = true;
+                                // The engine records a failure position relative to
+                                // the record it was handed; the driver's
+                                // plain-vs-shifted rule compares against an offset
+                                // in the concatenated stream, so carry the base.
+                                std::uint64_t rec_base = 0;
+                                for (const auto& c : s.chunks) {
+                                    const unsigned char* rec = bytes.Span(c.first, c.second);
+                                    if (rec == nullptr || !sd.run(rec, c.second, s.osz, &ow)) {
+                                        nzr::derr::OffsetPos(rec_base);
+                                        sok = false;
+                                        break;
+                                    }
+                                    rec_base += c.second;
+                                }
+                                if (!sok || ow.size() != s.osz) {
+                                    // Not one whole block per record after all (or a
+                                    // genuinely bad stream): start the stream over
+                                    // with everything concatenated, which is what the
+                                    // reader did before. Rewinding puts the sink's
+                                    // cursor back, and re-running rewrites the same
+                                    // absolute file ranges.
+                                    if (NZ_ENV("NZ_TRACE_BIGALLOC"))
+                                        std::fprintf(stderr, "[big] co stream %zu: per-record path failed, concatenating %zu records\n",
+                                                     idx, s.chunks.size());
+                                    if (use_sink) { psink::StreamRewind(idx); streamed = 0; }
+                                    slice.clear();
+                                    nzr::derr::Clear();
+                                    ow = make_out();
+                                    std::vector<unsigned char> concat;
+                                    std::size_t clen = 0;
+                                    for (const auto& c : s.chunks) clen += c.second;
+                                    concat.reserve(clen);
+                                    for (const auto& c : s.chunks)
+                                        bytes.AppendTo(&concat, c.first, c.second);
+                                    sok = decode_seq(concat.data(), 0u, concat.size(), s.osz, &ow);
+                                }
+                            }
+                            if (use_sink) {
+                                const bool okd = sok && ow.size() == s.osz;
+                                const bool clean = !okd && nzr::derr::Current().code == 0u && nzr::derr::Current().fatal_id == 0u;
+                                psink::StreamEnd(idx, nullptr, streamed, okd, clean);
+                                return okd;
+                            }
+                            if (!sok || slice.size() != s.osz) return false;
+                            if (ComputeBufferChecksum(s.cmode, slice.data(), slice.size()) != s.cval) return false;
+                            std::memcpy(assembled.data() + static_cast<std::size_t>(pdest[idx]),
+                                        slice.data(), slice.size());
+                            return true;
+                        });
+                        StageMark("streams decoded");
+                        if (sink_adopt()) {
+                        } else if (all_ok && (validate_decoded_candidate(assembled) || record_partial(assembled))) {
+                            StageMark("validated");
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = assembled.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(assembled);
+                        }
+                    }
+                }
+
+        ArcPos sp = payload_start;
+        std::uint64_t stream_tag = 0;
+        if (ReadLegacyVarint(bytes, &sp, bytes.size(), &stream_tag) &&
+            (stream_tag & 0x0fu) == 0u) {
+            const std::uint64_t stream_bytes = stream_tag >> 4u;
+            // Multi-stream chains (e.g., -cf/-cF p1=15 big files) put more
+            // stream tags after the first stream's payload. The LZ77+arith
+            // path handles the chain itself; literal/BWT paths still
+            // require the strict single-stream layout via inner checks.
+            if (stream_bytes <= static_cast<std::uint64_t>(bytes.size() - sp)) {
+                // `-cf/-cF` literal-only substream:
+                // [stream_tag][bitlen_tag][raw_payload]
+                if (method == 0x2bu &&
+                    (method_p0 == 1u || method_p0 == 2u) &&
+                    method_p1 == 0u) {
+                    ArcPos bp = sp;
+                    std::uint64_t bitlen_tag = 0;
+                    if (ReadLegacyVarint(bytes, &bp, bytes.size(), &bitlen_tag) &&
+                        total_data_size <= (std::numeric_limits<std::uint64_t>::max() - 1u) / 8u) {
+                        const std::uint64_t expected_bits = total_data_size * 8u;
+                        const bool bitlen_match = (bitlen_tag == expected_bits || bitlen_tag == expected_bits + 1u);
+                        if (bitlen_match &&
+                            total_data_size <= static_cast<std::uint64_t>(bytes.size() - bp) &&
+                            static_cast<std::uint64_t>(bp) + total_data_size == bytes.size() &&
+                            validate_literal_candidate_with_checksums(bp)) {
+                            native_literal_payload = true;
+                            literal_data_offset = bp;
+                            literal_data_size = static_cast<std::size_t>(total_data_size);
+                        }
+                    }
+                }
+
+                // `-cf/-cF` LZ77 bytecode + arith side-stream substream
+                // (the common path for compressible inputs).
+                //
+                // Block layout (per-block):
+                //   [varint uVar9]              — header. uVar9 = (out_size << 3) | flags.
+                //                                  uVar9 & 7 == 3 → LZ77 bytecode mode,
+                //                                  uVar9 & 1 == 1 → has arith side-stream.
+                //   [u16 LE side_stream_count]  — number of bytecode bytes in side-stream output.
+                //   [arith-coded side-stream]   — input to nzr::lzpf::DecodeArithBuffer.
+                //
+                // The decoded side-stream IS the LZ77 bytecode opcode stream
+                // consumed by nzr::lzpf::DecodeLz77VariantA. For multi-block
+                // archives (large inputs) we loop until we've produced
+                // total_data_size output bytes. method_p1 != 0 indicates the
+                // legacy parallel-encoder layout — same per-block format
+                // applies, just more blocks.
+                // method_p0 == 1 → nz_lzpf (variant A, 13-bit hash).
+                // method_p0 == 2 → nz_lzpf_large (variant B, 24-bit hash,
+                // opcode 0xf5 with secondary 8 KiB byte buffer). Both ported
+                // natively (task #26). Variant B allocates a 64 MiB hash table
+                // lazily — costly but matches legacy `nz_lzpf_large`.
+
+
+                if (!native_literal_payload &&
+                    method == 0x2bu &&
+                    (method_p0 == 1u || method_p0 == 2u) &&
+                    sp + static_cast<std::size_t>(stream_bytes) <= bytes.size()) {
+                    const bool is_variant_b = (method_p0 == 2u);
+                    // Verifier: the member's whole-output checksum, embedded as
+                    // [tag][value] (the per-file checksum). For members that also
+                    // carry a per-entry checksum, validate_decoded_candidate has
+                    // already verified the bytes, so the embedded scan is skipped.
+                    bool entries_have_checksum = false;
+                    if (checksum_verification_supported) {
+                        for (const LegacyCnEntry& e : entries)
+                            if (e.has_checksum) { entries_have_checksum = true; break; }
+                    }
+                    auto member_verify = [&](const std::vector<unsigned char>& dec) -> bool {
+                        const bool vdc = validate_decoded_candidate(dec);
+                        if (NZ_ENV("NZOPT_TRACE_LZPF")) {
+                            fprintf(stderr, "[lzpf] member_verify: size=%zu vdc=%d entries=%zu have_cksum=%d mode=%d\n",
+                                    dec.size(), (int)vdc, entries.size(), (int)entries_have_checksum, (int)checksum_mode);
+                            std::size_t cur = 0;
+                            for (const LegacyCnEntry& e : entries) {
+                                if (e.size > (std::uint64_t)(dec.size() - cur)) break;
+                                const std::uint32_t got = ComputeBufferChecksum(checksum_mode, dec.data() + cur, (std::size_t)e.size);
+                                fprintf(stderr, "[lzpf]   entry sz=%llu has_cksum=%d stored=%08x got=%08x %s\n",
+                                        (unsigned long long)e.size, (int)e.has_checksum, e.checksum, got,
+                                        (e.has_checksum && got != e.checksum) ? "MISMATCH" : "");
+                                cur += (std::size_t)e.size;
+                            }
+                        }
+                        if (!vdc) {
+                            // Option (c): the derived window (first candidate) of a damaged
+                            // archive decodes to the right size but fails its checksum; keep
+                            // it as the fallback so the good entries still come out.
+                            std::vector<unsigned char> copy = dec;
+                            record_partial(copy);
+                            return false;
+                        }
+                        if (entries_have_checksum) return true;
+                        std::uint8_t tag = 0; std::size_t cw = 0;
+                        switch (checksum_mode) {
+                            case ChecksumMode::kFletcher32: tag = 0x45u; cw = 4u; break;
+                            case ChecksumMode::kFletcher16: tag = 0x45u; cw = 2u; break;
+                            case ChecksumMode::kCrc32:      tag = 0x47u; cw = 4u; break;
+                            case ChecksumMode::kCrc16:      tag = 0x26u; cw = 2u; break;
+                            // No checksum exists anywhere in the archive, so
+                            // there is nothing to compare against; the caller
+                            // restricts this path to the single DERIVED
+                            // capacity, and vdc has already checked that the
+                            // output length and every entry length line up.
+                            case ChecksumMode::kNone:       return true;
+                        }
+                        const std::uint32_t c = ComputeBufferChecksum(checksum_mode, dec.data(), dec.size());
+                        std::array<std::uint8_t, 5> pat{};
+                        pat[0] = tag;
+                        for (std::size_t k = 0; k < cw; ++k)
+                            pat[1u + k] = static_cast<std::uint8_t>((c >> (8u * k)) & 0xffu);
+                        const std::size_t patlen = 1u + cw;
+                        for (std::size_t q = 0; q + patlen <= bytes.size(); ++q)
+                            if (std::memcmp(bytes.Span(q, patlen), pat.data(), patlen) == 0) return true;
+                        return false;
+                    };
+                    std::vector<unsigned char> member_out;
+                    // payload_start IS data_records[0].first, so the same parse
+                    // applies to the spliced buffer from its own start.
+                    const bool use_splice = spliced_map->total != 0u;
+                    // Cut inside a data record past the first: the original reads the
+                    // record at its DECLARED length into the one buffer every record
+                    // goes through, so the bytes the file lacks are the last earlier
+                    // record's bytes at the same offset (zeros where none reached) --
+                    // measured on a -cf archive cut at 129 330 bytes: all 100 809
+                    // missing bytes of record 1 were record 0's. It then decodes on
+                    // and reports what the garbage trips (a block header too large:
+                    // code 4), where reading only the bytes that exist said 6. The
+                    // stored family has the same model (see store_cut_buf).
+                    std::vector<unsigned char> lzpf_pad;
+                    bool lzpf_padded = false;
+                    if (truncated_input && cut_data_valid && !cut_first_data_record && !has_parallel_streams &&
+                        !data_payloads.empty() && cut_data_begin <= bytes.size()) {
+                        const std::uint64_t got = bytes.size() - cut_data_begin;
+                        if (cut_data_declared > got && cut_data_declared - got <= (std::uint64_t{1} << 30)) {
+                            // the view the chain reads (the records spliced, or the file),
+                            // flat, with the cut record's missing tail after it
+                            const ByteView v = use_splice ? bytes.Spliced(spliced_map.get()) : bytes;
+                            v.AppendTo(&lzpf_pad, 0u, v.size());
+                            const std::size_t base = lzpf_pad.size();
+                            lzpf_pad.resize(base + static_cast<std::size_t>(cut_data_declared - got), 0u);
+                            std::uint64_t filled = got;   // offsets inside the record, [got, declared)
+                            for (auto it = data_payloads.rbegin(); it != data_payloads.rend() && filled < cut_data_declared; ++it) {
+                                const std::uint64_t len = it->second - it->first;
+                                if (len <= filled) continue;
+                                const std::uint64_t upto = std::min<std::uint64_t>(len, cut_data_declared);
+                                const unsigned char* q = bytes.Span(it->first + filled, upto - filled);
+                                if (q != nullptr)
+                                    std::memcpy(lzpf_pad.data() + base + static_cast<std::size_t>(filled - got), q,
+                                                static_cast<std::size_t>(upto - filled));
+                                filled = upto;
+                            }
+                            lzpf_padded = true;
+                            if (const char* dp = NZ_ENV("NZ_DUMP_LZPFCUT"))
+                                if (FILE* df = std::fopen(dp, "wb")) { std::fwrite(lzpf_pad.data(), 1, lzpf_pad.size(), df); std::fclose(df); }
+                        }
+                    }
+                    const ByteView chain_src = lzpf_padded ? ByteView(lzpf_pad)
+                                                           : (use_splice ? bytes.Spliced(spliced_map.get()) : bytes);
+                    const bool chain_cut = truncated_input && !lzpf_padded;
+                    if (NZ_ENV("NZ_TRACE_LZPFCUT"))
+                        std::fprintf(stderr, "[lzpfcut] trunc=%d cut_valid=%d first=%d par=%d splice=%d payloads=%zu begin=%llu size=%llu declared=%llu padded=%d\n",
+                                     (int)truncated_input, (int)cut_data_valid, (int)cut_first_data_record, (int)has_parallel_streams,
+                                     (int)use_splice, data_payloads.size(), (unsigned long long)cut_data_begin,
+                                     (unsigned long long)bytes.size(), (unsigned long long)cut_data_declared, (int)lzpf_padded);
+                    const ArcPos chain_sp = use_splice ? (sp - payload_start) : sp;
+                    // Stream the chain to disk, one whole data record at a time, the
+                    // way the single-container original writes it: the output never
+                    // exists whole (a 128 MB -cf file held 433 MB here against the
+                    // original's 134). Only where the outcome cannot differ from the
+                    // buffered path below:
+                    //  - the sink is up (not `l`, not NZ_SAFE);
+                    //  - the entries tile the output exactly, since the sink's slices
+                    //    are the entries and it clamps at their total;
+                    //  - every entry that has a checksum is judged on its own (or there
+                    //    are none, -hn/-nm); the whole-output checksum search of
+                    //    member_verify needs the whole output, so that case stays
+                    //    buffered;
+                    //  - the output fits size_t.
+                    // It decodes the DERIVED capacity only. The fallback candidates
+                    // never decided an outcome that was measured: 31 of 31 adoptions on
+                    // intact archives were candidate 0, and on all 12 damaged -cf/-cF
+                    // cases of the corruption suite candidate 0 either completed or
+                    // failed at the same byte count as the rest. If it hands nothing
+                    // over -- the first record already fails, or the sink will not take
+                    // the layout -- nothing was published or written, and the buffered
+                    // decode below runs exactly as before.
+                    bool chain_streamed = false;
+                    {
+                        std::uint64_t tiled = 0;
+                        for (const LegacyCnEntry& e : entries) tiled += e.size;
+                        const bool chain_sink = psink::Available() && !entries.empty() &&
+                                                tiled == total_data_size &&
+                                                (entries_have_checksum || checksum_mode == ChecksumMode::kNone) &&
+                                                total_data_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+                        if (NZ_ENV("NZ_TRACE_SINK"))
+                            std::fprintf(stderr, "[sink] lzpf chain: available=%d entries=%zu tiled=%d checksums=%d -> %s\n",
+                                         (int)psink::Available(), entries.size(), (int)(tiled == total_data_size),
+                                         (int)(entries_have_checksum || checksum_mode == ChecksumMode::kNone),
+                                         chain_sink ? "stream" : "buffer");
+                        if (chain_sink) {
+                            bool tried = false, published = false;
+                            std::uint64_t streamed = 0;
+                            // Published on the FIRST byte handed over, not before the
+                            // decode: StreamBegin creates the first output file, and a
+                            // decode that completes no record must leave none -- and must
+                            // leave the sink unpublished for the buffered retry.
+                            const std::function<void(const unsigned char*, std::size_t)> to_sink =
+                                [&](const unsigned char* q, std::size_t n) {
+                                    if (!tried) {
+                                        tried = true;
+                                        std::vector<psink::Stream> pstreams(1);
+                                        for (std::size_t i = 0; i < entries.size(); ++i) {
+                                            const LegacyCnEntry& en = entries[i];
+                                            psink::Slice sl;
+                                            sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                                            sl.cmode = checksum_mode; sl.cval = en.checksum;
+                                            // judged exactly when the extractor would judge it
+                                            sl.has_cksum = en.has_checksum && checksum_verification_supported;
+                                            sl.group = i;   // one group per entry, as for -co/-cc
+                                            pstreams[0].slices.push_back(sl);
+                                        }
+                                        published = psink::Publish(entries, std::move(pstreams),
+                                                                   psink::Policy::kProduced, 0u, psink::Family::kLzpf);
+                                        if (published) psink::StreamBegin(0u);
+                                    }
+                                    if (!published) return;
+                                    psink::StreamWrite(0u, q, n);
+                                    streamed += n;
+                                };
+                            const auto accept_all = [](const unsigned char*, std::size_t) { return true; };
+                            std::vector<unsigned char> unused;
+                            std::size_t mdone = 0;
+                            const bool okd = DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
+                                                              total_data_size, is_variant_b, method_p1,
+                                                              /*derived_cap_only=*/true, accept_all, &unused,
+                                                              /*direct_out=*/nullptr, chain_cut, &mdone,
+                                                              /*lenient=*/!chain_cut, /*input_end=*/0u, &to_sink,
+                                                              /*stream_members=*/true);
+                            if (published && streamed > 0u) {
+                                psink::StreamEnd(0u, nullptr, streamed, okd, false);
+                                // The failing position is reported in payload space, as
+                                // the buffered path below does for its partial prefix.
+                                if (!okd && !use_splice && nzr::derr::t_state.has_pos &&
+                                    nzr::derr::t_state.input_pos >= payload_start)
+                                    nzr::derr::t_state.input_pos -= payload_start;
+                                chain_streamed = sink_adopt();
+                            }
+                        }
+                    }
+                    // With no checksum stored (-hn / -nm) there is nothing to
+                    // adjudicate between capacity candidates, so use only the
+                    // derived one -- and accept it, which is what member_verify
+                    // does for ChecksumMode::kNone.
+                    if (chain_streamed) {
+                        // written (or, for `t`, verified) by the sink
+                    } else if (DecodeLzpfMember(chain_src, chain_sp, static_cast<std::size_t>(stream_bytes),
+                                         total_data_size, is_variant_b, method_p1,
+                                         /*derived_cap_only=*/checksum_mode == ChecksumMode::kNone,
+                                         member_verify, &member_out, nullptr, chain_cut)) {
+                        native_literal_payload = true;
+                        literal_data_offset = 0u;
+                        literal_data_size = member_out.size();
+                        literal_data_owned = true;
+                        literal_data_buffer = std::move(member_out);
+                    } else if (!member_out.empty() && member_out.size() < total_data_size) {
+                        // The members completed before the failing one (see
+                        // DecodeLzpfMember): written the way the original does.
+                        partial_prefix = std::move(member_out);
+                        if (!use_splice && nzr::derr::t_state.has_pos && nzr::derr::t_state.input_pos >= payload_start)
+                            nzr::derr::t_state.input_pos -= payload_start;   // archive offset -> payload space
+                    }
+                }
+
+                // `-cd/-cD` literal-only substream:
+                // [stream_tag][unknown_varint][0x00][raw_payload]
+                if (!native_literal_payload &&
+                    method == 0x2bu &&
+                    (method_p0 == 3u || method_p0 == 4u) &&
+                    method_p1 == 0u) {
+                    ArcPos bp = sp;
+                    std::uint64_t unused_tag = 0;
+                    if (ReadLegacyVarint(bytes, &bp, bytes.size(), &unused_tag) &&
+                        bp < bytes.size() && bytes[bp] == 0x00u) {
+                        ++bp;
+                        if (total_data_size <= static_cast<std::uint64_t>(bytes.size() - bp) &&
+                            static_cast<std::uint64_t>(bp) + total_data_size == bytes.size() &&
+                            validate_literal_candidate_with_checksums(bp)) {
+                            native_literal_payload = true;
+                            literal_data_offset = bp;
+                            literal_data_size = static_cast<std::size_t>(total_data_size);
+                        }
+                    }
+                }
+
+                // `-co/-cO` observed BWT-wrapper substreams:
+                // - variant A: [stream_tag][u32 raw_size][bwt_last(raw_size)][u24 primary_be][trailer]
+                // - variant B: [stream_tag][u32 raw_size][bwt_last(raw_size)][16-byte trailer], where
+                //   primary index is encoded as little-endian u24 at trailer+5.
+                if (!native_literal_payload &&
+                    method == 0x3bu &&
+                    (method_p0 == 5u || method_p0 == 6u) &&
+                    method_p1 == 0u &&
+                    stream_bytes >= 7u &&
+                    sp + 7u <= bytes.size()) {
+                    const std::uint32_t raw_size = bytes.U32At(sp);
+                    if (raw_size == total_data_size &&
+                        stream_bytes >= 4u + static_cast<std::uint64_t>(raw_size) + 3u &&
+                        sp + 4u + static_cast<std::size_t>(raw_size) + 3u <= bytes.size()) {
+                        const unsigned char* const bwt_last = bytes.Span(sp + 4u, raw_size);
+                        const ArcPos trailer_off = sp + 4u + raw_size;
+                        const auto try_bwt_primary = [&](std::uint32_t primary_index) -> bool {
+                            std::vector<unsigned char> decoded;
+                            if (!InverseBwt(
+                                    bwt_last,
+                                    static_cast<std::size_t>(raw_size),
+                                    static_cast<std::size_t>(primary_index),
+                                    &decoded)) {
+                                return false;
+                            }
+                            if (!validate_decoded_candidate(decoded)) {
+                                return false;
+                            }
+                            native_literal_payload = true;
+                            literal_data_offset = 0u;
+                            literal_data_size = decoded.size();
+                            literal_data_owned = true;
+                            literal_data_buffer = std::move(decoded);
+                            return true;
+                        };
+
+                        // Variant A (legacy samples with direct BE u24 right after bwt_last).
+                        const std::uint32_t primary_be =
+                            (static_cast<std::uint32_t>(bytes[trailer_off]) << 16u) |
+                            (static_cast<std::uint32_t>(bytes[trailer_off + 1u]) << 8u) |
+                            static_cast<std::uint32_t>(bytes[trailer_off + 2u]);
+                        (void)try_bwt_primary(primary_be);
+
+                        // Variant B (observed in bigger single-file streams): 16-byte trailer,
+                        // primary index at trailer offset +5 as LE u24.
+                        if (!native_literal_payload &&
+                            stream_bytes >= 4u + static_cast<std::uint64_t>(raw_size) + 16u &&
+                            trailer_off + 16u <= bytes.size()) {
+                            const std::uint32_t primary_tail_le =
+                                static_cast<std::uint32_t>(bytes[trailer_off + 5u]) |
+                                (static_cast<std::uint32_t>(bytes[trailer_off + 6u]) << 8u) |
+                                (static_cast<std::uint32_t>(bytes[trailer_off + 7u]) << 16u);
+                            (void)try_bwt_primary(primary_tail_le);
+                        }
+                    }
+                }
+
+                // `-co/-cO` prefilter-compressed BWT substream:
+                // [stream_tag][u32 pf_input_size][pf_input_size bytes prefilter_data][22-byte trailer]
+                // trailer layout (first 13 bytes significant, last 9 are zero padding):
+                //   00 01 [u32 bwt_size] 03 [u32 checksum] 00 [u24 primary_le]
+                // Decoder consumes (pf_input_size - 11) bytes via core byte-copy + RC run-extra.
+                if (!native_literal_payload &&
+                    method == 0x3bu &&
+                    (method_p0 == 5u || method_p0 == 6u) &&
+                    method_p1 == 0u &&
+                    stream_bytes >= 4u + 11u + 22u &&
+                    sp + 4u <= bytes.size()) {
+                    const std::uint32_t pf_input_size = bytes.U32At(sp);
+                    const ArcPos pf_off = sp + 4u;
+                    if (pf_input_size >= 12u &&
+                        stream_bytes >= 4u + static_cast<std::uint64_t>(pf_input_size) + 22u &&
+                        pf_off + static_cast<std::size_t>(pf_input_size) + 22u <= bytes.size()) {
+                        const ArcPos trailer_off = pf_off + pf_input_size;   // FILE offset
+                        const std::uint32_t bwt_size_from_trailer = bytes.U32At(trailer_off + 2u);
+                        const std::uint32_t primary_from_trailer =
+                            static_cast<std::uint32_t>(bytes[trailer_off + 11u]) |
+                            (static_cast<std::uint32_t>(bytes[trailer_off + 12u]) << 8u) |
+                            (static_cast<std::uint32_t>(bytes[trailer_off + 13u]) << 16u);
+                        if (bwt_size_from_trailer >= total_data_size &&
+                            bwt_size_from_trailer <= total_data_size + 64u * 1024u) {
+                            LegacyPrefilterRangeCoder rc;
+                            const std::size_t byte_copy_count =
+                                static_cast<std::size_t>(pf_input_size) - 11u;
+                            if (bytes.Span(pf_off, 1u + byte_copy_count) == nullptr) return false;
+                            rc.Init(bytes.Span(pf_off, 1u), bytes.Span(pf_off + 1u, byte_copy_count));
+                            std::vector<unsigned char> bwt_last;
+                            if (DecodeLegacyPrefilterStream(
+                                    bytes.Span(pf_off + 1u, byte_copy_count),
+                                    byte_copy_count,
+                                    rc,
+                                    static_cast<std::size_t>(bwt_size_from_trailer),
+                                    &bwt_last) &&
+                                bwt_last.size() == bwt_size_from_trailer) {
+                                std::vector<unsigned char> decoded;
+                                if (InverseBwt(
+                                        bwt_last.data(),
+                                        bwt_last.size(),
+                                        static_cast<std::size_t>(primary_from_trailer),
+                                        &decoded) &&
+                                    validate_decoded_candidate(decoded)) {
+                                    native_literal_payload = true;
+                                    literal_data_offset = 0u;
+                                    literal_data_size = decoded.size();
+                                    literal_data_owned = true;
+                                    literal_data_buffer = std::move(decoded);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // `-co/-cO` observed raw-wrapper substream on incompressible inputs:
+                // [stream_tag][u32 raw_size][raw_payload][trailer]
+                if (!native_literal_payload &&
+                    method == 0x3bu &&
+                    (method_p0 == 5u || method_p0 == 6u) &&
+                    method_p1 == 0u &&
+                    stream_bytes >= 4u + total_data_size &&
+                    sp + 4u <= bytes.size()) {
+                    const std::uint32_t raw_size = bytes.U32At(sp);
+                    const ArcPos bp = sp + 4u;
+                    if (raw_size == total_data_size && validate_literal_candidate_with_checksums(bp)) {
+                        native_literal_payload = true;
+                        literal_data_offset = bp;
+                        literal_data_size = static_cast<std::size_t>(total_data_size);
+                    }
+                }
+
+                // `-cc` observed literal-wrapper substream on incompressible inputs:
+                // [stream_tag][u32 raw_size][raw_payload][trailer]
+                if (!native_literal_payload &&
+                    method == 0x4bu &&
+                    method_p0 == 7u &&
+                    stream_bytes >= 4u + total_data_size &&
+                    sp + 4u <= bytes.size()) {
+                    const std::uint32_t raw_size = bytes.U32At(sp);
+                    const ArcPos bp = sp + 4u;
+                    if (raw_size == total_data_size && validate_literal_candidate_with_checksums(bp)) {
+                        native_literal_payload = true;
+                        literal_data_offset = bp;
+                        literal_data_size = static_cast<std::size_t>(total_data_size);
+                    }
+                }
+            }
+        }
+    }
+
+    if (native_literal_payload && literal_data_size == 0u) {
+        literal_data_size = static_cast<std::size_t>(total_data_size);
+    }
+
+    // Zero-byte payload fast path: every compressor serialises an empty file
+    // identically (no data bytes), so we can satisfy the request natively
+    // without declining (the legacy binary segfaults on this shape, see
+    // backend on some builds when asked to decompress nothing).
+    if (!native_store_payload && !native_literal_payload && total_data_size == 0u) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = 0u;
+        literal_data_owned = true;
+        literal_data_buffer.clear();
+    }
+
+    LegacyCnContext ctx;
+    ctx.archive_path = archive_path;
+    ctx.checksum_mode = checksum_mode;
+    ctx.checksum_verification_supported = checksum_verification_supported;
+    ctx.legacy_method = method;
+    ctx.legacy_method_p0 = method_p0;
+    ctx.legacy_method_p1 = method_p1;
+    ctx.legacy_method_p2 = method_p2;
+    ctx.cm_a_bits = cm_a_bits;
+    ctx.cm_b_bits = cm_b_bits;
+    ctx.cm_window_size = cm_window_size;
+    if (store_cut_full) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = store_cut_buf.size();
+        literal_data_owned = true;
+        literal_data_buffer = std::move(store_cut_buf);
+        ctx.entry_checksum_ok = std::move(store_cut_ok);
+    } else if (store_cut_eof && !store_cut_buf.empty()) {
+        partial_prefix = std::move(store_cut_buf);
+    }
+    if (!native_literal_payload && !native_store_payload && !partial_candidate.empty()) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = partial_candidate.size();
+        literal_data_owned = true;
+        literal_data_buffer = std::move(partial_candidate);
+        ctx.entry_checksum_ok = std::move(partial_ok);
+    }
+    if (!native_literal_payload && !native_store_payload && !partial_prefix.empty()) {
+        native_literal_payload = true;
+        literal_data_offset = 0u;
+        literal_data_size = partial_prefix.size();
+        literal_data_owned = true;
+        literal_data_buffer = std::move(partial_prefix);
+        ctx.decode_failed = true;
+    }
+    {
+        // The container's shape, so a sweep can say which of them were exercised
+        // (the encode phase has to write all of these back).
+        std::size_t nstreams = 0;
+        if (has_parallel_streams) {
+            std::map<unsigned, LegacyParallelStream> shape;
+            if (ParseLegacyParallelStreams(bytes, &shape)) nstreams = shape.size();
+        }
+        nz_trace::Construct("container %s codec=0x%02x/%u streams=%zu files=%s",
+                            has_parallel_streams ? "parallel" : "single",
+                            method, method_p0, nstreams,
+                            entries.size() == 1u ? "1" : "many");
+    }
+    if (psink::Committed()) {
+        // The sink wrote the container while the streams decoded; the extractor
+        // only reports (footer, or the original's corruption line).
+        const psink::Outcome so = psink::Finish();
+        ctx.sink_handled = true;
+        ctx.sink_failed_entries = so.failed_entries;
+        ctx.decode_failed = so.stream_failed;
+        ctx.sink_plain_code = so.plain_code;
+        if (!native_store_payload) native_literal_payload = true;
+    }
+    if (NZ_ENV("NZ_TRACE_PARSTREAM"))
+        std::fprintf(stderr, "[PAYLOAD] payload_start=%zu first_data_record=%zu data_records=%zu spliced=%zu store=%d literal=%d\n",
+                     payload_start, first_data_record, data_records.size(), (std::size_t)spliced_map->total,
+                     (int)native_store_payload, (int)native_literal_payload);
+    ctx.native_payload_supported = native_store_payload || native_literal_payload;
+    ctx.truncated_input = truncated_input;
+    ctx.eof_before_decode = eof_before_decode;
+    ctx.saw_data_record = saw_data_record || has_parallel_streams;
+    ctx.cut_first_data_record = cut_first_data_record;
+    {
+        ArcPos acc = 0;   // payload-space offsets: 64-bit, like the records themselves
+        for (const auto& dr : data_records) { acc += dr.second - dr.first; ctx.payload_record_ends.push_back(acc); }
+        ctx.records_after_data = !data_records.empty() && data_records.back().second < bytes.size();
+    }
+    if (ctx.decode_failed) AdoptDecodeError(ctx);
+    if (store_cut_eof) ctx.decode_eof = true;
+    // Every native_literal_payload path above went through validate_decoded_candidate
+    // (or the partial fallback, whose verdicts are in entry_checksum_ok).
+    ctx.checksums_verified = native_literal_payload && checksum_verification_supported && !ctx.decode_failed;
+    if (has_parallel_streams) {
+        std::map<unsigned, LegacyParallelStream> pstreams;
+        if (ParseLegacyParallelStreams(bytes, &pstreams)) {
+            for (const auto& kv : pstreams) {
+                ctx.parallel_p1.push_back(kv.second.hasparams ? kv.second.p1 : method_p1);
+            }
+        }
+    }
+    if (native_store_payload) {
+        ctx.payload_mode = LegacyPayloadMode::kStore;
+    } else if (native_literal_payload) {
+        ctx.payload_mode = LegacyPayloadMode::kLiteralOnly;
+    } else if (payload_start < bytes.size()) {
+        ctx.payload_mode = LegacyPayloadMode::kCompressed;
+    } else {
+        ctx.payload_mode = LegacyPayloadMode::kUnknown;
+    }
+    ctx.entries = std::move(entries);
+    ctx.data_offset = (native_store_payload && !store_multiblock) ? data_offset_u64 : 0u;
+    ctx.total_data_size = total_data_size;
+    if (native_store_payload) {
+        if (store_splice && store_splice->total == total_data_size) {
+            // The stored records, spliced: no copy at all.
+            ctx.src = archive_ptr;
+            ctx.payload_is_view = true;
+            ctx.splice = store_splice;
+            ctx.payload_view = bytes.Spliced(store_splice.get());
+        } else if (store_multiblock) {
+            // Raw payload was reassembled from multiple stored blocks.
+            ctx.data = std::move(store_blocks_buffer);
+        } else {
+            // One contiguous run from data_offset to the end of the archive: a
+            // subview, which is the same bytes without the copy.
+            ctx.src = archive_ptr;
+            ctx.payload_is_view = true;
+            ctx.payload_view = bytes.subview(data_offset_u64);
+        }
+    } else if (native_literal_payload) {
+        if (literal_data_owned) {
+            ctx.data_offset = 0u;
+            ctx.data = std::move(literal_data_buffer);
+        } else {
+            ctx.data_offset = static_cast<std::uint64_t>(literal_data_offset);
+            std::vector<unsigned char> lit;
+            bytes.AppendTo(&lit, literal_data_offset, literal_data_size);
+            ctx.data = std::move(lit);
+        }
+    } else if (ctx.payload_mode == LegacyPayloadMode::kCompressed &&
+               ((method == 0x4bu && method_p0 == 7u) ||
+                (method == 0x2bu && (method_p0 == 3u || method_p0 == 4u)) ||
+                (method == 0x3bu && (method_p0 == 5u || method_p0 == 6u))) &&
+               payload_start < bytes.size()) {
+        // Store the raw compressed stream so the native decoders can parse the
+        // stream_tag + block directly:
+        //  - 0x4b p0=7  -> TryDecodeLegacyCm (CM)
+        //  - 0x2b p0=3/4 -> TryDecodeLegacyLzhd (the real coroutine token-LZ, now
+        //    ported as NzCdDecodeBlock; the old "virtual-stream framing crashes a
+        //    flat DecLZ" note is obsolete — pure-LZ -cd decodes byte-exact).
+        //  - 0x3b p0=5 (-co, nz_optimum1) -> TryDecodeLegacyOptimum, backed by
+        //    NzOptimumLzDecoder (FUN_0809e600 port).
+        //  - 0x3b p0=6 (-cO, nz_optimum2) -> TryDecodeLegacyOptimum, backed by
+        //    NzOptimum2LzDecoder (FUN_080a5d90 port) -- single-container only;
+        //    (historical note: parallel-container -cO and decr_param==0 BWT were once unported; both are native now)
+        //    (see nz_optimum2_lz.h for the engine's scope).
+        // Describe the payload instead of copying it: the mapping is shared with
+        // the context, so the decoders can read it through the same window (or
+        // the same splice) after this function returns. A 4.6 GB payload used to
+        // be 4.6 GB of anonymous memory here, which is what a 32-bit build cannot
+        // have and what made even `l` cost gigabytes.
+        ctx.src = archive_ptr;
+        ctx.payload_is_view = true;
+        if (spliced_map->total != 0u) {
+            ctx.splice = spliced_map;
+            ctx.payload_view = bytes.Spliced(spliced_map.get());
+        } else {
+            ctx.payload_view = bytes.subview(payload_start);
+        }
+        // A -co/-cO/-cc single container cut inside a data record after the first:
+        // the original's reader hands the codec the record at its DECLARED length,
+        // the bytes the file no longer has being what its record buffer still
+        // holds from the previous record at the same offset (the store branch
+        // above, measured byte for byte). A block's header fields follow its
+        // payload, so a cut of a few bytes lands in them -- and the original reads
+        // on and reports success when the codec never needs those bytes (a
+        // two-block -co and -cc archive cut by one byte: `t` OK, where this reader
+        // said code 25600). So give the codec the same padded record. A cut in the
+        // FIRST data record keeps its measured short-end rule (quirk 51).
+        if ((method_p0 == 5u || method_p0 == 6u || method_p0 == 7u) && truncated_input && cut_data_valid &&
+            !cut_first_data_record && !has_parallel_streams && !data_payloads.empty() &&
+            spliced_map->total == 0u && cut_data_begin <= bytes.size()) {
+            const std::uint64_t got = bytes.size() - cut_data_begin;
+            if (cut_data_declared > got && cut_data_declared - got <= (std::uint64_t{1} << 30)) {
+                std::vector<unsigned char> pb;
+                ctx.payload_view.AppendTo(&pb, 0u, ctx.payload_view.size());
+                ctx.pad_from = pb.size();
+                pb.resize(pb.size() + static_cast<std::size_t>(cut_data_declared - got), 0u);
+                ctx.payload_is_view = false;
+                ctx.payload_view = ByteView();
+                ctx.data = ByteBuffer(std::move(pb));
+                nz_trace::Construct("cut_record padded codec=%u", method_p0);
+            }
+        }
+    }
+
+    StageMark("context built");
+    *out_context = std::move(ctx);
+    if (out_error_message != nullptr) {
+        out_error_message->clear();
+    }
+    return true;
+}
+
+int RunLegacyCnList(const CliOptions& options, const LegacyCnContext& legacy, std::ostream& os) {
+    const bool has_checksum = legacy.checksum_mode != ChecksumMode::kNone;
+    // The original drops a whole column when the archive carries no such
+    // record: -hn removes the checksum, -nt the timestamp, -np the permission
+    // column -- and so does a permission record that the encoder omitted
+    // because every entry was mode 0600 (such an archive is byte-identical to
+    // the -np one).
+    bool has_perm = false;
+    bool has_date = false;
+    for (const LegacyCnEntry& e : legacy.entries) {
+        if (e.has_permissions) has_perm = true;
+        if (e.has_mtime) has_date = true;
+    }
+    // Layout matched to the original: archive name, column header, one row per
+    // entry, total. It prints no compressor or payload line here.
+    os << "Archive: " << legacy.archive_path << '\n';
+    // The column header comes with the first entry: an archive of no files (all
+    // inputs excluded or unreadable) lists as the Archive line and the total
+    // alone, measured on the original's own 27-byte archive of that kind.
+    std::ostringstream hdr;
+    if (has_checksum) {
+        hdr << "checksum ";
+    }
+    if (has_perm) {
+        // A Windows build names the column "attr." and shows the file's
+        // attributes there instead of a mode; note the original's own header
+        // word is one character wider than the values under it.
+#if defined(_WIN32)
+        hdr << "attr. ";
+#else
+        hdr << "perm ";
+#endif
+    }
+    // Measured: `-fo` adds a "user/grp." column only when the archive carries
+    // ownership records (an archive made without -fo shows no column).
+    bool has_owner = false;
+    for (const LegacyCnEntry& e : legacy.entries) if (e.has_owner) { has_owner = true; break; }
+    const bool show_owner = options.restore_ownership && has_owner;
+    if (show_owner) {
+        hdr << "user/grp. ";
+    }
+    if (has_date) {
+        hdr << "yyyy-mmm-dd hh:mm:ss";
+    }
+    // -v widens the size column to exact, space-grouped byte counts (%15s).
+    hdr << (options.verbose ? "           size  file\n" : "     size  file\n");
+    if (!legacy.entries.empty()) os << hdr.str();
+
+    std::uint64_t total_size = 0;
+    std::size_t total_files = 0;
+    // Measured: `l` lists every entry whatever file arguments follow the archive.
+    for (const LegacyCnEntry& e : legacy.entries) {
+        if (has_checksum) {
+            // A stored value of zero prints as "n/a", whatever the mode: with
+            // crc16/crc32 an empty file's checksum IS zero and the original
+            // shows n/a for it, while fletcher16 stores ffffffff for one and
+            // shows that. (A non-empty file whose crc happens to be zero gets
+            // the same treatment -- measured, not assumed.)
+            if (e.checksum_na || !e.has_checksum || e.checksum == 0u) {
+                os << "     n/a ";
+            } else {
+                const std::uint32_t shown = e.has_checksum ? e.checksum : 0;
+                os << std::setw(8) << std::left
+                   << FormatChecksum(legacy.checksum_mode, shown) << ' ';
+            }
+        }
+        if (has_perm) {
+#if defined(_WIN32)
+            // "R", "H", "S", "A" in fixed positions; an archive that carries
+            // POSIX modes instead leaves the field blank, as the original does.
+            char attr[5] = {' ', ' ', ' ', ' ', 0};
+            if (e.has_win_attr) {
+                if (e.win_attr & 1u) attr[0] = 'R';
+                if (e.win_attr & 2u) attr[1] = 'H';
+                if (e.win_attr & 4u) attr[2] = 'S';
+                if (e.win_attr & 8u) attr[3] = 'A';
+            }
+            os << attr << ' ';
+#else
+            os << std::setw(4) << std::right
+               << FormatMode(e.has_listed_permissions ? e.listed_permissions : e.permissions) << ' ';
+#endif
+        }
+        if (show_owner) {
+            os << std::setw(4) << std::right << e.uid << '/' << std::setw(4) << std::right << e.gid << ' ';
+        }
+        // An entry with no stored mtime leaves the column EMPTY rather than
+        // printing the epoch: the original does that for the entries its own
+        // mtime reader ran short of (quirk 43), and the rest of the row keeps
+        // its usual spacing.
+        if (has_date && e.has_mtime) {
+            os << FormatMtimeStored(e.mtime_unix);
+        }
+        if (options.verbose) {
+            os << std::setw(15) << std::right << FormatGrouped(e.size) << "  " << e.path << '\n';
+        } else {
+            // Measured: the plain listing shortens names over 40 columns to "..."
+            // plus their last 37 characters, like the progress line; -v does not.
+            os << FormatSizeColumn(e.size) << "  " << TruncateName40(e.path) << '\n';
+        }
+
+        total_size += e.size;
+        ++total_files;
+    }
+
+    os << "Total of " << total_files << " files, " << FormatGrouped(total_size) << " bytes.\n";
+    return 0;
+}
+
+// Decode -cd/-cD (nz_lzhd) compressed payload natively using the ported DecLZ
+// decoder.
+//
+// Block format (from strace of nz binary): the archive parser reads each type-0
+// chunk as a unit of exactly chunk.size bytes.  The chunk body is the raw DecLZ
+// bitstream — no Header struct, no payload_size/decr_param prefix.  The
+// stream_tag varint encodes (compressed_bytes << 4) | 0, identical to the
+// type-0 chunk varint.  Multi-file archives have one type-0 chunk per logical
+// block; each chunk is decoded independently and the outputs are concatenated
+// in file-table order.
+static bool TryDecodeLegacyLzhd(
+    const LegacyCnContext& legacy,
+    std::vector<unsigned char>* out_data,
+    std::string* out_error_message,
+    // Hand each data record's output over as soon as the record is decoded,
+    // instead of assembling the whole entry: the original flushes per record (1 MB
+    // multiples, measured), so a record that fails is the one lost either way.
+    // Memory is then one record, not the whole output (`t` of 128 MB: 359 MB ->
+    // see below). `out_data` stays empty; nothing is handed over for a record
+    // that did not finish cleanly.
+    const std::function<void(const unsigned char*, std::size_t)>* stream_out = nullptr) {
+    progress::Scope pscope;
+    if (out_data == nullptr) return false;
+    out_data->clear();
+
+    if (NZ_ENV("NZOPT_TRACE_CD")) {
+        fprintf(stderr, "[LZHD] enter: method=0x%x p0=%u p1=%u total=%llu data=%zu\n",
+                legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1,
+                (unsigned long long)legacy.total_data_size, (size_t)legacy.Payload().size());
+    }
+    if (legacy.legacy_method != 0x2bu ||
+        (legacy.legacy_method_p0 != 3u && legacy.legacy_method_p0 != 4u)) {
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: method/p0 gate\n");
+        return false;
+    }
+    // The payload as a range source: a record at a time out of the archive's
+    // mapping, where it used to be flattened first -- a copy of the whole payload,
+    // made twice over while the flat buffer was built.
+    const ByteView payload = legacy.Payload();
+    if (payload.empty()) {
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: empty data\n");
+        return false;
+    }
+    const ArcPos raw_len = payload.size();
+
+    // Pre-allocate full output with 16-byte zero prefix for safe history reads
+    // (DecLZ reads cur_ptr[-5] etc. from the first byte). Streaming, the output
+    // is one decode unit instead (the ring holds the history; the parallel
+    // container's workers have decoded this way since e97f245): a unit of 1 MB
+    // plus 64 KB of headroom, a chunk's output being at most 32 KB.
+    static constexpr std::size_t kWindowPad = 16u;
+    static constexpr std::size_t kUnit = 0x100000u, kUnitHeadroom = 0x10000u;
+    const std::uint64_t total_out = legacy.total_data_size;
+    const bool streaming = (stream_out != nullptr);
+    std::vector<unsigned char> buf(kWindowPad + (streaming ? std::min<std::uint64_t>(kUnit + kUnitHeadroom, total_out)
+                                                           : total_out), 0u);
+    unsigned char* const window_base = buf.data() + kWindowPad;
+    std::vector<unsigned char> record;   // streaming: the record being decoded
+
+    std::size_t pos = 0u;
+    std::size_t written = 0u;
+    bool ok = true;
+
+    // The LZ window is a single per-archive ring (FUN_08099050, obj+0x978) sized
+    // bytefloat(method_p1 + 1) * 0x10000 -- the same mantissa/exponent byte the
+    // -cc window and the lzpf dictionary capacity already use: xp1 = p1 + 1,
+    // m = xp1 & 0xf, s = xp1 >> 4, if (s) m = (m + 16) << (s - 1). Below p1 = 15
+    // that is just p1 + 1 units, which is why an earlier LINEAR (p1 + 1) reading
+    // fit small files and under-sized large ones, and why the round(total /
+    // 0x10000) rule that replaced it fit every sample it was measured on
+    // (1/3/19/46 units) and still failed the first real file where the two
+    // disagree: p1 = 33 encodes 36 units, round(2322452 / 65536) gives 35, and
+    // the last chunk then began exactly at the ring end and a match reached past
+    // the whole (undersized) ring -- refused with `offset > ring_size`, a clean
+    // decline. GDB on the original for that file: obj+0x978 = 2359296 = 36 units.
+    // Large files split the output into 1 MB streams that reference each other
+    // through this shared ring, so it is allocated ONCE and `ring_pos` threads
+    // across stream iterations.
+    std::uint32_t ring_units = 0u;
+    {
+        const unsigned xp1 = static_cast<unsigned>(legacy.legacy_method_p1) + 1u;
+        unsigned m = xp1 & 0x0fu;
+        const unsigned sh = xp1 >> 4u;
+        if (sh) m = (m + 16u) << (sh - 1u);
+        ring_units = m;
+    }
+    if (ring_units == 0u) ring_units = 1u;
+    const std::uint32_t ring_size = ring_units * 0x10000u;
+    // Sized for the whole archive and zero where nothing has been written yet --
+    // which the linear match copy past the ring end relies on -- but zeroed
+    // without being touched (nz_zeroed.h).
+    nzr::ZeroedBytes ring(ring_size);
+    std::uint32_t ring_pos = 0u;
+
+    // `-cD` (method_p0==4, nz_lzhds) selects the per-context MTF+adaptive-
+    // predictor literal model (nz_lzhds.h) instead of `-cd`'s raw literal copy.
+    // The context table is per-archive persistent state (like `ring`): init
+    // once here, then thread across every stream/chunk in this archive.
+    const bool is_lzhds = (legacy.legacy_method_p0 == 4u);
+
+    // Prefilter sub-chunk state ((nibble & 0xc) == 0xc). ONE object for the whole
+    // archive, matching the real codec object's single instance at obj+0x40: state
+    // persists across adjacent prefilter chunks and every LZ chunk resets it
+    // (both rules measured; see nz_cd_tokens.cpp). -cd configures order01 = 8,
+    // -cD order01 = 32, both nstages = 3 (GDB-measured immediates).
+    nzr::lzpf::PrefilterContext cd_pf_ctx;
+    cd_pf_ctx.Configure(is_lzhds ? 32u : 8u, 3u);
+    nzr::lzpf::LmsObject cd_pf_lms1{}, cd_pf_lms2{};
+    cd_pf_lms1.Init();
+    cd_pf_lms2.Init();
+    // Image model for the 0xf sub-chunk (FUN_080a9ca0 on obj+0xe1f0): one per
+    // archive, never reset. -cd and -cD share the profile (GDB: flags 0x02,
+    // all five planes order 16).
+    nzr::audio::NzImageModel cd_img;
+    cd_img.Configure(0x02u, 16u, 16u, true);
+
+    std::vector<std::uint8_t> lzhds_ctx;
+    std::uint32_t lzhds_ctx_index = 0u;
+    std::uint8_t* lzhds_ctx_ptr = nullptr;
+    if (is_lzhds) {
+        lzhds_ctx.assign(nzr::cd::kLzhdsCtxTableSize, 0u);
+        nzr::cd::NzLzhdsInitCtxTable(lzhds_ctx.data());
+        lzhds_ctx_ptr = lzhds_ctx.data();
+    }
+
+    // Each type-0 chunk is one stream: stream_tag varint followed by
+    // stream_bytes bytes of raw DecLZ compressed data.
+    nzr::cd::NzCdExeFilterReset();
+    while (pos < raw_len && written < total_out) {
+        // Read stream_tag (ParseChunk-style biased varint).
+        std::uint64_t stream_tag = 0u;
+        {
+            unsigned shift = 7u;
+            unsigned char c = payload[pos++];
+            stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+            while ((c & 0x80u) != 0u) {
+                if (pos >= raw_len || shift >= 63u) {
+                    ok = false; break;
+                }
+                c = payload[pos++];
+                stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+                shift += 7u;
+            }
+            if (!ok) break;
+        }
+        if ((stream_tag & 0x0fu) != 0u) { ok = false; break; }
+        std::uint64_t stream_bytes = stream_tag >> 4u;
+        if (stream_bytes == 0u) { ok = false; break; }
+        bool cut_stream = false;
+        if (stream_bytes > raw_len - pos) {
+            if (!legacy.truncated_input) { ok = false; break; }
+            stream_bytes = raw_len - pos;   // the cut-off last record: decode what exists, as the original does
+            cut_stream = true;
+        }
+
+        const std::size_t block_off = static_cast<std::size_t>(pos);
+        const std::uint8_t* block_in  = payload.Span(pos, stream_bytes);
+        const std::uint32_t block_in_size = static_cast<std::uint32_t>(stream_bytes);
+        if (block_in == nullptr) { ok = false; break; }
+        pos += static_cast<std::size_t>(stream_bytes);
+
+        // Native -cd LZ block decode (NzCdDecodeBlock): loops the block's 32 KB
+        // chunks into the contiguous output. Handles pure-LZ -cd (recon output ==
+        // file). Blocks whose chunks carry a tt08/param14/CM/BWT post-filter
+        // produce fewer bytes here; the size-mismatch check below rejects them so
+        // they decline until those stages are wired.
+        // CLAMPED, not narrowed. This is the same 4 GB wrap the optimum/-cc
+        // post-filters had (OptimumRemainingOut), but UNEXERCISED and probably
+        // unreachable: restoring the narrowing and decoding a 4.5 GB -cd entry
+        // changes nothing, because an archive that large is a parallel container
+        // and takes the per-slice path below, where the cap is a slice's and
+        // never approaches 2^32. Reaching this line with a >4 GB entry would need
+        // one in a SINGLE container, which only exist under 8 MB. Fixed because
+        // the arithmetic is wrong either way, not because a failure was seen.
+        const std::uint64_t block_left = static_cast<std::uint64_t>(total_out) - static_cast<std::uint64_t>(written);
+        const std::uint32_t block_cap = block_left > 0xffffffffull ? 0xffffffffu
+                                                                  : static_cast<std::uint32_t>(block_left);
+        std::uint32_t produced = 0u;
+        if (!streaming) {
+            produced = nzr::cd::NzCdDecodeStream(
+                block_in, block_in_size, window_base + written, block_cap,
+                ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written),
+                is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
+                &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img);
+        } else {
+            // The record in units, each stopping softly at 1 MB: the ring, the -cD
+            // context table and the prefilter/LMS/image state persist across the
+            // calls, so N unit calls are byte for byte the one call above. A unit
+            // that stops unclean ends the record the way the one call would have
+            // (NzCdLastStreamClean reads that unit's verdict).
+            record.clear();
+            std::size_t in_off = 0u;
+            while (in_off < block_in_size && record.size() < block_cap) {
+                const std::uint64_t room = std::min<std::uint64_t>(kUnit + kUnitHeadroom, block_cap - record.size());
+                const std::uint32_t cap = static_cast<std::uint32_t>(room);
+                const std::uint32_t soft = room > kUnitHeadroom ? static_cast<std::uint32_t>(room - kUnitHeadroom) : cap;
+                std::size_t consumed = 0u;
+                const std::uint32_t n = nzr::cd::NzCdDecodeStream(
+                    block_in + in_off, block_in_size - in_off, window_base, cap,
+                    ring.data(), ring_size, &ring_pos, static_cast<std::uint32_t>(written + record.size()),
+                    is_lzhds, lzhds_ctx_ptr, &lzhds_ctx_index,
+                    &cd_pf_ctx, &cd_pf_lms1, &cd_pf_lms2, &cd_img, soft, &consumed);
+                if (n == 0u) break;             // nothing more: the checks below judge the record
+                record.insert(record.end(), window_base, window_base + n);
+                if (!nzr::cd::NzCdLastStreamClean() || consumed == 0u) break;
+                in_off += consumed;
+            }
+            produced = static_cast<std::uint32_t>(record.size());
+        }
+        if (NZ_ENV("NZOPT_TRACE_CD")) {
+            fprintf(stderr, "[LZHD] stream: in=%u cap=%u produced=%u written=%zu/%zu\n",
+                    block_in_size, block_cap, produced, written + produced, (size_t)total_out);
+        }
+        if (produced == 0u) { nzr::derr::SetAt(16u, block_off); ok = false; break; }   // header read past the stream end: -0x10
+        if (!nzr::cd::NzCdLastStreamClean()) {
+            // A chunk that failed inside a cut-off stream: nz_lzhd's header reader
+            // runs out of input first (-0x10) whatever the chunk decoder noticed.
+            // (nz_lzhds behaves differently there -- it reaches its reconstruct
+            // assertion on the garbage -- and is not modelled.)
+            if (cut_stream && !is_lzhds) { nzr::derr::Clear(); nzr::derr::SetAt(16u, block_off); }
+            else nzr::derr::SetAt(5u, block_off);
+            // The stream stopped on a malformed chunk: the original reports the
+            // error here (code 5) and has flushed only the streams before it.
+            if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] stream stopped short: produced=%u written=%zu\n", produced, written);
+            ok = false; break;
+        }
+        if (streaming) (*stream_out)(record.data(), record.size());
+        written += produced;
+        progress::Add(produced);
+    }
+
+    // The original flushes its output per stream (measured: 1 MB multiples on a
+    // 6 MB file), so on a failure only the streams completed before the failing
+    // one count as written: a stream that produced nothing left `written` at the
+    // boundary already; one that stopped short is dropped below.
+    if (!ok) {
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: malformed block stream (written=%zu/%zu)\n", written, (size_t)total_out);
+        if (out_error_message) *out_error_message = "lzhd: malformed block stream";
+        if (!streaming) out_data->assign(window_base, window_base + std::min<std::uint64_t>(written, total_out));
+        return false;
+    }
+    if (const char* dp = streaming ? nullptr : NZ_ENV("NZOPT_DUMP_PRECHECK")) {
+        // Dump before BOTH the size check and the checksum gate, so a short
+        // decode is diffable too (its prefix is still meaningful) -- not just a
+        // full-size wrong-bytes one.
+        FILE* f = fopen(dp, "wb");
+        if (f) { fwrite(window_base, 1, written, f); fclose(f); }
+        fprintf(stderr, "[LZHD] dumped %zu of %zu bytes to %s\n", written, (size_t)total_out, dp);
+    }
+    if (written != total_out) {
+        if (NZ_ENV("NZOPT_TRACE_CD")) fprintf(stderr, "[LZHD] reject: size mismatch written=%zu total=%zu\n", written, (size_t)total_out);
+        // Every stream decoded cleanly yet the output is short: the original has
+        // flushed all of it (the last file cut short) and reports "Archive
+        // corrupted. Unexpected end of file." instead of an error code.
+        if (out_error_message) *out_error_message = "lzhd: unexpected end of file";
+        if (!streaming) out_data->assign(window_base, window_base + std::min<std::uint64_t>(written, total_out));
+        return false;
+    }
+    if (streaming) { pscope.Commit(); return true; }   // the sink judges each entry's checksum
+    // Verify the decoded output against the archive's stored per-file checksum(s).
+    // The native -cd ring model is byte-exact for the common case but has a residual
+    // edge (multi-stream ring wrap under heavy repetition). Rejecting a checksum
+    // mismatch here makes the caller decline, so the user still
+    // gets byte-exact output (no silent corruption, no double-decode of correct
+    // files), and turns NZ_NO_BRIDGE native-only into a provable correctness signal.
+    // Skipped only when the archive carries no usable checksum.
+    if (legacy.checksum_verification_supported &&
+        legacy.checksum_mode != ChecksumMode::kNone &&
+        !legacy.entries.empty()) {
+        std::size_t cursor = 0;
+        for (const LegacyCnEntry& e : legacy.entries) {
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            if (cursor + n > total_out) break;
+            if (e.has_checksum) {
+                const std::uint32_t got =
+                    ComputeBufferChecksum(legacy.checksum_mode, window_base + cursor, n);
+                (void)got;   // verdict recorded by the caller (CheckEntries); a
+                             // mismatch marks the entry, it no longer voids the decode
+            }
+            cursor += n;
+        }
+    }
+    // Hand the window over instead of copying it: a second buffer the size of
+    // the whole output, allocated and written only to be read once, cost a full
+    // pass of page faults. The pad in front goes with an in-place move.
+    buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(kWindowPad));
+    buf.resize(static_cast<std::size_t>(total_out));
+    out_data->swap(buf);
+    pscope.Commit();
+    return true;
+}
+
+// How much output this entry still owes, computed in 64 bits. Three post-filter
+// sites bounded their expansion by `(uint32)total_size_hint - (uint32)produced`,
+// and that subtraction wraps as soon as an entry is larger than 4 GB -- worse,
+// the wrapped value can come out SMALLER than the block about to be expanded.
+// The block-RLE refuses a capacity under its own input, so a sound 4 823 005 184
+// byte -cO archive was reported `Archive corrupted. Error decoding (code 100)`
+// at output 520 093 696, the first block past the wrap. (The reporter's file;
+// the original decodes it whole.) Clamped to 32 bits because every transform
+// below takes a uint32 capacity.
+//
+// The clamp leaves a megabyte of headroom under 2^32, NOT the full range: the
+// text-transform steps below size their buffers as `remaining + 16` and
+// `remaining + 65536`, and a `remaining` of 0xffffffff turned those sums into
+// 15 and 65535 -- a 15-byte buffer handed to a dictionary transform that writes
+// 16-byte words and ignores its cap. Heap corruption, then a crash in free(),
+// on the -cc archive of a 4.5 GB entry (found under ASan the same day the clamp
+// went in). With the headroom no sum on this value can wrap.
+static std::uint32_t OptimumRemainingOut(std::uint64_t total, std::uint64_t produced) {
+    const std::uint64_t p = produced;
+    const std::uint64_t r = (total > p) ? (total - p) : 0u;
+    constexpr std::uint64_t kCeiling = 0xffffffffull - (1ull << 20);
+    return r > kCeiling ? static_cast<std::uint32_t>(kCeiling) : static_cast<std::uint32_t>(r);
+}
+
+// The whole remaining is the CORRECT bound for one block's expansion and a
+// multi-gigabyte allocation per block on a large entry, when every block but the
+// last needs a small fraction of it. Start from a generous multiple of the block
+// and quadruple on demand: a block that really does expand that far ends at
+// exactly the same capacity, one that does not never allocates it.
+static std::uint32_t OptimumExpandStart(std::uint32_t in_size, std::uint32_t limit) {
+    std::uint64_t want = static_cast<std::uint64_t>(in_size) * 2u + 0x10000u;
+    if (want < 0x100000u) want = 0x100000u;
+    return want >= limit ? limit : static_cast<std::uint32_t>(want);
+}
+static std::uint32_t OptimumExpandGrow(std::uint32_t cap, std::uint32_t limit) {
+    const std::uint64_t n = static_cast<std::uint64_t>(cap) * 4u;
+    return n >= limit ? limit : static_cast<std::uint32_t>(n);
+}
+
+// Decode -cc (nz_cm) compressed payload natively using the ported CM decoder.
+// Parses the stream_tag varint + one or more per-block headers (payload_size,
+// decr_param, param6, size18, staged_checksum_count, param2..dece_param) that
+// immediately follow it, and feeds each block to CM_Decode.
+static bool TryDecodeLegacyCm(
+    const LegacyCnContext& legacy,
+    // Count-and-sink or buffer, like the optimum family: a -cc entry's output
+    // can be gigabytes, and holding it here (and then again in the context, and
+    // again in the extractor) is what made a 4.5 GB one cost 13 GB where the
+    // original uses 554 MB.
+    OptimumOut* out_data,
+    std::string* out_error_message) {
+    progress::Scope pscope;
+    if (out_data == nullptr) return false;
+    out_data->Clear();
+
+    if (legacy.legacy_method != 0x4bu || legacy.legacy_method_p0 != 7u) return false;
+    const ByteBuffer& payload_flat = legacy.PayloadFlat();
+    if (payload_flat.empty()) return false;
+
+    const auto* raw = payload_flat.data();
+    const std::size_t raw_len = payload_flat.size();
+
+    // Create the CM decoder once; its state persists across all data chunks.
+    NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
+    // One audio predictor for the whole entry, matching the reference's single
+    // global. Reset rules are applied per block below.
+    nzr::audio::NzAudioPred aud;
+    // Inter-channel stage selector, from the decoder object's flag byte in the
+    // real binary (GDB-read at FUN_080a5330's entry): -cO 0x03, -cc 0x0f,
+    // -co 0x13. Only bit 4 is consulted; see NzAudioPred::SetContextFlags.
+    aud.SetContextFlags(0x0fu);      // -cc
+    aud.SetPlaneOrders(384u, 16u, 8u);
+    aud.SetStereoParam(16u);
+    // The image model (decr_param 3), one per entry; its state is never reset.
+    // Profile GDB-read at FUN_080a90c0's entry for -cc (see nz_audio.h).
+    nzr::audio::NzImageModel img;
+    img.Configure(0x0fu, 32u, 48u, false);
+    // One exe filter for the whole entry. Its recent-target caches and base
+    // persist across a RUN of consecutive dece blocks and reset as soon as a
+    // block without dece intervenes -- see nz_exefilter.h. The reference's
+    // per-block temporary is wrong on 22 of 88 real dece archives.
+    NzExeFilter exe;
+    if (!cm) {
+        if (out_error_message) *out_error_message = "cm: allocation failed";
+        return false;
+    }
+    // One work budget for the whole entry, generous against what a valid stream
+    // needs (8 bit decodes per output byte) and bounded by the DECLARED output
+    // rather than by the chunk count a corrupt header can invent.
+    NzCmSetBitBudget(cm, static_cast<std::uint64_t>(legacy.total_data_size) * 16u +
+                             (1u << 20));
+    // The encoder-direction mirror for NZCC_RECODE (owned here, freed with cm).
+    NzCmDecoder* cm_mirror = nullptr;
+    if (NZ_ENV("NZCC_RECODE") != nullptr)
+        cm_mirror = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
+    out_data->Reserve(legacy.total_data_size);
+    bool ok = true;
+    std::size_t pos = 0;
+
+    // Set when a type-5/6/7 checksum record turns up mid-stream rather than in the
+    // front metadata run (see the chunk_type != 0 branch below).
+    std::uint32_t inline_checksum = 0;
+    bool inline_checksum_seen = false;
+
+    // Outer loop over consecutive type-0 data chunks. Large -cc archives split the
+    // payload into multiple chunks; the CM state carries across them (a block with
+    // decr_param != 1 does not reset). Each chunk header is a biased varint
+    // (size<<4)|type; non-type-0 chunks (metadata) between data chunks are skipped.
+    // 64-bit compare: on a 32-bit build the cast turned a 4 823 005 184-byte
+    // total into 528 037 888, so the loop stopped a tenth of the way in and the
+    // size gate below then called a complete archive corrupt -- the same wrap
+    // the optimum family's segment loop had.
+    while (ok && pos < raw_len &&
+           static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
+        std::uint64_t stream_tag = 0;
+        {
+            unsigned shift = 7;
+            unsigned char c = raw[pos++];
+            stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+            while ((c & 0x80u) != 0u) {
+                if (pos >= raw_len || shift >= 63u) { ok = false; break; }
+                c = raw[pos++];
+                stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+                shift += 7u;
+            }
+        }
+        if (!ok) break;
+        std::uint32_t chunk_type = static_cast<std::uint32_t>(stream_tag & 0x0fu);
+        std::uint64_t chunk_size = stream_tag >> 4u;
+        if (chunk_type == 15u) {  // extended stream-id form
+            if (pos >= raw_len) { ok = false; break; }
+            unsigned r = raw[pos++];
+            if (r >= 0xf8u) {
+                if (pos >= raw_len) { ok = false; break; }
+                r = (r & 7u) + 8u * raw[pos++] + 248u;
+            }
+            chunk_type = r & 0x0fu;
+            if ((r >> 4) == 0u) chunk_type += 15u;
+        }
+        if (chunk_size > raw_len - pos) {
+            if (!legacy.truncated_input) { ok = false; break; }
+            chunk_size = static_cast<std::uint32_t>(raw_len - pos);   // cut-off last record (see the parser)
+        }
+        if (chunk_type != 0u) {
+            // Metadata chunk between data chunks. One of these can be the entry's
+            // CHECKSUM: it is a type-5 record, and it does NOT have to sit in the
+            // contiguous metadata run at the front of the archive. A large -cc
+            // archive emits an EMPTY type-5 placeholder up front and the real
+            // 4-byte one after its first data chunk, which the front-of-archive
+            // tag scan in TryParseLegacyCnArchive cannot see -- so the entry came
+            // out with has_checksum == false and the gate below declined a decode
+            // that was in fact byte-exact. Pick it up here instead.
+            if ((chunk_type == 5u || chunk_type == 6u || chunk_type == 7u) &&
+                !inline_checksum_seen) {
+                if (chunk_size == 4u) {
+                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
+                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u) |
+                                      (static_cast<std::uint32_t>(raw[pos + 2]) << 16u) |
+                                      (static_cast<std::uint32_t>(raw[pos + 3]) << 24u);
+                    inline_checksum_seen = true;
+                } else if (chunk_size == 2u) {
+                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
+                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u);
+                    inline_checksum_seen = true;
+                }
+                if (inline_checksum_seen && NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDCC] inline type-%u checksum record: 0x%08x\n",
+                            chunk_type, inline_checksum);
+                }
+            }
+            pos += static_cast<std::size_t>(chunk_size);
+            continue;
+        }
+        const std::size_t stream_end = pos + static_cast<std::size_t>(chunk_size);
+
+        while (pos < stream_end) {
+        if (pos + 4u > stream_end) { ok = false; break; }
+        const std::uint32_t payload_size =
+            static_cast<std::uint32_t>(raw[pos]) |
+            (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+            (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+            (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+        pos += 4u;
+        if (payload_size > stream_end - pos) { ok = false; break; }
+        const std::uint8_t* payload = raw + pos;
+        pos += payload_size;
+        if (pos > legacy.pad_from) { ok = false; break; }   // payload cut: the short end (see t_opt_pad_from)
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t decr_param = raw[pos++];
+
+        // decr_param 2 (audio) and 3 both use the TRUNCATED header that stops
+        // right after size18 -- no staged-checksum count and none of the
+        // param2/param1/param16/tt/dece fields (reference Header::Parse
+        // early-returns for both). Reading them with the ordinary layout takes
+        // mode2_type for param6 and then walks into the following record.
+        if (decr_param == 2u || decr_param == 3u) {
+            nz_trace::Construct("audio_image_block decr=%u", decr_param);
+            std::uint8_t mode2_type = 0;
+            if (decr_param == 2u) {
+                if (pos >= stream_end) { ok = false; break; }
+                mode2_type = raw[pos++];
+            }
+            if (pos + 4u > stream_end) { ok = false; break; }
+            const std::uint32_t alt_out_size =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
+                        payload_size, decr_param, mode2_type, alt_out_size, pos, stream_end);
+            }
+            if (alt_out_size > OptimumRemainingOut(legacy.total_data_size, out_data->size())) { ok = false; break; }
+
+            if (decr_param == 2u) {
+                if (alt_out_size == 0u) continue;
+                // An audio block resets the predictor only when mode2_type is set.
+                if (const char* adp = NZ_ENV("NZOPT_DUMP_AUDIO")) {
+                    FILE* f = fopen(adp, "wb");
+                    if (f) { fwrite(payload, 1, payload_size, f); fclose(f); }
+                    fprintf(stderr, "[TDCC] dumped audio payload (%u bytes, out_size=%u) to %s\n",
+                            payload_size, alt_out_size, adp);
+                }
+                if (mode2_type) aud.Reset();
+                img.Reset();   // every non-image block resets the image object (GDB, FUN_080b6170)
+                std::vector<std::uint8_t> abuf(alt_out_size);
+                const bool aok = aud.Decode(payload, payload_size, abuf.data(), alt_out_size);
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDCC] audio Decode(payload_size=%u out_size=%u) -> %d\n",
+                            payload_size, alt_out_size, aok ? 1 : 0);
+                }
+                if (!aok) { nzr::derr::SetAt(16u, pos); ok = false; break; }
+                // NOTE: the reference does not feed audio output through the CM
+                // model. Our stored-block path does feed it (an empirically
+                // established deviation -- see the long comment below), so if a
+                // decr_param==0 CM block ever turns up after an audio block and
+                // decodes wrong, this is the first place to look.
+                out_data->Append(abuf.data(), abuf.size());
+                progress::Add(abuf.size());
+                continue;
+            }
+
+            // decr_param == 3: an IMAGE block. The real dispatcher's mode-3 branch
+            // runs FUN_080a9ca0 on its own image object -- not the CM model (the
+            // community reference decodes it as CM-without-reset, which is why every
+            // BMP failed its checksum). Nothing feeds the CM model here.
+            aud.Reset();
+            if (alt_out_size == 0u) continue;
+            std::vector<std::uint8_t> work3(alt_out_size);
+            const std::size_t iused = img.Decode(payload, payload_size, work3.data(), alt_out_size);
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
+                        payload_size, alt_out_size, iused);
+            }
+            if (iused == 0u) { nzr::derr::SetAt(2u, pos); ok = false; break; }
+            out_data->Append(work3.data(), work3.size());
+            progress::Add(work3.size());
+            continue;
+        }
+        // Every non-audio block resets the audio predictor; every LZ block resets
+        // the image object too (FUN_080b6170; image -> LZ -> image decoded the second
+        // image from the first one's rings without it).
+        aud.Reset();
+        img.Reset();
+
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param6 = raw[pos++];
+
+        std::uint32_t out_size = 0;
+        if (param6) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            out_size =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+        }
+
+        // Skip staged checksums.
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t staged_count = raw[pos++];
+        if (pos + staged_count > stream_end) { ok = false; break; }
+        const std::vector<std::uint8_t> staged(raw + pos, raw + pos + staged_count);
+        pos += staged_count;
+        // Per-stage check bytes, verified as in DecodeOptimumBlockSequence.
+        static const bool trace_stg = (NZ_ENV("NZOPT_TRACE_STG") != nullptr);
+        std::string stg;
+        std::size_t stage_idx = 0;
+        bool stage_bad = false;
+        std::uint32_t stage_bad_code = 100u;
+        // The original checks each stage the moment it is computed and stops
+        // there; ours defers the verdict to the block end (the LIFO index needs
+        // the stage count). So when a sub-decoder fails on a block whose earlier
+        // stage already mismatched, the original had reported THAT stage first.
+        const auto fail_code = [&](std::uint32_t own) { return stage_bad ? stage_bad_code : own; };
+        const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
+            const unsigned got = StageCheck255(p, n);
+            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got && !stage_bad) {
+                stage_bad = true; stage_bad_code = nzr::derr::StageCode(nm);
+            }
+            ++stage_idx;
+            if (!trace_stg) return;
+            char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
+        };
+        const auto stg_report = [&]() {
+            if (!trace_stg) return;
+            std::string hx; char b[8];
+            for (std::uint8_t v : staged) { snprintf(b, sizeof(b), "%02x", v); hx += b; }
+            fprintf(stderr, "[STG] cc block decr=%u param6=%u staged=[%s]%s verify=%s\n", decr_param, param6, hx.c_str(), stg.c_str(),
+                    stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
+        };
+
+        // Read param2 flag + vector.
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param2_flag = raw[pos++];
+        std::vector<std::uint8_t> param2_data;
+        if (param2_flag) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            param2_data.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
+        }
+        // Read param1 flag + vector.
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t param1_flag = raw[pos++];
+        std::vector<std::uint8_t> param1_data;
+        if (param1_flag) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            param1_data.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
+        }
+        // Skip param16.
+        if (pos + 1u > stream_end) { ok = false; break; }
+        pos++;
+        // Read texttransformer_enabled.
+        if (pos >= stream_end) { ok = false; break; }
+        const std::uint8_t tt_enabled = raw[pos++];
+        std::uint8_t tt_flags = 0;
+        std::vector<std::uint8_t> tt2_data, tt16_data;
+        if (tt_enabled) {
+            if (pos >= stream_end) { ok = false; break; }
+            tt_flags = raw[pos++];
+            // Header.Parse order: tt2_data (if &2) then tt16_data (if &16).
+            auto read_varint_str = [&](std::vector<std::uint8_t>& dst) -> bool {
+                if (pos >= stream_end) return false;
+                std::uint32_t n = 0, sh = 0;
+                unsigned char vc;
+                do {
+                    if (pos >= stream_end) return false;
+                    vc = raw[pos++];
+                    n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh;
+                    sh += 7u;
+                } while (vc & 0x80u);
+                if (pos + n > stream_end) return false;
+                dst.assign(raw + pos, raw + pos + n);
+                pos += n;
+                return true;
+            };
+            if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { ok = false; break; }
+            if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { ok = false; break; }
+        }
+        // Read dece_param + its side stream.
+        if (pos >= stream_end) { ok = false; break; }
+        std::vector<std::uint8_t> dece_data;
+        const std::uint8_t dece_param = raw[pos++];
+        if (dece_param) {
+            if (pos + 4u > stream_end) { ok = false; break; }
+            std::uint32_t vlen =
+                static_cast<std::uint32_t>(raw[pos]) |
+                (static_cast<std::uint32_t>(raw[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(raw[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(raw[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { ok = false; break; }
+            dece_data.assign(raw + pos, raw + pos + vlen);
+            pos += vlen;
+        }
+
+        // param6 == 0 marks a STORED block: the CM could not compress (e.g. high-
+        // entropy / incompressible data), so the payload bytes are the raw output
+        // verbatim. (The reference decoder rejects these with param6 != 1; the
+        // linux32 binary stores them.)
+        //
+        // The CM model observes every byte of the decompressed *output* stream in
+        // position order, not just the bytes it actually entropy-codes: its rolling
+        // byte-history window/hash context (used for LZP-style match prediction)
+        // must stay in sync with the true output position even across a stored
+        // span, or a later decr_param==0 ("don't reset") CM block will decode
+        // correctly for a while (its bit-level predictions are still individually
+        // plausible) and then desync once the stale context finally drives a wrong
+        // decision -- confirmed via a differential trace against an independently
+        // built copy of the reference NZ_CM.cpp: feeding the stored bytes through
+        // CM_Input_Bit (no entropy coding, model-update only) between two CM_Decode
+        // calls made the second block's output round-trip byte-exact through
+        // param2, where omitting the feed produced the same corruption this port
+        // was producing. Feed the model here so any subsequent CM block sees the
+        // context an unbroken pass over the file would have produced.
+        // param6 == 0 marks a STORED block (the CM could not compress) -- the payload
+        // is the block output BEFORE the post-filters, which still run: an .ape file
+        // under -cc came out as stored blocks with a param1 (AddBytes) delta filter,
+        // and skipping straight to the output left 6 MB of wrong bytes. The CM model
+        // must still observe every byte (see the comment on NzCmFeedByte below).
+        std::vector<std::uint8_t> work;
+        std::uint32_t cur_size = 0;
+        if (!param6 || out_size == 0u) {
+            nz_trace::Construct("cc_stored decr=%u p2=%u p1=%u tt=0x%02x dece=%u", decr_param, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param);
+            for (std::uint32_t i = 0; i < payload_size; ++i) {
+                NzCmFeedByte(cm, payload[i]);
+            }
+            if (cm_mirror) for (std::uint32_t i = 0; i < payload_size; ++i) NzCmFeedByte(cm_mirror, payload[i]);
+            work.assign(payload, payload + payload_size);
+            cur_size = payload_size;
+            stgmark("payload", payload, payload_size);
+        } else {
+            if (decr_param == 1u) NzCmReset(cm);
+            work.resize(out_size);
+            NzCmDecode(cm, payload, payload_size, work.data(), out_size);
+            cur_size = out_size;
+            stgmark("payload", payload, payload_size);
+            stgmark("cm", work.data(), cur_size);
+            // NZCC_RECODE=1: a second model walking the same blocks in the encoder's
+            // direction. It has seen exactly what the decoder's has, so coding this
+            // block's own output must reproduce the payload byte for byte.
+            if (cm_mirror) {
+                if (decr_param == 1u) NzCmReset(cm_mirror);
+                std::vector<std::uint8_t> again;
+                NzCmEncode(cm_mirror, work.data(), cur_size, &again);
+                std::size_t fd = 0;
+                while (fd < again.size() && fd < payload_size && again[fd] == payload[fd]) ++fd;
+                const bool same = (again.size() == payload_size) && fd == payload_size;
+                std::fprintf(stderr, "[RECODECC] out=%u in_len=%u recoded=%zu -> %s",
+                             cur_size, payload_size, again.size(), same ? "IDENTICAL" : "DIFF");
+                if (!same) std::fprintf(stderr, " first diff at %zu", fd);
+                std::fprintf(stderr, "\n");
+            }
+        }
+
+        const std::uint64_t prev_size = out_data->size();
+        const std::uint32_t remaining = OptimumRemainingOut(legacy.total_data_size, prev_size);
+
+        nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u);
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDCC] pre-filters: decr_param=%u param6=%u param2_flag=%u param1_flag=%u "
+                            "tt_enabled=%u tt_flags=%u out_size=%u pos=%zu stream_end=%zu\n",
+                    decr_param, param6, param2_flag, param1_flag, tt_enabled, tt_flags, out_size, pos, stream_end);
+        }
+        // param2: u32-wise RLE expansion driven by the param2 side stream.
+        if (param2_flag) {
+            std::uint32_t cap2 = OptimumExpandStart(cur_size, remaining);
+            if (NZ_ENV("NZ_TRACE_BIGALLOC") && cap2 >= (64u << 20))
+                std::fprintf(stderr, "[big] param2 expand start %u (remaining %u)\n", cap2, remaining);
+            std::vector<std::uint8_t> exp;
+            std::uint32_t esz = 0;
+            bool p2ok = false;
+            for (;;) {
+                exp.assign(cap2, 0);
+                esz = cap2;
+                p2ok = NzBwtRleDecodeU32(param2_data.data(),
+                                         static_cast<std::uint32_t>(param2_data.size()),
+                                         work.data(), cur_size, exp.data(), &esz);
+                if (p2ok || cap2 == remaining) break;
+                cap2 = OptimumExpandGrow(cap2, remaining);
+            }
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] param2: data.size=%zu cur_size=%u -> ok=%d esz=%u\n",
+                        param2_data.size(), cur_size, p2ok ? 1 : 0, esz);
+            }
+            if (!p2ok || esz == 0u) { ok = false; break; }
+            exp.resize(esz);
+            work.swap(exp);
+            cur_size = esz;
+            stgmark("p2", work.data(), cur_size);
+        }
+
+        // param1: AddBytesFilter (delta filter, output size == input size).
+        if (param1_flag) {
+            std::vector<std::uint8_t> tbuf(cur_size);
+            const bool p1ok = NzAddBytesFilter(param1_data.data(),
+                                  static_cast<std::uint32_t>(param1_data.size()),
+                                  work.data(), cur_size, tbuf.data());
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] param1: data.size=%zu cur_size=%u -> ok=%d\n",
+                        param1_data.size(), cur_size, p1ok ? 1 : 0);
+            }
+            if (!p1ok) { ok = false; break; }
+            work.swap(tbuf);
+            stgmark("p1", work.data(), cur_size);
+            // cur_size unchanged
+        }
+
+        // Text transforms, applied in reference order: 0x10 (number transform),
+        // then 0x08 (dictionary), then 0x02 (insert-LF). Other bits
+        // Every bit but 0x80 (param14 text transform) is ported; 0x80 declines
+        // (never seen on a -cc/-co/-cO block in any corpus so far).
+        // The text-transform chain's INPUT, before any stage runs. With an
+        // unported bit set this is the only way to get an (input, output) pair
+        // for that stage: the golden file is the chain's OUTPUT and every other
+        // stage in the chain is already ported and invertible.
+        if (tt_enabled) {
+            if (const char* tp = NZ_ENV("NZOPT_DUMP_TTIN")) {
+                FILE* f = fopen(tp, "wb");
+                if (f) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
+                fprintf(stderr, "[TT] chain input: %u bytes, tt_flags=0x%02x -> %s\n",
+                        cur_size, tt_flags, tp);
+            }
+        }
+        // The text-transform dispatcher FUN_080a3c90 knows one more bit than the
+        // seven below: 0x80 = param14 (FUN_080a0ff0). The CM family requests
+        // param14 through its OWN block-header flag instead (the p14 field this
+        // block already applies), and over 9 255 CM-family blocks of the 3037-file
+        // sweep tt never had bit 0x80 set (the largest value seen is 0x43) while
+        // p14 was set 1 272 times. So this decline covers a bit the encoder
+        // expresses elsewhere, not a gap in the port.
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { ok = false; break; }
+        // Text-transform scratch, the same shape the optimum family uses (see
+        // the tt_scratch there): `remaining` -- the whole rest of the ENTRY's
+        // output -- is a correct cap and a ruinous allocation. On a 4.5 GB -cc
+        // entry the first block of every stage took gigabytes of zero-filled
+        // scratch, which is most of what kept this at 13 GB where the original
+        // holds 554 MB. Start block-proportional and fall back to the full cap
+        // only when the transform says it did not fit; a transform returns 0
+        // both for bad data and for no room, so no valid block can be lost.
+        // `slack`: bytes past `cap` the transform may write beyond its logical
+        // output (the dictionary's fixed-width words, CR/CRLF's one extra byte).
+        const auto cm_tt_scratch = [&](std::vector<std::uint8_t>* buf,
+                                       const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run,
+                                       std::uint32_t slack = 0u)
+                                   -> std::uint32_t {
+            std::uint64_t want = static_cast<std::uint64_t>(cur_size) * 2u + 0x10000u;
+            if (want > remaining) want = remaining;
+            std::uint32_t cap = static_cast<std::uint32_t>(want);
+            buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
+            std::uint32_t n = run(buf->data(), cap);
+            if (n == 0u && cap < remaining) {
+                cap = remaining;
+                buf->assign(static_cast<std::size_t>(cap) + slack, 0u);
+                n = run(buf->data(), cap);
+            }
+            return n;
+        };
+        if (tt_enabled && (tt_flags & 0x10u)) {
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformNumber(
+                    tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
+                    work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x08u)) {
+            // word-dict encoded; expand with dictionary transform.
+            //
+            // NzTextTransformDict's CopyDictEntWithCase (like the reference
+            // TransformText_1_Dictionary it's ported from) writes a fixed
+            // 8 or 16 bytes per multi-byte dict word starting at the word's
+            // logical output position, even when the word itself is shorter
+            // -- the reference relies on caller-provided output slack to
+            // absorb that intentional over-write (bytes beyond the word's
+            // true length get overwritten by the next characters anyway).
+            // Found live via ASan while validating tt_flags&0x02 real-archive
+            // fixtures: a short (~3-byte) final dict word landing at the
+            // exact tail of a tight `remaining`-sized buffer over-wrote past
+            // the vector's allocation, corrupting the heap allocator
+            // (glibc "double free or corruption" on free). +16 bytes of
+            // slack is more than the max possible per-word overshoot (7
+            // bytes) and costs nothing since the buffer is resized down
+            // immediately after.
+            // Sized like the other transforms (small first, the whole remaining
+            // output only on a retry): a buffer of `remaining` per block was
+            // 126 MB, zero-filled, for the first block of a 128 MB entry, and
+            // two of them at a time (this and CR/CRLF) put -cc's decode at 866 MB
+            // against the original's 448.
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t expanded = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformDict(work.data(), cur_size, o, cap + 16u);
+            }, 16u);
+            if (expanded == 0 || expanded > remaining) { ok = false; break; }
+            tbuf.resize(expanded);
+            work.swap(tbuf);
+            cur_size = expanded;
+        }
+        if (tt_enabled && (tt_flags & 0x04u)) {
+            // HTML closing-tag restoration (NzTextTransformHtml). Reference
+            // order puts 0x04 after the 0x08 dictionary and before 0x02.
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformHtml(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x02u)) {
+            // Insert-LF transform (NzTextTransformInsertLf, ported from
+            // TransformText_3_InsertLF). Byte-count-preserving pure byte
+            // post-filter driven by the tt2_data side stream.
+            // Byte-count-PRESERVING (see nz_text_transform.h, and its own
+            // `allocated < in_size` guard): the output is exactly cur_size, so
+            // sizing this from `remaining` -- the whole rest of the stream's
+            // output -- allocated 258 MB per block on a 281 MB worker stream,
+            // sixteen workers at once. The other text stages were moved off
+            // `remaining` in ef6468b; this one and dece below were missed.
+            std::vector<std::uint8_t> tbuf(cur_size);
+            const std::uint32_t n = NzTextTransformInsertLf(
+                tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
+                work.data(), cur_size, tbuf.data(), cur_size);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+
+        if (tt_enabled && (tt_flags & 0x20u)) {
+            // Escape+run-length repeat transform, the same codec-agnostic
+            // function the optimum path already uses and has verified against
+            // real archives. NOT verified for -cc specifically: no -cc archive
+            // in a 60-file real corpus sets this bit, so there is no repro to
+            // check. Wiring it can only help -- the reference applies 0x20
+            // identically regardless of codec (no reorder_ascii_ dependency),
+            // and a wrong result is caught by the entry checksum and declines
+            // exactly as it does today.
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformRle(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x40u)) {
+            // Chess/PGN transform, between 0x20 and 0x01 in the reference's
+            // dispatch order. Not in the community reference at all (its body
+            // is assert(0)); decoded from (input, output) pairs plus the binary.
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransform6(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+        if (tt_enabled && (tt_flags & 0x01u)) {
+            // CR/CRLF restoration -- LAST in the reference's chain (after 0x20
+            // and 0x40). One byte of slack: the reference's output budget is
+            // out_cap + 1 and it writes that extra byte before noticing the
+            // overrun (see NzTextTransformCrToCrLf's header comment).
+            std::vector<std::uint8_t> tbuf;
+            const std::uint32_t n = cm_tt_scratch(&tbuf, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformCrToCrLf(work.data(), cur_size, o, cap);
+            }, 1u);
+            if (n == 0) { ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+        }
+
+        if (tt_enabled) stgmark("tt", work.data(), cur_size);
+        if (dece_param) {
+            // dece: x86 CALL/JMP address un-relativiser -- the LAST step of the
+            // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
+            // text transforms -> dece). Output GROWS (4 bytes per restored
+            // displacement, 3 more per add-esp), and since dece is last its
+            // result IS the block final output, so `remaining` is the right cap.
+            // Sized from what THIS block's side stream can add, not from the
+            // whole rest of the stream: `remaining` was 258 MB per block on a
+            // 281 MB worker stream. A retry-if-it-did-not-fit is not available
+            // here -- dece TRUNCATES rather than failing when it runs out of
+            // room, and its recent-call/recent-jump/carry state advances as it
+            // goes -- so the cap has to be right the first time. The bound is
+            // exact-or-over: the input plus 4 bytes per restored call target
+            // and 3 per add-esp immediate, both counted in the side stream.
+            const std::uint64_t dece_bound = NzExeFilter::DecodedSizeBound(
+                dece_data.data(), static_cast<std::uint32_t>(dece_data.size()), cur_size);
+            const std::uint32_t dece_cap = dece_bound >= remaining
+                                               ? remaining
+                                               : static_cast<std::uint32_t>(dece_bound);
+            std::vector<std::uint8_t> tbuf(dece_cap);
+            std::uint32_t n = 0;
+            const bool dok = exe.Decode(dece_data.data(),
+                                 static_cast<std::uint32_t>(dece_data.size()),
+                                 work.data(), cur_size, tbuf.data(), dece_cap, &n);
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDCC] dece: param=%u data=%zu in=%u -> %d out=%u\n",
+                        dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
+            }
+            if (!dok || n == 0u) { ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        } else {
+            // No dece on this block: it breaks any run in progress.
+            exe.Reset();
+        }
+
+        stg_report();
+        if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); ok = false; break; }
+        out_data->Append(work.data(), cur_size);
+        progress::Add(cur_size);
+        }
+    }
+
+    NzCmDestroy(cm);
+    if (cm_mirror) NzCmDestroy(cm_mirror);
+
+    if (NZ_ENV("NZOPT_TRACE_TDO")) {
+        fprintf(stderr, "[TDCC] loop end: ok=%d pos=%zu raw_len=%zu out_data.size=%llu total_data_size=%llu\n",
+                ok ? 1 : 0, pos, raw_len, (unsigned long long)out_data->size(),
+                static_cast<unsigned long long>(legacy.total_data_size));
+    }
+    if (!ok) {
+        // Completed blocks stay in out_data (see TryDecodeLegacyOptimum).
+        nzr::derr::Set(100u);   // anything not classified above is the payload stage check of the original
+        if (out_error_message) *out_error_message = "cm: malformed block stream";
+        return false;
+    }
+    if (out_data->size() != legacy.total_data_size) {
+        out_data->TruncateTo(legacy.total_data_size);
+        if (out_error_message) *out_error_message = "cm: output size mismatch";
+        return false;
+    }
+
+    // Checksum self-verify, mirroring the sibling TryDecodeLegacyLzhd and
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
+        FILE* f = fopen(dp, "wb");
+        if (f) { if (const auto* b = out_data->buffer()) fwrite(b->data(), 1, b->size(), f); fclose(f); }
+        fprintf(stderr, "[TDCC] dumped pre-checksum output (%llu bytes) to %s\n",
+                (unsigned long long)out_data->size(), dp);
+    }
+
+    // TryDecodeLegacyOptimum gates: a stored per-file checksum mismatch means
+    // "decline and let the caller try another engine", never "emit it
+    // anyway".
+    //
+    // This gate was missing until a real-world corpus sweep found the hole it
+    // left. Back when a legacy binary could still be consulted, the caller's CM
+    // handling cross-checked native output against it -- but only when one was
+    // actually reachable, which for a user never is, and then it took
+    // `cm_native_ok` at face value and emitted whatever this function returned. Sweeping 56 real files x 8 methods
+    // surfaced one archive (a ~10 MB game-data blob under -cc) where this
+    // function returns true with 394113 wrong bytes, so the extractor wrote a
+    // silently corrupt file instead of declining. Output size alone is not a
+    // correctness signal for CM: the block framing can parse cleanly and the
+    // sizes can add up exactly while the entropy-decoded content diverges.
+    //
+    // (The CM divergence on that archive was fixed later by the cross-chunk model
+    // feed, 25d2f75; the gate stays as the safety net it is.) Historical:
+    // bug; this gate is what makes it a clean decline rather than corruption.
+    if (legacy.checksum_verification_supported &&
+        legacy.checksum_mode != ChecksumMode::kNone &&
+        !legacy.entries.empty()) {
+        // The verdict belongs to the caller (CheckEntries, or the sink's own
+        // per-slice checks when the output was streamed straight to the files);
+        // what this gate decides is an archive with no usable checksum at all.
+        // The per-entry recompute below is a trace, and needs the buffer.
+        const std::vector<unsigned char>* buf = out_data->buffer();
+        std::size_t cursor = 0;
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDCC] checksum gate: mode=%d entries=%zu outsize=%llu\n",
+                    (int)legacy.checksum_mode, legacy.entries.size(),
+                    (unsigned long long)out_data->size());
+        }
+        for (const LegacyCnEntry& e : legacy.entries) {
+            const std::size_t n = static_cast<std::size_t>(e.size);
+            std::uint32_t expected = e.checksum;
+            if (!e.has_checksum) {
+                // Fall back to a checksum record found mid-stream. Only for the
+                // single-entry case: with several entries there is no way to tell
+                // from here which entry a mid-stream record belongs to.
+                if (inline_checksum_seen) nz_trace::Construct("cc_midstream_checksum entries=%zu", legacy.entries.size());
+                if (!inline_checksum_seen || legacy.entries.size() != 1u) {
+                    out_data->Clear();
+                    if (out_error_message) *out_error_message = "cm: entry missing checksum, declining";
+                    return false;
+                }
+                expected = inline_checksum;
+            }
+            if (buf == nullptr) continue;             // streamed: the sink checked it
+            if (cursor + n > buf->size()) break;
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                const std::uint32_t got =
+                    ComputeBufferChecksum(legacy.checksum_mode, buf->data() + cursor, n);
+                fprintf(stderr, "[TDCC]   entry n=%zu expected=0x%08x computed=0x%08x %s\n",
+                        n, expected, got, got == expected ? "OK" : "MISMATCH");
+            }
+            cursor += n;
+        }
+    }
+    pscope.Commit();
+    return true;
+}
+
+// Decode -co (nz_optimum1, method_p0==5) natively via NzOptimumLzDecoder
+// (src/nz_optimum_lz.cpp, a byte-exact transcription of the real linux32/nz
+// binary's FUN_0809e600) or -cO (nz_optimum2, method_p0==6) via
+// NzOptimum2LzDecoder (src/nz_optimum2_lz.cpp, a byte-exact transcription of
+// FUN_080a5d90) -- see include/nz_optimum_lz.h, include/nz_optimum2_lz.h, and
+// work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md for the full RE
+// provenance. This function's outer block-header framing (payload_size u32,
+// decr_param, param6, size18, staged, params, tt, dece -- the same flat
+// framing -cc uses) was already confirmed correct in an earlier session (the
+// field walk lands exactly on stream_end/EOF for every fixture tried); what
+// changed is the decr_param==1 payload decoder itself: it used to call
+// NzLzhdDecode() (a port of the community reference's DecLZ), which live GDB
+// tracing proved is never reached by the real binary for -co/-cO content.
+// -co's real per-block LZ/CM core is FUN_0809e600, validated byte-exact
+// against 4 isolated golden vectors (matchfix_co/bigdist_co/smalldist_co/
+// hientropy_co -- see tests/test_optimum_lz.cpp) covering literal runs,
+// small/large-distance matches (slots 0-18), rep-offset reuse, and a
+// high-entropy literal stress segment. -cO's real per-block core is
+// FUN_080a5d90 (a materially richer 8-input literal-mixer plus a rolling
+// LZP-style secondary predictor -- the backbone is a byte-identical-formula
+// scale-up of -co's own), validated byte-exact against 2 isolated golden
+// vectors (aaa200_cO/hientropy_cO -- see tests/test_optimum2_lz.cpp)
+// covering the same shapes as -co's own vectors plus all three of -cO's
+// distance-tier footer-bit schedules (including tier3, only reachable with
+// slot>6 / distance>=129).
+//
+// Scope: SINGLE-CONTAINER only (archive header flag 0x05 for -co, 0x06 for
+// -cO) -- one decoder instance is constructed per call (i.e. per container
+// stream) and threaded across every decr_param==1 block in this stream's
+// sequence, matching the real binary's per-stream-persistent ring/adaptive-
+// table state. Parallel-container -cO (flag 0x0f) remains out of scope and
+// is declined here (parallel-container
+// -co IS handled, but by a separate code path in TryParseLegacyCnArchive, not
+// this function -- see its own comments). decr_param==0 (BWT) blocks are also
+// not yet ported (either engine) and decline.
+//
+// Safety: every candidate is checksum-gated below (mirroring -cd/-cD/-cc's
+// own self-verify pattern) before being trusted by the caller; any mismatch,
+// malformed framing, or DecodeBlock-reported inconsistency cleanly declines
+// (returns false) so RunLegacyCnExtractOrTest tries the next engine --
+// never a partial/corrupt native result.
+// Decode a sequence of -co (nz_optimum1) block records occupying
+// [blocks_begin, blocks_end) within `raw` -- NO leading stream_tag (callers
+// that have one, e.g. the single-container path below, must consume it
+// first and pass just the block-sequence body that follows). Appends
+// decoded bytes to *out_data, which may already contain bytes from a prior
+// call against the same stream/decoder (e.g. a parallel stream whose data
+// is split across more than one type-0 chunk record). `total_size_hint` is
+// this stream's ultimate total decoded size -- used only to size the
+// "remaining" scratch buffers the post-filters need; it does not by itself
+// decide when decoding stops (the caller controls that via `blocks_end`).
+// `dec` must already be constructed with this stream's window capacity and
+// must be threaded across every call belonging to the same stream: its
+// ring and every adaptive probability table persist across block
+// boundaries (only the range coder and 4 rep-offsets reset per block).
+// Templated on the per-engine decoder type so the exact same block-record
+// framing/post-filter loop serves both -co (NzOptimumLzDecoder) and -cO
+// (NzOptimum2LzDecoder) -- both expose the identical
+// `bool DecodeBlock(in, in_len, out, out_size)` signature (see
+// nz_optimum_lz.h / nz_optimum2_lz.h), differing only in which real-binary
+// function ports the actual per-block LZ/CM engine.
+// A decode stage's output buffer (see nz_calloc_vec.h): each stage reserves a
+// generous capacity and fills part of it, and only that part is ever resident --
+// param2 reserved 90 MiB for a 64 MiB result on a 128 MB `-co` archive, all of
+// it written to zero first.
+using StageBuf = nz::CallocVec;
+
+template <typename OptimumDecoder>
+static bool DecodeOptimumBlockSequence(
+    // The block records as a RANGE SOURCE, not a pointer at a buffer: a single
+    // container's payload can be the whole archive, and copying it flat is what
+    // a 32-bit build cannot afford. Every read below is bounded by a header
+    // field, so a window (or a splice) can serve them all.
+    const ByteView& src,
+    // Payload offsets, NOT size_t: a single container's payload is the whole
+    // archive, so on a 32-bit build these wrap just short of 4 GB -- the decode
+    // then walks off the end of a perfectly good stream.
+    ArcPos blocks_begin,
+    ArcPos blocks_end,
+    std::uint64_t total_size_hint,
+    OptimumDecoder& dec,
+    nzr::audio::NzAudioPred& audio,
+    nzr::audio::NzImageModel& image,
+    NzExeFilter& exe,
+    OptimumOut* out_data) {
+    progress::Scope pscope;
+    ArcPos pos = blocks_begin;
+    const ArcPos stream_end = blocks_end;
+    bool ok = true;
+
+    const bool trace_blocks = NZ_ENV("NZOPT_TRACE_TDO") != nullptr;
+    while (pos < stream_end) {
+        if (pos + 4u > stream_end) {
+            if (trace_blocks) fprintf(stderr, "[TDO] stop: no room for a block header at %zu of %zu (out=%zu)\n", pos, stream_end, out_data->size());
+            if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
+        }
+        const std::uint32_t payload_size =
+            static_cast<std::uint32_t>(src[pos]) |
+            (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+            (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+            (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+        pos += 4u;
+        if (trace_blocks) fprintf(stderr, "[TDO] block at %zu payload_size=%u remaining=%zu out=%zu\n", pos - 4u, payload_size, stream_end - pos, out_data->size());
+        if (payload_size > stream_end - pos) {
+            if (trace_blocks) fprintf(stderr, "[TDO] stop: payload %u runs past the stream (%zu left)\n", payload_size, stream_end - pos);
+            if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
+        }
+        const std::uint8_t* payload = src.Span(pos, payload_size);
+        if (payload == nullptr) { ok = false; break; }
+        pos += payload_size;
+        if (pos > t_opt_pad_from) {   // the payload itself is cut (see t_opt_pad_from)
+            if (trace_blocks) fprintf(stderr, "[TDO] stop: payload reaches the padding of a cut record\n");
+            ok = false; break;
+        }
+
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t decr_param = src[pos++];
+
+        // decr_param 2 (audio) and 3 use a TRUNCATED header that stops right
+        // after size18: no staged-checksum count, and none of the param2 /
+        // param1 / param16 / text-transform / dece fields an ordinary block
+        // carries (reference Header::Parse, which early-returns for both).
+        // Parsing them with the ordinary layout reads mode2_type as param6 and
+        // then walks off into the next record -- which is exactly why every
+        // audio-bearing archive used to die before its first block trace.
+        if (decr_param == 2u || decr_param == 3u) {
+            nz_trace::Construct("audio_image_block decr=%u", decr_param);
+            std::uint8_t mode2_type = 0;
+            if (decr_param == 2u) {
+                if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+                mode2_type = src[pos++];
+            }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            const std::uint32_t audio_out_size =
+                static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u mode2_type=%u out_size=%u pos=%zu stream_end=%zu\n",
+                        payload_size, decr_param, mode2_type, audio_out_size, pos, stream_end);
+            }
+            if (audio_out_size == 0u) continue;
+            if (audio_out_size > total_size_hint - out_data->size()) { nzr::derr::SetAt(14u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            if (decr_param == 3u) {
+                // Image block (FUN_080a9ca0 on the codec's image object; the
+                // community reference wrongly treats this shape as CM-only and
+                // returns false for the optimum family). Every non-audio block
+                // resets the audio predictor, and every non-image block (audio or LZ)
+                // resets the image object: the two side models are symmetric here,
+                // unlike lzpf's dispatcher where audio blocks leave the image alone.
+                audio.Reset();
+                if (const char* idp = NZ_ENV("NZOPT_DUMP_IMAGE")) {
+                    static int seq = 0;
+                    char nm[512];
+                    std::snprintf(nm, sizeof(nm), "%s.%d", idp, seq++);
+                    if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(payload, 1, payload_size, f); std::fclose(f); }
+                    std::fprintf(stderr, "[img] dumped image payload (%u bytes, out_size=%u) to %s\n",
+                                 payload_size, audio_out_size, nm);
+                }
+                std::vector<std::uint8_t> ibuf(audio_out_size);
+                const std::size_t iused = image.Decode(payload, payload_size, ibuf.data(), audio_out_size);
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] image Decode(payload_size=%u out_size=%u) -> used %zu\n",
+                            payload_size, audio_out_size, iused);
+                }
+                if (iused == 0u) { nzr::derr::SetAt(2u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+                out_data->Append(ibuf.data(), ibuf.size());
+                progress::Add(ibuf.size());
+                continue;
+            }
+            // An audio block resets the predictor only when mode2_type is set.
+            if (const char* adp = NZ_ENV("NZOPT_DUMP_AUDIO")) {
+                FILE* f = fopen(adp, "wb");
+                if (f) { fwrite(payload, 1, payload_size, f); fclose(f); }
+                fprintf(stderr, "[TDO] dumped audio payload (%u bytes, out_size=%u, mode2=%u) to %s\n",
+                        payload_size, audio_out_size, mode2_type, adp);
+            }
+            if (mode2_type) audio.Reset();
+            image.Reset();   // every non-image block resets the image object in this family (GDB: one FUN_080b6170 per audio block)
+            std::vector<std::uint8_t> abuf(audio_out_size);
+            const bool aok = audio.Decode(payload, payload_size, abuf.data(), audio_out_size);
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] audio Decode(payload_size=%u out_size=%u) -> %d\n",
+                        payload_size, audio_out_size, aok ? 1 : 0);
+            }
+            if (!aok) { nzr::derr::SetAt(16u, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            out_data->Append(abuf.data(), abuf.size());
+                progress::Add(abuf.size());
+            continue;
+        }
+        // Every non-audio block resets the audio predictor (reference
+        // DecodeFromStream calls audio_pred->Reset() on the way past the
+        // decr_param == 2 branch), so its state never carries across one. The
+        // image object resets here too (FUN_080b6170).
+        audio.Reset();
+        image.Reset();
+
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t param6 = src[pos++];
+        std::uint32_t out_size = 0;
+        if (param6) {
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            out_size = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+        }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t staged_count = src[pos++];
+        if (pos + staged_count > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t* staged_p = src.Span(pos, staged_count);
+        if (staged_p == nullptr) { ok = false; break; }
+        const std::vector<std::uint8_t> staged(staged_p, staged_p + staged_count);
+        pos += staged_count;
+        static const bool trace_stg = (NZ_ENV("NZOPT_TRACE_STG") != nullptr);
+        std::string stg;
+        // The original's per-stage check (FUN_080c0220): after each stage it pops
+        // the LAST remaining staged byte and compares it with Fletcher32(stage
+        // output) % 255; a mismatch is "Archive corrupted. Error decoding" with
+        // nothing of the block written. Stage k therefore checks staged[count-1-k].
+        // Verified only when this port's stage count matches the header's, so an
+        // unmodelled stage (the exe filter?) can never fail a good archive.
+        std::size_t stage_idx = 0;
+        bool stage_bad = false;
+        std::uint32_t stage_bad_code = 100u;
+        // The original checks each stage the moment it is computed and stops
+        // there; ours defers the verdict to the block end (the LIFO index needs
+        // the stage count). So when a sub-decoder fails on a block whose earlier
+        // stage already mismatched, the original had reported THAT stage first.
+        const auto fail_code = [&](std::uint32_t own) { return stage_bad ? stage_bad_code : own; };
+        const auto stgmark = [&](const char* nm, const std::uint8_t* p, std::size_t n) {
+            const unsigned got = StageCheck255(p, n);
+            if (stage_idx < staged.size() && staged[staged.size() - 1u - stage_idx] != got && !stage_bad) {
+                stage_bad = true; stage_bad_code = nzr::derr::StageCode(nm);
+            }
+            ++stage_idx;
+            if (!trace_stg) return;
+            char b[48]; snprintf(b, sizeof(b), " %s=%02x", nm, got); stg += b;
+        };
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] block payload_size=%u decr_param=%u param6=%u out_size=%u staged_count=%u pos=%zu stream_end=%zu\n",
+                    payload_size, decr_param, param6, out_size, staged_count, pos, stream_end);
+        }
+
+        // BWT-only header fields. Per the reference Header::Parse, a non-CM
+        // block with decr_param == 0 carries param7 (only when param6 is set),
+        // the inverse-BWT start position, and params 14/15 -- all absent from
+        // the decr_param == 1 (LZ) layout, which goes straight to param2.
+        std::uint8_t bwt_param7 = 0;
+        std::uint32_t bwt_start_pos = 0;
+        std::uint8_t param14_flag = 0, param15_flag = 0;
+        std::vector<std::uint8_t> param14_data, param15_data;
+        auto read_u32vec = [&](std::vector<std::uint8_t>& dst) -> bool {
+            if (pos + 4u > stream_end) return false;
+            const std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+            if (vlen > stream_end - pos) return false;
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) return false;
+              dst.assign(q, q + vlen); }
+            pos += vlen;
+            return true;
+        };
+        if (decr_param == 0u) {
+            if (param6) {
+                if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+                bwt_param7 = src[pos++];
+            }
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            bwt_start_pos = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+            if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            param14_flag = src[pos++];
+            if (param14_flag && !read_u32vec(param14_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            param15_flag = src[pos++];
+            if (param15_flag && !read_u32vec(param15_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] BWT hdr: param7=%u bwt_start_pos=%u param14=%u (%zu bytes) param15=%u (%zu bytes) pos=%zu\n",
+                        bwt_param7, bwt_start_pos, param14_flag, param14_data.size(),
+                        param15_flag, param15_data.size(), pos);
+            }
+        }
+
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t param2_flag = src[pos++];
+        std::vector<std::uint8_t> param2_data;
+        if (param2_flag) {
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) { ok = false; break; }
+              param2_data.assign(q, q + vlen); }
+            pos += vlen;
+        }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t param1_flag = src[pos++];
+        std::vector<std::uint8_t> param1_data;
+        if (param1_flag) {
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+            if (pos + vlen > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) { ok = false; break; }
+              param1_data.assign(q, q + vlen); }
+            pos += vlen;
+        }
+        if (pos + 1u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        pos++;  // param16
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        const std::uint8_t tt_enabled = src[pos++];
+        std::uint8_t tt_flags = 0;
+        std::vector<std::uint8_t> tt16_data, tt2_data;
+        if (tt_enabled) {
+            if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tt_flags = src[pos++];
+            auto read_varint_str = [&](std::vector<std::uint8_t>& dst) -> bool {
+                if (pos >= stream_end) return false;
+                std::uint32_t n = 0, sh = 0; unsigned char vc;
+                do {
+                    if (pos >= stream_end) return false;
+                    vc = src[pos++];
+                    n |= static_cast<std::uint32_t>(vc & 0x7fu) << sh; sh += 7u;
+                } while (vc & 0x80u);
+                if (pos + n > stream_end) return false;
+                { const unsigned char* q = src.Span(pos, n);
+                  if (q == nullptr) return false;
+                  dst.assign(q, q + n); } pos += n; return true;
+            };
+            if ((tt_flags & 2u) && !read_varint_str(tt2_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            if ((tt_flags & 16u) && !read_varint_str(tt16_data)) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        }
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u tt16_data.size=%zu pos=%zu stream_end=%zu\n",
+                    param2_flag, param1_flag, tt_enabled, tt_flags, tt16_data.size(), pos, stream_end);
+        }
+        if (pos >= stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        std::vector<std::uint8_t> dece_data;
+        const std::uint8_t dece_param = src[pos++];
+        if (dece_param) {
+            if (pos + 4u > stream_end) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            std::uint32_t vlen = static_cast<std::uint32_t>(src[pos]) |
+                (static_cast<std::uint32_t>(src[pos+1]) << 8u) |
+                (static_cast<std::uint32_t>(src[pos+2]) << 16u) |
+                (static_cast<std::uint32_t>(src[pos+3]) << 24u);
+            pos += 4u;
+            if (vlen > stream_end - pos) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            { const unsigned char* q = src.Span(pos, vlen);
+              if (q == nullptr) { ok = false; break; }
+              dece_data.assign(q, q + vlen); }
+            pos += vlen;
+        }
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] dece_param=%u pos=%zu stream_end=%zu param6=%u out_size=%u\n",
+                    dece_param, pos, stream_end, param6, out_size);
+        }
+
+        // param6 == 0 means "this block has no compressed layer": the encoder
+        // found the data incompressible, so there is no size18 field at all and
+        // the block expands to exactly its own payload size. That holds for BOTH
+        // block kinds the optimum family emits, which is visible in the
+        // reference's own dispatch (NZ.cpp:997-1004): the decr_param == 0 branch
+        // does `size = payload_size; memcpy(...)` and only applies the entropy
+        // layer `if (header.param6)`. The decr_param == 1 branch reads
+        // `size = header.size18` unconditionally -- but size18 is only ever
+        // assigned under `if (param6)` and `Header` has no constructor, so with
+        // param6 == 0 the reference is reading an UNINITIALISED field. It is UB
+        // there, not a specification; the payload-size reading is what the real
+        // binary does, and it is what makes the sizes add up (PowerPacker.pp:
+        // 40492 total - 20091 from its two BWT blocks = 20401 = exactly this
+        // block's payload size).
+        //
+        // Treating only the BWT kind as storable made a stored LZ block hit the
+        // `continue` below: the block was skipped ENTIRELY while the sequence
+        // reported success, so the stream came up short and the whole file was
+        // declined with a misleading "decode failed".
+        const bool stored_block = ((decr_param == 0u || decr_param == 1u) && param6 == 0u);
+        const bool bwt_raw = (decr_param == 0u && param6 == 0u);
+        if (!stored_block && (!param6 || out_size == 0u)) continue;
+
+        // NZOPT_DUMP_PAYLOAD=<path>: every block's raw payload as <path>.N, with
+        // its descriptor fields on stderr. A BWT block (decr_param 0) also gets
+        // <path>.N.bwt, the bucket decoder's output -- the byte string the bucket
+        // ENCODER has to turn back into <path>.N, which is how it is verified.
+        // (The counter moves only while dumping: the stream workers of a parallel
+        // container run this concurrently, and ThreadSanitizer caught the old
+        // unconditional ++ racing. Dumps are numbered in run order, so use -t1.)
+        static std::atomic<int> payload_dump_seq{0};
+        const char* const dpp = NZ_ENV("NZOPT_DUMP_PAYLOAD");
+        const int payload_dump_n = (dpp != nullptr) ? payload_dump_seq.fetch_add(1) : 0;
+        if (dpp != nullptr) {
+            char nm[600];
+            std::snprintf(nm, sizeof(nm), "%s.%d", dpp, payload_dump_n);
+            if (FILE* f = fopen(nm, "wb")) { fwrite(payload, 1, payload_size, f); fclose(f); }
+            fprintf(stderr, "[TDO] dumped payload #%d (%u bytes) to %s: decr_param=%u param6=%u out_size=%u\n",
+                    payload_dump_n, payload_size, nm, decr_param, param6, out_size);
+        }
+
+        StageBuf work;
+        std::uint32_t cur_size = 0;
+        stgmark("payload", payload, payload_size);
+        if (decr_param == 0u) {
+            if (bwt_raw) {
+                work.assign(payload, payload + payload_size);
+                cur_size = payload_size;
+            } else {
+                // param6 == 1: the BWT output is entropy-coded (256
+                // per-leading-symbol MTF/arith buckets). size18 is its size.
+                work.resize(out_size);
+                const bool bdi_ok = NzBwtDecodeInput(payload, payload_size, out_size, work.data());
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] BWT DecodeInput(payload_size=%u out_size=%u) -> %d\n",
+                            payload_size, out_size, bdi_ok ? 1 : 0);
+                }
+                if (!bdi_ok) { nzr::derr::SetAt(fail_code(3u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+                cur_size = out_size;
+                stgmark("bwtin", work.data(), cur_size);   // the entropy-decoded buckets are a stage of their own
+                if (dpp != nullptr) {
+                    char nm[600];
+                    std::snprintf(nm, sizeof(nm), "%s.%d.bwt", dpp, payload_dump_n);
+                    if (FILE* f = fopen(nm, "wb")) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
+                }
+            }
+            const bool bwt_ok = NzBwtUntransform(work.data(), cur_size, bwt_start_pos);
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] BWT raw untransform(size=%u bwt_start_pos=%u) -> %d\n",
+                        cur_size, bwt_start_pos, bwt_ok ? 1 : 0);
+            }
+            if (!bwt_ok) { nzr::derr::SetAt(fail_code(103u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            stgmark("bwt", work.data(), cur_size);
+
+            // params 14/15 run here: after the inverse BWT, before the shared
+            // param2/param1/text-transform/dece chain (reference
+            // DecodeFromStream lines 1009-1017).
+            if (param14_flag) {
+                // Output can grow: the transform expands LZ matches. Cap at
+                // whatever this entry still has left to produce.
+                const std::uint32_t limit14 = OptimumRemainingOut(total_size_hint, out_data->size());
+                std::uint32_t cap = OptimumExpandStart(cur_size, limit14);
+                StageBuf t14;
+                std::uint32_t n14 = 0;
+                bool p14ok = false;
+                for (;;) {
+                    t14 = StageBuf(cap);
+                    n14 = 0;
+                    p14ok = NzBwtParam14(param14_data.data(),
+                                static_cast<std::uint32_t>(param14_data.size()),
+                                work.data(), cur_size, t14.data(), cap, &n14);
+                    if (p14ok || cap == limit14) break;
+                    cap = OptimumExpandGrow(cap, limit14);
+                }
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] param14: data=%zu in=%u -> %d out=%u\n",
+                            param14_data.size(), cur_size, p14ok ? 1 : 0, n14);
+                }
+                if (!p14ok || n14 == 0u) { nzr::derr::SetAt(fail_code(5u), pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+                t14.resize(n14); work.swap(t14); cur_size = n14;
+                stgmark("p14", work.data(), cur_size);
+            }
+            if (param15_flag) {
+                // param15 matches name their source as a RING POSITION: the
+                // encoder's long-range index stores one slot per 256 bytes of
+                // the LZ ring, and every offset ever observed is a multiple of
+                // 256. The ring is `dec`'s, the one every LZ block reads, and it
+                // follows the original's cursor exactly -- including the up to
+                // 32 KB EnsureHeadroom abandons at the ring's end whenever a
+                // chunk does not fit before it. This port used to resolve the
+                // offsets against a FLAT accumulation of the same bytes plus a
+                // mod-capacity congruence: right until the first such gap, and
+                // then wrong by exactly the gap. Measured on a 180 MB -co
+                // archive: an 83-byte block expanding to 82 240, source read
+                // 18 522 bytes late; the ring's wrap trace shows
+                // `cursor=8370086 cap=8388608 needed=32768 slack=18522`.
+                // (Offsets pointing into the block being decoded, or past the
+                // ring's end, have not been observed; both would fail the
+                // bound check below rather than read garbage.)
+                const std::uint32_t limit15 = OptimumRemainingOut(total_size_hint, out_data->size());
+                std::uint32_t cap = OptimumExpandStart(cur_size, limit15);
+                StageBuf t15;
+                std::uint32_t n15 = 0;
+                bool p15ok = false;
+                const std::uint8_t* const ring_base = dec.WindowBase();
+                const std::size_t ring_len = static_cast<std::size_t>(dec.WindowCapacity()) + 256u;
+                for (;;) {
+                    t15 = StageBuf(cap);
+                    n15 = 0;
+                    p15ok = NzBwtParam15(param15_data.data(),
+                                static_cast<std::uint32_t>(param15_data.size()),
+                                work.data(), cur_size,
+                                ring_base, ring_len,
+                                t15.data(), cap, &n15, 0u);
+                    if (p15ok || cap == limit15) break;
+                    cap = OptimumExpandGrow(cap, limit15);
+                }
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] param15: data=%zu in=%u -> %d out=%u\n",
+                            param15_data.size(), cur_size, p15ok ? 1 : 0, n15);
+                }
+                if (const char* dd = NZ_ENV("NZOPT_DUMP_P15")) {
+                    static thread_local unsigned call_no = 0;
+                    ++call_no;
+                    char path[512];
+                    auto wr = [&](const char* what, const void* data, std::size_t n) {
+                        std::snprintf(path, sizeof(path), "%s/p15_%03u_%s.bin", dd, call_no, what);
+                        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(data, 1, n, f); std::fclose(f); }
+                    };
+                    wr("model", param15_data.data(), param15_data.size());
+                    wr("in", work.data(), cur_size);
+                    wr("window", dec.WindowBase(), static_cast<std::size_t>(dec.WindowCapacity()));
+                    wr("out", t15.data(), n15);
+                    std::fprintf(stderr, "[P15] call=%u model=%zu in=%u ring=%u out=%u out_at=%zu ok=%d\n",
+                                 call_no, param15_data.size(), cur_size, dec.WindowCapacity(), n15, out_data->size(), (int)p15ok);
+                }
+                if (!p15ok || n15 == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+                t15.resize(n15); work.swap(t15); cur_size = n15;
+                stgmark("p15", work.data(), cur_size);
+            }
+
+            // The window is the shared accumulated-block buffer in the
+            // original, advanced by every block that writes into it -- a BWT
+            // block included (reference: mem->data += size, right after
+            // params 14/15 and before the post-filter chain). This port's ring
+            // is otherwise only written by DecodeBlock, so feed it here or a
+            // later LZ block whose match reaches back into this BWT output
+            // reads stale ring bytes and fails.
+            dec.FeedWindow(work.data(), cur_size);
+        } else {
+            // Decode this block's LZ/CM payload via the persistent per-stream
+            // decoder. A false return means the bitstream produced a malformed
+            // dispatch bit, an out-of-window match, or any other detected
+            // inconsistency -- decline cleanly rather than trust a partially-
+            // written buffer (DecodeBlock never touches `work` before it is
+            // sure).
+            if (stored_block) {
+                // Stored LZ block: the payload IS the block output. It still has
+                // to go into the window -- the original advances its shared
+                // accumulated-block buffer for every block, so a later LZ block
+                // whose match reaches back into this one must find these bytes
+                // there. But NOT through FeedWindow, as the BWT branch above does:
+                // the engine's own store (FUN_0809e4e0 / FUN_080a5c70) writes them
+                // in DecodeBlock's 32 KB chunks, which can leave the cursor
+                // elsewhere than FeedWindow does (for a block longer than the
+                // ring the feed parks it at the capacity). They agree when the
+                // block is written in place or the chunks happen to end where
+                // the feed does, which is why the whole -m4m blocks tested before
+                // (1114112 bytes, entered at the ring's end) never showed it; a
+                // 578206-byte stored block of a multi-file -co archive did, the
+                // next LZ block decoding garbage from its first match.
+                work.assign(payload, payload + payload_size);
+                cur_size = payload_size;
+                dec.StoreBlock(work.data(), cur_size);
+                // ...and the adaptive model starts cold again. A stored block is
+                // the compressor giving up on a block, and it takes its model
+                // with it: the NEXT LZ block of the stream decodes from a cold
+                // state, not from what the previous LZ block adapted.
+                // Measured on a 130 MB .cab as `-co -p16`: stream 10 is the only
+                // one of the sixteen with a stored block BETWEEN two LZ blocks,
+                // and its second LZ block decoded garbage from its very first
+                // byte while its ring content was byte-exact -- so the only
+                // state left to differ was the model. With this, the whole
+                // archive is byte-exact. Intervening BWT blocks do NOT reset it
+                // (streams 1, 6, 7 and 12 have LZ blocks after two or three of
+                // them and decode correctly with the model carried across).
+                dec.ResetModel();
+                if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDO] stored LZ block: payload_size=%u (param6=0, no size18)\n",
+                            payload_size);
+                }
+            } else {
+            work.resize(out_size);
+            // NZOPT_DUMP_DEC=<path>: one line per decision of every LZ block, so
+            // the reference's own parse can be diffed against ours (the encoder
+            // dumps the same format under the same variable). The decoder's list
+            // ACCUMULATES over the stream, so a block's own decisions are the
+            // tail after the previous block's count -- the encoder's are per
+            // block. tdo/lzcap/cmpdec.py lines the two up.
+            constexpr bool kCanRecord =
+                std::is_same_v<OptimumDecoder, nzr::optimum::NzOptimumLzDecoder>;
+            const char* const ddp = kCanRecord ? NZ_ENV("NZOPT_DUMP_DEC") : nullptr;
+            if constexpr (kCanRecord) { if (ddp != nullptr) dec.RecordDecisions(true); }
+            const bool decode_block_ok = dec.DecodeBlock(payload, payload_size, work.data(), out_size);
+            if constexpr (kCanRecord) if (ddp != nullptr) {
+                static int dec_blk = 0;
+                if (FILE* df = fopen(ddp, "a")) {
+                    const auto& ds = dec.LastDecisions();
+                    fprintf(df, "# block %d out_size=%u payload=%u ndec=%zu\n",
+                            dec_blk, out_size, payload_size, ds.size());
+                    for (const auto& d : ds) {
+                        if (d.is_literal) fprintf(df, "L %u\n", (unsigned)d.byte);
+                        else fprintf(df, "M %u %u %u\n", (unsigned)d.sg, d.len, d.dist);
+                    }
+                    fclose(df);
+                }
+                ++dec_blk;
+                dec.RecordDecisions(false);
+            }
+            if (!decode_block_ok) {
+                // A failing block's PARTIAL output is where the interesting
+                // boundary is: its correct prefix ends exactly at the first
+                // wrong decision. Without this the pre-checksum dump only ever
+                // showed the blocks that already succeeded.
+                if (const char* bp = NZ_ENV("NZOPT_DUMP_FAILBLOCK")) {
+                    FILE* bf = fopen(bp, "wb");
+                    if (bf) { fwrite(work.data(), 1, out_size, bf); fclose(bf); }
+                    // ...and the INPUT that produced it, so the block can be
+                    // replayed on its own instead of decoding the archive again.
+                    const std::string ip = std::string(bp) + ".in";
+                    FILE* inf = fopen(ip.c_str(), "wb");
+                    if (inf) { fwrite(payload, 1, payload_size, inf); fclose(inf); }
+                    fprintf(stderr, "[TDO] dumped failing block (%u bytes, out_data so far %zu) to %s, payload (%u bytes, out_size=%u) to %s\n",
+                            out_size, out_data->size(), bp, payload_size, out_size, ip.c_str());
+                }
+            }
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] DecodeBlock(payload_size=%u out_size=%u) -> %d\n",
+                        payload_size, out_size, decode_block_ok ? 1 : 0);
+            }
+            if (!decode_block_ok) {
+                // The engine declined without a status: keep the place anyway.
+                // In a parallel container the driver reports a failing slot
+                // PLAIN when a later record of that slot notices it, and the
+                // sink decides that from the position (pmf_o 0.30: the first of
+                // six records fails cleanly, the original prints 100, not 25600).
+                nzr::derr::SetPos(pos);
+                if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break;
+            }
+            cur_size = out_size;
+            stgmark("lz", work.data(), cur_size);
+            }
+        }
+        if (NZ_ENV("NZOPT_TRACE_WIN")) {
+            fprintf(stderr, "[WIN] +%u  decr=%u param6=%u p2=%u p1=%u tt=%u p14=%u p15=%u dece=%u out=%zu\n",
+                    cur_size, decr_param, param6, param2_flag, param1_flag,
+                    tt_enabled ? tt_flags : 0u, param14_flag, param15_flag, dece_param, out_data->size());
+        }
+
+        const std::uint64_t prev_size = out_data->size();
+        const std::uint32_t remaining = OptimumRemainingOut(total_size_hint, prev_size);
+
+        if (param2_flag) {
+            std::uint32_t cap2 = OptimumExpandStart(cur_size, remaining);
+            StageBuf exp;
+            std::uint32_t esz = 0;
+            bool p2ok = false;
+            for (;;) {
+                exp = StageBuf(cap2);
+                esz = cap2;
+                p2ok = NzBwtRleDecodeU32(param2_data.data(),
+                                         static_cast<std::uint32_t>(param2_data.size()),
+                                         work.data(), cur_size, exp.data(), &esz)
+                       && esz != 0u;
+                if (p2ok || cap2 == remaining) break;
+                cap2 = OptimumExpandGrow(cap2, remaining);
+            }
+            if (!p2ok) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            exp.resize(esz); work.swap(exp); cur_size = esz;
+            stgmark("p2", work.data(), cur_size);
+        }
+        // param1: AddBytesFilter (delta filter, output size == input size).
+        // Same NzAddBytesFilter already used by -cc's TryDecodeLegacyCm --
+        // shared post-filter, not codec-specific (the "not yet ported" gate
+        // here was just never wired for the optimum family until now).
+        if (param1_flag) {
+            StageBuf tbuf(cur_size);
+            const bool p1ok = NzAddBytesFilter(param1_data.data(),
+                                  static_cast<std::uint32_t>(param1_data.size()),
+                                  work.data(), cur_size, tbuf.data());
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] param1: data.size=%zu cur_size=%u -> %d\n",
+                        param1_data.size(), cur_size, p1ok ? 1 : 0);
+            }
+            if (!p1ok) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            work.swap(tbuf);
+            // cur_size unchanged
+            stgmark("p1", work.data(), cur_size);
+        }
+        // Reference bit order (TextTransformer::TransformText): 0x80, 0x10,
+        // 0x08, 4, 2, 0x20, 0x40, 1. Every bit but 0x80 is ported; 0x80 declines
+        // far; any other bit set (0x80/4/0x40/1) declines cleanly.
+        // The text-transform chain's INPUT, before any stage runs. With an
+        // unported bit set this is the only way to get an (input, output) pair
+        // for that stage: the golden file is the chain's OUTPUT and every other
+        // stage in the chain is already ported and invertible.
+        if (tt_enabled) {
+            if (const char* tp = NZ_ENV("NZOPT_DUMP_TTIN")) {
+                FILE* f = fopen(tp, "wb");
+                if (f) { fwrite(work.data(), 1, cur_size, f); fclose(f); }
+                fprintf(stderr, "[TT] chain input: %u bytes, tt_flags=0x%02x -> %s\n",
+                        cur_size, tt_flags, tp);
+            }
+        }
+        // The text-transform dispatcher FUN_080a3c90 knows one more bit than the
+        // seven below: 0x80 = param14 (FUN_080a0ff0). The CM family requests
+        // param14 through its OWN block-header flag instead (the p14 field this
+        // block already applies), and over 9 255 CM-family blocks of the 3037-file
+        // sweep tt never had bit 0x80 set (the largest value seen is 0x43) while
+        // p14 was set 1 272 times. So this decline covers a bit the encoder
+        // expresses elsewhere, not a gap in the port.
+        if (tt_enabled && (tt_flags & ~(0x10u | 0x08u | 0x04u | 0x02u | 0x20u | 0x40u | 0x01u))) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        // NZOPT_DUMP_TT=<dir>: the text transform's input and output for every
+        // block that carries one, as <dir>/ttN.in and .out plus a .flags line. The
+        // input is what the original's encoder produced from the text and the
+        // output is the text itself, so the pair is ground truth for the FORWARD
+        // transform the encoder still needs.
+        static int tt_dump_seq = 0;
+        const char* const tt_dump_dir = NZ_ENV("NZOPT_DUMP_TT");
+        const int tt_dump_n = tt_dump_seq;
+        if (tt_dump_dir != nullptr && tt_enabled) {
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.in", tt_dump_dir, tt_dump_n);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.flags", tt_dump_dir, tt_dump_n);
+            if (FILE* f = std::fopen(nm, "w")) { std::fprintf(f, "flags=%u tt2=%zu tt16=%zu in=%u\n", tt_flags, tt2_data.size(), tt16_data.size(), cur_size); std::fclose(f); }
+            // The two side streams as well: the forward insert-LF and number
+            // passes have to reproduce them byte for byte, not just their sizes.
+            if (!tt2_data.empty()) {
+                std::snprintf(nm, sizeof(nm), "%s/tt%d.tt2", tt_dump_dir, tt_dump_n);
+                if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(tt2_data.data(), 1, tt2_data.size(), f); std::fclose(f); }
+            }
+            if (!tt16_data.empty()) {
+                std::snprintf(nm, sizeof(nm), "%s/tt%d.tt16", tt_dump_dir, tt_dump_n);
+                if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(tt16_data.data(), 1, tt16_data.size(), f); std::fclose(f); }
+            }
+        }
+        // one file per step of the chain, so each transform can be worked on alone
+        const auto tt_step = [&](const char* step) {
+            if (tt_dump_dir == nullptr || !tt_enabled) return;
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.%s", tt_dump_dir, tt_dump_n, step);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
+        };
+        // Text-transform scratch. `remaining` -- the whole rest of the stream's
+        // output -- is a correct cap but a ruinous allocation: the FIRST block of
+        // a 281 MB worker stream took 281 MB of zero-filled scratch, and sixteen
+        // workers ran at once, which is most of what kept this reader at 8.5 GB
+        // where the original holds 278 MB. Start from a block-proportional
+        // capacity and fall back to the full cap only when the transform says it
+        // did not fit. A transform returns 0 both for bad data and for no room,
+        // so the retry is what makes the small first try safe: no valid block can
+        // be lost by it, whatever the real expansion bound turns out to be.
+        const auto tt_scratch = [&](StageBuf* buf, std::uint32_t slack,
+                                    const std::function<std::uint32_t(std::uint8_t*, std::uint32_t)>& run)
+                                -> std::uint32_t {
+            std::uint64_t want = static_cast<std::uint64_t>(cur_size) * 2u + 0x10000u;
+            if (want > remaining) want = remaining;
+            std::uint32_t cap = static_cast<std::uint32_t>(want);
+            *buf = StageBuf(static_cast<std::size_t>(cap) + slack);
+            std::uint32_t n = run(buf->data(), cap);
+            if (n == 0u && cap < remaining) {
+                if (NZ_ENV("NZ_TRACE_BIGALLOC"))
+                    std::fprintf(stderr, "[big] tt scratch retry at the full cap: %u -> %u\n", cap, remaining);
+                cap = remaining;
+                *buf = StageBuf(static_cast<std::size_t>(cap) + slack);
+                n = run(buf->data(), cap);
+            }
+            return n;
+        };
+        if (tt_enabled && (tt_flags & 0x10u)) {
+            StageBuf tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 1u << 16, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformNumber(tt16_data.data(), static_cast<std::uint32_t>(tt16_data.size()),
+                                             work.data(), cur_size, o, cap + (1u << 16));
+            });
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("num");
+        }
+        if (tt_enabled && (tt_flags & 0x08u)) {
+            // Non-CM codecs (optimum/lzhd, decparams type != 7) reorder the ASCII
+            // alphabet before the dictionary transform (TextTransformer ctor sets
+            // reorder_ascii_ = type != 7). Apply kReorderAscii in place first.
+            static const std::uint8_t kReorderAscii[256] = {
+                0,1,2,3,4,5,6,7,8,9,34,11,12,13,14,15, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+                39,38,10,35,36,37,32,44,40,41,42,43,46,58,47,45, 48,49,50,51,52,53,54,55,56,57,33,59,60,61,62,63,
+                64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79, 80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+                96,115,107,122,110,109,112,118,100,120,99,106,108,114,103,104, 102,116,98,119,105,121,113,101,97,117,111,123,124,125,126,127,
+                128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143, 144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+                160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175, 176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+                192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207, 208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+                224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239, 240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+            };
+            for (std::uint32_t i = 0; i < cur_size; ++i) work[i] = kReorderAscii[work[i]];
+            // +16 bytes of slack: see the matching comment at the -cc
+            // NzTextTransformDict call site above (CopyDictEntWithCase's
+            // intentional fixed-width over-write needs caller-provided
+            // headroom past the logical output size).
+            StageBuf tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 16u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformDict(work.data(), cur_size, o, cap + 16u);
+            });
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("dict");
+        }
+        if (tt_enabled && (tt_flags & 0x04u)) {
+            // HTML closing-tag restoration (NzTextTransformHtml). Reference
+            // order puts 0x04 after the 0x08 dictionary and before 0x02.
+            StageBuf tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformHtml(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("html");
+        }
+        if (tt_enabled && (tt_flags & 0x02u)) {
+            // Insert-LF transform (NzTextTransformInsertLf, ported from
+            // TransformText_3_InsertLF -- see include/nz_text_transform.h).
+            // Byte-count-preserving pure byte post-filter driven by the
+            // tt2_data side stream (its own embedded arithmetic decoder,
+            // independent of the CM/LZ entropy coder).
+            //
+            // Byte-count-PRESERVING (its own `allocated < in_size` guard says
+            // so), so the output is exactly cur_size. Sizing it from `remaining`
+            // -- the whole rest of the stream's output -- allocated 258 MB per
+            // block on a 281 MB worker stream, sixteen workers at once. The
+            // other text stages moved off `remaining` in ef6468b; this one and
+            // dece below were missed.
+            StageBuf tbuf(cur_size);
+            const std::uint32_t n = NzTextTransformInsertLf(
+                tt2_data.data(), static_cast<std::uint32_t>(tt2_data.size()),
+                work.data(), cur_size, tbuf.data(), cur_size);
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("lf");
+        }
+        if (tt_enabled && (tt_flags & 0x20u)) {
+            // Escape+run-length repeat transform (NzTextTransformRle, ported
+            // from TransformText_4 -- see include/nz_text_transform.h). Pure
+            // byte post-filter, no side-channel data, order-independent of
+            // the entropy coder (verified against real -co archives whose
+            // literal payload didn't warrant the word dictionary).
+            StageBuf tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformRle(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("rle");
+        }
+        if (tt_enabled && (tt_flags & 0x40u)) {
+            // Chess/PGN transform, between 0x20 and 0x01 in the reference's
+            // dispatch order. Not in the community reference at all (its body
+            // is assert(0)); decoded from (input, output) pairs plus the binary.
+            StageBuf tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 0u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransform6(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n);
+            work.swap(tbuf);
+            cur_size = n;
+            tt_step("t6");
+        }
+        if (tt_enabled && (tt_flags & 0x01u)) {
+            // CR/CRLF restoration -- LAST in the reference's chain (after 0x20
+            // and 0x40). One byte of slack: the reference's output budget is
+            // out_cap + 1 and it writes that extra byte before noticing the
+            // overrun (see NzTextTransformCrToCrLf's header comment).
+            StageBuf tbuf;
+            const std::uint32_t n = tt_scratch(&tbuf, 1u, [&](std::uint8_t* o, std::uint32_t cap) {
+                return NzTextTransformCrToCrLf(work.data(), cur_size, o, cap);
+            });
+            if (n == 0) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+            tt_step("crlf");
+        }
+        if (tt_dump_dir != nullptr && tt_enabled) {
+            char nm[512];
+            std::snprintf(nm, sizeof(nm), "%s/tt%d.out", tt_dump_dir, tt_dump_n);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(work.data(), 1, cur_size, f); std::fclose(f); }
+            ++tt_dump_seq;
+        }
+        if (tt_enabled) stgmark("tt", work.data(), cur_size);
+        if (dece_param) {
+            // dece: x86 CALL/JMP address un-relativiser -- the LAST step of the
+            // post-filter chain (reference DecodeFromStream: param2 -> param1 ->
+            // text transforms -> dece). Output GROWS (4 bytes per restored
+            // displacement, 3 more per add-esp), and since dece is last its
+            // result IS the block final output, so `remaining` is a correct cap
+            // -- and a ruinous allocation, 258 MB per block on a 281 MB worker
+            // stream. A try-small-then-retry is not available here: dece
+            // declines when it runs out of room, but its recent-target caches
+            // are already mutated by then, so a second run would decode from
+            // the wrong state. NzExeFilter::DecodedSizeBound bounds the block
+            // from the block itself instead.
+            const std::uint64_t dece_bound = NzExeFilter::DecodedSizeBound(
+                dece_data.data(), static_cast<std::uint32_t>(dece_data.size()), cur_size);
+            const std::uint32_t dece_cap = dece_bound >= remaining
+                                               ? remaining
+                                               : static_cast<std::uint32_t>(dece_bound);
+            StageBuf tbuf(dece_cap);
+            std::uint32_t n = 0;
+            const bool dok = exe.Decode(dece_data.data(),
+                                 static_cast<std::uint32_t>(dece_data.size()),
+                                 work.data(), cur_size, tbuf.data(), dece_cap, &n);
+            if (NZ_ENV("NZOPT_TRACE_TDO")) {
+                fprintf(stderr, "[TDO] dece: param=%u data=%zu in=%u -> %d out=%u\n",
+                        dece_param, dece_data.size(), cur_size, dok ? 1 : 0, n);
+            }
+            if (!dok || n == 0u) { if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+            tbuf.resize(n); work.swap(tbuf); cur_size = n;
+        } else {
+            // No dece on this block: it breaks any run in progress.
+            exe.Reset();
+        }
+
+        if (trace_stg) {
+            std::string hx; char b[8];
+            for (std::uint8_t v : staged) { snprintf(b, sizeof(b), "%02x", v); hx += b; }
+            fprintf(stderr, "[STG] block decr=%u param6=%u tt=%s%02x dece=%u staged=[%s]%s verify=%s\n", decr_param, param6,
+                    tt_enabled ? "0x" : "-", tt_enabled ? tt_flags : 0u, dece_param, hx.c_str(), stg.c_str(),
+                    stage_idx != staged.size() ? "skip(count)" : (stage_bad ? "BAD" : "ok"));
+        }
+        if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
+        out_data->Append(work.data(), cur_size);
+        progress::Add(cur_size);
+        nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
+                    cur_size, out_data->size(), (unsigned long long)total_size_hint,
+                    param2_flag, param1_flag, tt_enabled, tt_flags, dece_param);
+        }
+    }
+
+    if (ok) pscope.Commit();
+    if (trace_blocks) fprintf(stderr, "[TDO] loop end: ok=%d pos=%zu stream_end=%zu out=%zu want=%llu\n",
+                              (int)ok, pos, stream_end, out_data->size(), (unsigned long long)total_size_hint);
+    // Width-correct twin of the line above: every other [TDO] trace prints an
+    // ArcPos with %zu, which is a 64-bit value through a 32-bit conversion on a
+    // 32-bit build -- right where a >4 GB decode has to be read.
+    if (trace_blocks) {
+        const nzr::derr::State& st = nzr::derr::Current();
+        fprintf(stderr, "[TDO64] exit ok=%d pos=%llu stream_end=%llu out=%llu want=%llu derr=%u fatal=%u pos_set=%d at=%llu\n",
+                (int)ok, (unsigned long long)pos, (unsigned long long)stream_end,
+                (unsigned long long)out_data->size(), (unsigned long long)total_size_hint,
+                st.code, st.fatal_id, (int)st.has_pos, (unsigned long long)st.input_pos);
+    }
+    return ok;
+}
+
+static bool TryDecodeLegacyOptimum(
+    const LegacyCnContext& legacy,
+    OptimumOut* out_data,
+    std::string* out_error_message) {
+    progress::Scope pscope;
+    if (out_data == nullptr) return false;
+    out_data->Clear();
+
+    if (legacy.legacy_method != 0x3bu ||
+        (legacy.legacy_method_p0 != 5u && legacy.legacy_method_p0 != 6u))
+        return false;
+    // The payload as a RANGE SOURCE. This is the single-container path, where
+    // the payload can be the whole archive: asking for a flat pointer here is
+    // what made a 4.6 GB -cO archive cost 4.6 GB of anonymous memory and put it
+    // out of reach of a 32-bit build entirely.
+    const ByteView pv = legacy.Payload();
+    if (pv.empty()) return false;
+    const ArcPos raw_len = pv.size();
+    t_opt_pad_from = legacy.pad_from;
+    struct PadReset { ~PadReset() { t_opt_pad_from = ~ArcPos{0}; } } pad_reset;
+
+    // Read one top-level `stream_tag` varint: (stream_bytes<<4)|0, giving the
+    // byte range of one segment's block-record sequence. Real single-
+    // container -co/-cO archives can contain MORE THAN ONE of these back to
+    // back, directly concatenated with no separator/checksum record between
+    // them (unlike -cf/-cd's own chain mode, which has an inter-segment
+    // whole-output checksum) -- confirmed empirically on a real 60 KB .doc
+    // file whose first segment only covered 10229 of the entry's 60416
+    // declared output bytes: the very next byte was a second, independently
+    // valid `stream_tag` varint (low nibble 0, in-bounds stream_bytes)
+    // immediately following the first segment's end. An earlier RE session's
+    // "chain mode doesn't exist for -co" conclusion was apparently reached
+    // from insufficient (large-synthetic-file-only) fixtures.
+    auto read_stream_tag = [&pv, raw_len](ArcPos* p, std::uint64_t* out_tag) -> bool {
+        unsigned shift = 7;
+        if (*p >= raw_len) return false;
+        unsigned char c = pv[(*p)++];
+        std::uint64_t tag = static_cast<std::uint64_t>(c & 0x7fu);
+        while ((c & 0x80u) != 0u) {
+            if (*p >= raw_len || shift >= 63u) return false;
+            c = pv[(*p)++];
+            tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+            shift += 7u;
+        }
+        *out_tag = tag;
+        return true;
+    };
+
+    // One persistent decoder for this whole (single-container) entry: its
+    // ring/dictionary window and every adaptive probability table carry over
+    // from one decr_param==1 block to the next -- INCLUDING across chain
+    // segments, exactly like the real binary's per-container-stream
+    // subengine object (there is only one such object for the whole entry,
+    // not one per segment).
+    const std::uint32_t window_capacity =
+        nzr::optimum::NzOptimumLzWindowSizeFromP1(legacy.legacy_method_p1);
+    if (window_capacity == 0u) return false;
+    if (NZ_ENV("NZOPT_TRACE_TDO")) {
+        fprintf(stderr, "[TDO] method_p1=%u window_capacity=%u total_data_size=%llu\n",
+                legacy.legacy_method_p1, window_capacity,
+                (unsigned long long)legacy.total_data_size);
+    }
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_RAW")) {
+        FILE* f = fopen(dp, "wb");
+        if (f) { const ByteBuffer& fl = legacy.PayloadFlat();   // debug switch only
+                 fwrite(fl.data(), 1, fl.size(), f); fclose(f); }
+    }
+    out_data->Reserve(legacy.total_data_size);
+    // method_p0==5 -> -co (nz_optimum1, NzOptimumLzDecoder / FUN_0809e600);
+    // method_p0==6 -> -cO (nz_optimum2, NzOptimum2LzDecoder / FUN_080a5d90).
+    // Both share the exact same block-record framing/post-filter loop
+    // (DecodeOptimumBlockSequence, templated on the decoder type) and the
+    // same window-size-from-method_p1 formula -- only the per-block LZ/CM
+    // engine construction differs. The decoder type is fixed for the whole
+    // entry, so select it once via a small closure (mirrors the
+    // parallel-container branch's own pattern below) rather than
+    // duplicating the chain loop per type.
+    const std::uint64_t total_size_hint = legacy.total_data_size;
+    // One audio predictor per archive entry, shared across every chain
+    // segment: the reference keeps a single global for the whole decode, and
+    // its state is meant to survive from one segment's last block into the
+    // next segment's first (subject to the per-block reset rule inside
+    // DecodeOptimumBlockSequence).
+    auto aud = std::make_shared<nzr::audio::NzAudioPred>();
+    // One image model per entry as well (decr_param 3); never reset.
+    auto img = std::make_shared<nzr::audio::NzImageModel>();
+    ConfigureOptimumModels(legacy.legacy_method_p0, *aud, *img);
+    // The accumulated pre-post-filter stream param15 indexes, shared across
+    // the entry's chain segments like the window it mirrors.
+    // One exe filter per entry, same run/reset semantics as -cc above.
+    auto exe = std::make_shared<NzExeFilter>();
+    std::function<bool(ArcPos, ArcPos, OptimumOut*)> decode_seq;
+    if (legacy.legacy_method_p0 == 5u) {
+        auto dec = std::make_shared<nzr::optimum::NzOptimumLzDecoder>(window_capacity);
+        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](ArcPos b, ArcPos e, OptimumOut* out) {
+            return DecodeOptimumBlockSequence(pv, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
+        };
+    } else {
+        auto dec = std::make_shared<nzr::optimum2::NzOptimum2LzDecoder>(window_capacity);
+        decode_seq = [&pv, dec, aud, img, exe, total_size_hint](ArcPos b, ArcPos e, OptimumOut* out) {
+            return DecodeOptimumBlockSequence(pv, b, e, total_size_hint, *dec, *aud, *img, *exe, out);
+        };
+    }
+
+    ArcPos seg_pos = 0;   // payload offsets: 64-bit, the payload can exceed 4 GB
+    bool ok = true;
+    // 64-bit compare: narrowing the total to size_t on a 32-bit build turned
+    // 4 823 005 184 into 528 037 888, so the loop stopped after the fifth
+    // segment and the check below then called a perfectly good archive corrupt
+    // -- "unpacks about 512 MB, then code 100", exactly as reported.
+    while (static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
+        ArcPos p = seg_pos;
+        std::uint64_t stream_tag = 0;
+        const auto seg_stop = [&](const char* why) {
+            if (!NZ_ENV("NZOPT_TRACE_TDO")) return;
+            std::fprintf(stderr, "[TDO64] segment stop (%s): seg_pos=%llu p=%llu tag=%llu raw_len=%llu out=%llu\n",
+                         why, (unsigned long long)seg_pos, (unsigned long long)p,
+                         (unsigned long long)stream_tag, (unsigned long long)raw_len,
+                         (unsigned long long)out_data->size());
+            // Span() and operator[] take different routes to the same byte (the
+            // second has a flat fast path); printing both localises a bad read
+            // to the view rather than to the framing.
+            std::fprintf(stderr, "[TDO64]   idx:");
+            for (ArcPos k = 0; k < 8 && seg_pos + k < raw_len; ++k)
+                std::fprintf(stderr, " %02x", pv[seg_pos + k]);
+            const unsigned char* q = pv.Span(seg_pos, 8);
+            std::fprintf(stderr, "   span:");
+            if (q == nullptr) std::fprintf(stderr, " (null)");
+            else for (int k = 0; k < 8; ++k) std::fprintf(stderr, " %02x", q[k]);
+            std::fprintf(stderr, "   view=%s\n", pv.DebugKind());
+        };
+        if (!read_stream_tag(&p, &stream_tag)) { seg_stop("tag read"); ok = false; break; }
+        if ((stream_tag & 0x0fu) != 0u) { seg_stop("tag nibble"); ok = false; break; }
+        const std::uint64_t stream_bytes = stream_tag >> 4u;
+        if (stream_bytes > raw_len - p) { seg_stop("stream past end"); ok = false; break; }
+        const ArcPos stream_end = p + stream_bytes;
+        if (NZ_ENV("NZOPT_TRACE_TDO")) {
+            fprintf(stderr, "[TDO] chain segment: p=%zu stream_end=%zu out_data_size_before=%zu\n",
+                    p, stream_end, out_data->size());
+        }
+        if (!decode_seq(p, stream_end, out_data)) { ok = false; break; }
+        seg_pos = stream_end;
+    }
+
+    if (const char* dp = NZ_ENV("NZOPT_DUMP_PRECHECK")) {
+        // Dump BEFORE the size gate as well as the checksum gate, so a decode
+        // that gave up part-way is diffable too -- its correct prefix is where
+        // the interesting boundary is. Sitting after the size check made this
+        // useless for exactly the failure it was added to investigate.
+        FILE* f = fopen(dp, "wb");
+        if (f) { if (const auto* b = out_data->buffer()) fwrite(b->data(), 1, b->size(), f); fclose(f); }
+        fprintf(stderr, "[TDO] dumped %zu of %llu bytes to %s\n", out_data->size(),
+                (unsigned long long)legacy.total_data_size, dp);
+    }
+
+    // 64-bit compare, for the same reason the loop above is: narrowing the total
+    // to size_t on a 32-bit build turns 4 823 005 184 into 528 037 888, and a
+    // decode that produced every one of those bytes is then called corrupt.
+    if (!ok || out_data->size() != legacy.total_data_size) {
+        // out_data keeps the blocks completed before the failure: the original
+        // has written exactly those by the time it reports the error.
+        out_data->TruncateTo(legacy.total_data_size);
+        nzr::derr::Set(100u);
+        if (out_error_message) *out_error_message = "optimum: decode failed";
+        return false;
+    }
+
+    // Checksum self-verify (mirrors TryDecodeLegacyLzhd's own gate above): a
+    // stored per-file checksum mismatch means "decline, let the caller try
+    // another engine" rather than "trust it anyway".
+    //
+    // History: an earlier pass through this session found a live,
+    // reproducible bug in the literal 4-context mixer's ctxC seed formula
+    // (NzOptimumLzDecoder::DecodeBlock, the `(local_81 & 1u) == 0u` branch
+    // right after a match): on a real 246KB C++ source file
+    // (arc_source.cpp.nz-style archive), byte 132408 decoded as 0x64 instead
+    // of the correct 0x69, with the range-coder `code` register and every
+    // mixer/rep-array input up to that point confirmed bit-for-bit identical
+    // to the real linux32/nz binary via GDB, and `lo`/`hi` silently
+    // diverging only after that literal. Root-caused via disassembly at
+    // 0x0809eb9e-0x0809ebb5: the real binary computes
+    // `signshift = (uint8_t)prevHi >> 7` (a `movzx eax,al` before the
+    // `sar eax,7`, i.e. eax is always in [0,255], so the shift just extracts
+    // bit 7 as 0/1) but this port instead sign-extended `prevHi` to
+    // `int8_t` first, giving -1 instead of +1 whenever bit 7 was set --
+    // fixed in-place (see the comment at that branch). Re-validated against
+    // all 4 golden vectors, the previously-failing real archive, freshly
+    // regenerated matchfix/bigdist/smalldist/hientropy engineered-repeat
+    // archives, and tests/native_only_v2.sh with zero regressions, so the
+    // checksum gate below now follows the same shape as the sibling
+    // -cd/-cD/-cc gates (skip verification only when the archive truly
+    // carries no usable checksum) rather than an extra-conservative
+    // unconditional decline.
+    if (legacy.checksum_verification_supported &&
+        legacy.checksum_mode != ChecksumMode::kNone &&
+        !legacy.entries.empty()) {
+        // The verdict belongs to the caller (CheckEntries, or the sink's own
+        // per-slice checks when the output was streamed straight to the files);
+        // what matters here is declining an archive with no checksums at all.
+        for (const LegacyCnEntry& e : legacy.entries) {
+            if (!e.has_checksum) {
+                out_data->Clear();
+                if (out_error_message) *out_error_message = "optimum: entry missing checksum, declining";
+                return false;
+            }
+        }
+    }
+    pscope.Commit();
+    return true;
+}
+
+// The original's decode banner and summary. It writes each status line over the
+// previous one with a 79-space clear, reports the thread count it would use, names
+// the compressor with its working-set size, and closes with a throughput line plus
+// an IO line. Reproduced here so `nz-re`'s console output diffs against `nz`'s.
+// The working-set figure the original prints beside the compressor name. Ours is
+// this port's own allocation for that engine -- the original's number comes from its
+// own budgeting (it reports 13 MB where this engine allocates 0.3 MB), so this is
+// the one field in the decode banner that is deliberately OUR value and not a clone.
+// This port's own diagnostics ("[native] ...") used to ride on -v;
+// the original's -v adds nothing but an IO-buffers figure to the header, so they
+// now live behind NZ_VERBOSE_NATIVE to keep -v output byte-identical.
+// What the original says about a file that is not one of its archives -- its
+// opener (FUN_08092ca0) transcribed. It reads records as `varint (size<<4|type)`
+// with the type-15 stream extension, each with up to 64 bytes of content: the
+// first must be type 14 (the "NanoZip 0.09 alpha" string); if it is not, it
+// resyncs once on the magic string within the first 4 KB and retries. The second
+// record must be type 30 (the extension with stream 0) of size 1 holding the
+// version byte 9 (= "0.09"); anything else is reported as
+// "Archive file is made with incompatible version (%u.%02u)" with the byte it
+// found -- the previous record's first content byte when the second header
+// could not be read at all. Running out of input elsewhere is
+// "File is not a NanoZip archive.".
+// FUN_080b0e50: where an archive appended to a Windows PE image begins -- the
+// end of the last section, rounded up to 512 bytes -- or 0 when the buffer is
+// not a PE image (1 when it is one this code cannot measure).
+std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n) {
+    auto u16 = [b](std::size_t o) { return static_cast<std::uint32_t>(b[o]) | (static_cast<std::uint32_t>(b[o + 1]) << 8); };
+    auto u32 = [b, u16](std::size_t o) { return u16(o) | (u16(o + 2) << 16); };
+    if (n <= 0x40u || u16(0) != 0x5a4du) return 0;
+    const std::uint32_t pe = u32(0x3c);
+    if (pe >= n - 4u || u32(pe) != 0x4550u) return 0;
+    const std::uint32_t optsz = u16(pe + 0x14u);
+    std::size_t sect = static_cast<std::size_t>(pe) + optsz + 0x18u;
+    if (sect >= n || optsz >= 0x4001u) return 1;
+    const std::uint32_t nsec = u16(pe + 6u);
+    std::size_t total = 0;
+    if (nsec != 0u) {
+        std::uint32_t left = nsec;
+        while (sect < n - 0x28u) {
+            total += u32(sect + 0x10u);
+            sect += 0x28u;
+            if (--left == 0u) break;
+        }
+        if (left != 0u) return 1;
+    }
+    return ((sect + 0x1ffu) & ~static_cast<std::size_t>(0x1ffu)) + total;
+}
+
+std::string LegacyProbeMessage(const std::string& path) {
+    // Only record HEADERS are read here, every payload skipped, so the archive is
+    // mapped instead of copied. It used to be read into a vector in full: 4.3 GB
+    // of memory for a 4.3 GB archive, on top of the mapping the header walk
+    // already holds, which is what actually decided whether a large archive could
+    // be reported on at all -- and on a 32-bit build the resize threw
+    // std::length_error straight past main.
+    ArchiveBytes ab;
+    if (!ab.Open(path)) return ab.oom() ? "Out of memory!" : "Cannot open archive!";
+    const ByteView bytes = ab.View();
+    ArcPos pos = 0;
+    struct Rec { unsigned type = 0; std::size_t size = 0; unsigned char content[64]; bool have = false; };
+    Rec rec;
+    auto read_header = [&](Rec& r) -> bool {   // false = EOF / oversize (record not consumed)
+        std::uint64_t v = 0;
+        ArcPos p2 = pos;
+        if (!ReadLegacyVarint(bytes, &p2, bytes.size(), &v)) return false;
+        unsigned type = static_cast<unsigned>(v & 0xfu);
+        std::size_t size = static_cast<std::size_t>(v >> 4u);
+        if (type == 15u) {
+            if (p2 >= bytes.size()) return false;
+            unsigned ext = bytes[p2++];
+            if (ext >= 0xf8u) {
+                if (p2 >= bytes.size()) return false;
+                ext = (ext & 7u) + 0xf8u + 8u * bytes[p2++];
+            }
+            type = ext & 0xfu;
+            if ((ext >> 4u) == 0u) type += 15u;
+            size = ext >> 4u ? size : size;   // the size field is unchanged
+        }
+        pos = p2;
+        if (size > 64u) return false;
+        r.type = type; r.size = size; r.have = true;
+        const ArcPos avail = bytes.size() - pos;
+        const std::size_t n = size < avail ? size : avail;
+        std::memcpy(r.content, bytes.Span(pos, n), n);
+        pos += size < avail ? size : avail;
+        return true;
+    };
+    const char* not_archive = "File is not a NanoZip archive.";
+    bool ok = read_header(rec) && rec.type == 14u;
+    if (!ok) {
+        // Resync (FUN_08092220 -> FUN_080b0e50): the file may be a self-extracting
+        // .exe with the archive appended after the PE image; seek past the image.
+        const std::size_t probe_n = bytes.size() < 4096u ? static_cast<std::size_t>(bytes.size()) : 4096u;
+        const ArcPos off = LegacySfxDataOffset(bytes.Span(0u, probe_n), probe_n);
+        if (off == 0u) return not_archive;
+        pos = off;
+        if (!read_header(rec) || rec.type != 14u) return not_archive;
+    }
+    Rec second = rec;
+    const bool second_ok = read_header(second);
+    unsigned version = 0;
+    if (second_ok && second.type == 30u && second.size == 1u) {
+        version = second.content[0];
+        if (version == 9u) return std::string();   // a real 0.09 archive
+    } else if (second.size != 0u) {
+        version = second.content[0];   // the last header that was read, even a failed one
+    } else {
+        if (pos >= bytes.size()) return not_archive;
+        version = bytes[pos];
+    }
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "Archive file is made with incompatible version (%u.%02u).", version / 100u, version % 100u);
+    return std::string(buf);
+}
+
+// Resident and peak-resident megabytes, for the stage profile. Linux only;
+// every other platform reports 0 and the stage line just omits the figures.
+static void StageRssMb(long* rss_mb, long* peak_mb, long* data_mb = nullptr) {
+    *rss_mb = 0; *peak_mb = 0; if (data_mb) *data_mb = 0;
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (f == nullptr) return;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        long kb = 0;
+        if (std::sscanf(line, "VmRSS: %ld kB", &kb) == 1) *rss_mb = kb / 1024;
+        else if (std::sscanf(line, "VmHWM: %ld kB", &kb) == 1) *peak_mb = kb / 1024;
+        else if (data_mb != nullptr && std::sscanf(line, "VmData: %ld kB", &kb) == 1) *data_mb = kb / 1024;
+    }
+    std::fclose(f);
+#endif
+}
+
+// Stage timer AND memory for the big-archive profile (NZ_VERBOSE_NATIVE):
+// "+delta (total)  rss=N MB peak=N MB". The memory column is what the streaming
+// work is measured against -- the original holds 278 MB decoding a 4.5 GB output,
+// so a stage whose rss climbs with the OUTPUT rather than the window is a bug.
+void StageMark(const char* what) {
+    static const bool on = (NZ_ENV("NZ_VERBOSE_NATIVE") != nullptr);
+    if (!on) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    static auto last = t0;
+    const auto now = std::chrono::steady_clock::now();
+    long rss = 0, peak = 0, dat = 0;
+    StageRssMb(&rss, &peak, &dat);
+    std::fprintf(stderr, "[time] %-20s +%6.2fs  (t=%6.2fs)  rss=%5ld MB peak=%5ld MB anon=%5ld MB\n", what,
+                 std::chrono::duration<double>(now - last).count(),
+                 std::chrono::duration<double>(now - t0).count(), rss, peak, dat);
+    last = now;
+}
+
+bool NativeTrace() {
+    static const bool t = (NZ_ENV("NZ_VERBOSE_NATIVE") != nullptr);
+    return t;
+}
+
+// bytefloat(p1 + 1) in 64 KB units -- the window size every codec derives from
+// its p1 byte (the same mantissa/exponent code the -cc window and the lzpf
+// dictionary use).
+std::uint64_t LegacyWindowBytes(std::uint32_t p1) {
+    const std::uint32_t xp1 = p1 + 1u;
+    std::uint32_t m = xp1 & 0xfu;
+    const std::uint32_t sft = xp1 >> 4u;
+    if (sft) m = (m + 16u) << (sft - 1u);
+    return static_cast<std::uint64_t>(m) << 16u;
+}
+
+// The byte figure behind "Compressor #n: <name> [<N> MB]" -- the value the
+// original's per-codec memory-usage method (vtable slot 0: FUN_08094f10 store,
+// FUN_08097550 lzpf, FUN_08099440 lzhd, FUN_080aafb0 CM family) returns, which the
+// printer rounds with ((bytes >> 19) + 1) >> 1. The exact returns were read with
+// GDB at that call for every codec; the window term is bytefloat(p1+1)*64 KB and
+// the constants are the codec objects' fixed allocations:
+//     none           W
+//     lzpf           W + 0x618000          lzpf_large  W + 0x4410000
+//     lzhd           W + 0x210000          lzhds       W + 0x350040
+//     cm / optimum1 / optimum2   see LegacyCmFamilyWorkingSet
+std::uint64_t LegacyCmFamilyWorkingSet(const LegacyCnContext& c, std::uint64_t W);
+std::uint64_t LegacyEngineWorkingSetP1(const LegacyCnContext& c, std::uint8_t p1);
+std::uint64_t LegacyEngineWorkingSet(const LegacyCnContext& c) { return LegacyEngineWorkingSetP1(c, c.legacy_method_p1); }
+std::uint64_t LegacyEngineWorkingSetP1(const LegacyCnContext& c, std::uint8_t p1) {
+    const std::uint64_t W = LegacyWindowBytes(p1);
+    if (c.legacy_method_p0 == 0u) return W;
+    if (c.legacy_method == 0x2bu) {
+        switch (c.legacy_method_p0) {
+            case 1u: return W + 0x618000ull;
+            case 2u: return W + 0x4410000ull;
+            case 3u: return W + 0x210000ull;
+            case 4u: return W + 0x350040ull;
+            default: return W;
+        }
+    }
+    if (c.legacy_method == 0x4bu || c.legacy_method == 0x3bu) return LegacyCmFamilyWorkingSet(c, W);
+    return W;
+}
+
+// The extract loop's view of the progress engine: a file starting is the
+// writer's tick (name + fields, once per second); on a stored archive, where no
+// decoder ran, the copied bytes are the figure.
+struct DecodeProgress {
+    explicit DecodeProgress(std::ostream&) {}
+    void Begin(const std::string& name) { progress::FileStart(name); }
+    void Advance(std::uint64_t n) { if (!progress::Decoded()) progress::Add(n); }
+};
+
+// The CM family's memory method, FUN_080aafb0, transcribed (Ghidra + GDB reads of
+// every component on nine archives, all reproduced to the byte):
+//   FUN_080c0070(window object) = W + 0x1008ab + 5*P + ((0x100000 + P/32 + 1) >> 1)
+//                                 + (0x20001 >> 1) + FUN_080b88b0(P) [+ CM tables]
+//   where P = the object's primary buffer: max(W, 1 MB) for -co/-cO, a fixed 1 MB
+//   for -cc; FUN_080b88b0 is two halved table sizes = 2775628 at P = 1 MB growing
+//   by 69/1280 of P beyond that (exact on 1.375/2/6 MB); the -cc tables are
+//   2^a + 4*2^b + 23280971 (a, b = the two size nibbles the archive carries).
+//   Then + 0x210000 (the audio/image object) and the per-mode tail: -co 0x8b600 +
+//   0x3f700 + 0x1000 + 0x80000, -cc 0x8b600 + 0x1000, -cO 0x118f240 alone.
+std::uint64_t LegacyCmFamilyWorkingSet(const LegacyCnContext& c, std::uint64_t W) {
+    const std::uint64_t MB = 1048576ull;
+    // P is the object's primary buffer. For -cc it is a fixed 1 MB; for
+    // -co/-cO it follows the BLOCK size the compressor chose, which the codec
+    // record carries in its third byte (the same byte-float as the window).
+    // Older archives (and any record without that byte) fall back to the
+    // window, which is what the default -m produces anyway.
+    std::uint64_t P = MB;
+    if (c.legacy_method_p0 != 7u) {
+        std::uint64_t block = 0;
+        if (c.legacy_method_p2 != 0u) {
+            const unsigned xp = static_cast<unsigned>(c.legacy_method_p2) + 1u;
+            unsigned m = xp & 0x0fu;
+            const unsigned sh = xp >> 4u;
+            if (sh) m = (m + 16u) << (sh - 1u);
+            block = static_cast<std::uint64_t>(m) << 16u;
+        }
+        const std::uint64_t base = block != 0u ? block : W;
+        P = base > MB ? base : MB;
+    }
+    std::uint64_t f88b0 = 2775628ull;
+    if (P > MB) f88b0 += ((P - MB) * 69ull + 640ull) / 1280ull;
+    std::uint64_t core = W + 0x1008abull + 5ull * P + ((0x100000ull + P / 32ull + 1ull) >> 1)
+                       + (0x20001ull >> 1) + f88b0;
+    if (c.legacy_method_p0 == 7u) core += (1ull << c.cm_a_bits) + (4ull << c.cm_b_bits) + 23280971ull;
+    // -cO takes the method's early return: core + audio object + 0x118f240, with
+    // NO dispatcher term (verified: 30643511 / 37663236 / 63120695 for W = 384 KB /
+    // 2 MB / 6 MB). -co and -cc go through the common tail with the dispatcher.
+    if (c.legacy_method_p0 == 6u) return core + 0x210000ull + 0x118f240ull;
+    std::uint64_t total = core + 0x210000ull + 0x8b600ull;
+    if (c.legacy_method_p0 == 5u) total += 0x3f700ull + 0x1000ull + 0x80000ull;
+    else total += 0x1000ull;
+    return total;
+}
+
+// Throughput unit, chosen the way the original does: it prints "6000 B/s" for a
+// 6-byte decode and "55 KB/s" alongside it, i.e. the unit steps up past nine of the
+// current one, matching the size column's rule.
+std::string FormatRate(double bytes_per_second) {
+    static const char* kU[] = {"B/s", "KB/s", "MB/s", "GB/s"};
+    double v = bytes_per_second;
+    int i = 0;
+    while (i < 3 && v > 9.0 * 1024.0) { v /= 1024.0; ++i; }
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.0f %s", v, kU[i]);
+    return std::string(b);
+}
+
+double ElapsedSince(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// FUN_0804bf50: the original's duration string, built by hand from a count of
+// MILLISECONDS -- there is no printf format for it in the binary. Hours and
+// minutes appear only when non-zero and are never zero-padded, the seconds field
+// is one digit under ten, and the fraction is two digits TRUNCATED from the
+// millisecond remainder:
+//
+//     1.05s      45.94s      37m 45.94s      2h 3m 4.56s
+//
+// with the quirk that a run of exactly two hours and four seconds prints
+// "2h 4.00s" -- the minute field is skipped outright rather than printed as 0.
+// This port printed "%.2fs" of the whole elapsed time everywhere, which agrees
+// only below one minute (and even there rounds where the original truncates).
+// Nothing in the test corpus ran for a minute, so the branch was never taken
+// until a 4.6 GB archive took 38 of them.
+std::string FormatElapsedMs(std::uint64_t ms) {
+    const std::uint64_t h = ms / 3600000ull;
+    const std::uint64_t m = (ms / 60000ull) % 60ull;
+    const std::uint64_t sec = (ms / 1000ull) % 60ull;
+    const std::uint64_t frac = ms % 1000ull;
+    char b[64];
+    std::string out;
+    if (h != 0ull) { std::snprintf(b, sizeof b, "%lluh ", (unsigned long long)h); out += b; }
+    if (m != 0ull) { std::snprintf(b, sizeof b, "%llum ", (unsigned long long)m); out += b; }
+    std::snprintf(b, sizeof b, "%llu.%llu%llus", (unsigned long long)sec,
+                  (unsigned long long)(frac / 100ull), (unsigned long long)((frac / 10ull) % 10ull));
+    out += b;
+    return out;
+}
+
+std::string FormatElapsed(double seconds) {
+    if (!(seconds > 0.0)) seconds = 0.0;
+    return FormatElapsedMs(static_cast<std::uint64_t>(seconds * 1000.0));
+}
+
+// The original's compression banner and summary. Shapes matched exactly; the
+// memory/IO-buffer figures are this port's own (it does not implement the original's
+// buffer budgeting), and `bpb` is out*8/(in+1) -- fitted to five measured samples,
+// two of which rule out the obvious out*8/in (6 -> 55 prints 62.857 = 55*8/7, and
+// 100 -> 154 prints 12.198 = 154*8/101).
+void PrintEncodeHeader(std::ostream& os, const std::string& archive_path,
+                       const std::string& compressor_name, std::uint64_t engine_bytes,
+                       unsigned memory_mb, unsigned read_mb, unsigned write_mb, bool verbose) {
+    os << "Archive: " << archive_path << '\n';
+    os << "Threads: " << HostThreadCount() << ", memory: " << memory_mb
+       << " MB, IO-buffers: " << read_mb << '+' << write_mb << " MB\n";
+    if (verbose) os << "Setting up IO write buffer: " << write_mb << " MB\n";
+    ClearStatusLine(os);
+    os << "Compressor #0: " << compressor_name << " ["
+       << ((engine_bytes + 512u * 1024u) / (1024u * 1024u)) << " MB]";
+    if (verbose) os << " IO-buffer: " << read_mb << " MB.";
+    os << '\n';
+}
+
+void PrintEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t out_bytes,
+                       double seconds, bool verbose) {
+    const double bps = (seconds > 0.0) ? (double)in_bytes / seconds : 0.0;
+    char buf[224];
+    ClearStatusLine(os);
+    // Note: no trailing period on this line in the original; the IO line has one.
+    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %s, %s",
+                  FormatGrouped(in_bytes).c_str(), FormatGrouped(out_bytes).c_str(),
+                  FormatElapsed(seconds).c_str(), FormatRate(bps).c_str());
+    os << buf;
+    if (verbose) {
+        std::snprintf(buf, sizeof(buf), " (%.3f bpb)",
+                      (double)out_bytes * 8.0 / (double)(in_bytes + 1u));
+        os << buf;
+    }
+    os << '\n';
+    std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.", FormatElapsed(seconds).c_str(), FormatRate(bps).c_str());
+    os << buf << '\n';
+}
+
+// "Compressor #k: <name> [<N> MB]\n" for worker k, the memory figure from that
+// worker's own window byte (rounding is the original's ((bytes >> 19) + 1) >> 1);
+// under -v the IO buffer split (no read-ahead, 1 MB write-behind for `t`, 4 for `x`).
+std::string FormatCompressorLine(const LegacyCnContext& ctx, std::size_t k, bool verbose, bool test_mode) {
+    const std::string label = LegacyCompressorName(ctx.legacy_method, ctx.legacy_method_p0);
+    const std::uint8_t p1 = (ctx.parallel_p1.empty() || k >= ctx.parallel_p1.size()) ? ctx.legacy_method_p1 : ctx.parallel_p1[k];
+    const std::uint64_t bytes = LegacyEngineWorkingSetP1(ctx, p1);
+    // The original builds the decompressor before it prints this line, so a
+    // working set that does not fit ends the run with "Out of memory!" right
+    // after `Threads:` and no compressor line (measured: 32-bit build, a 3.75 GiB
+    // window). The port allocates later, inside the decoder; asking for the
+    // same amount here, and handing it straight back, puts the failure where
+    // the original's is. A large calloc is only an address-space reservation.
+    if (bytes != 0u) {
+        if (bytes > static_cast<std::uint64_t>(SIZE_MAX)) throw std::bad_alloc();
+        void* probe = std::calloc(static_cast<std::size_t>(bytes), 1u);
+        if (probe == nullptr) throw std::bad_alloc();
+        std::free(probe);
+    }
+    std::string line = "Compressor #" + std::to_string(k) + ": " + label + " [" + std::to_string(((bytes >> 19) + 1u) >> 1) + " MB]";
+    if (verbose) line += std::string(" IO-buffers: 0+") + (test_mode ? "1" : "4") + " MB.";
+    line += '\n';
+    return line;
+}
+
+void PrintDecodeHeader(std::ostream& os, const LegacyCnContext& ctx, const CliOptions& options, bool test_mode) {
+    const bool verbose = options.verbose;
+    os << "Archive: " << ctx.archive_path << '\n';
+    // -t<n> caps the reported thread count (n = 0 or above the CPU count = auto);
+    // -br/-bw show as ", IO-read-buffer: N MB" / ", IO-write-buffer: N MB", or
+    // ", IO-buffers: R+W MB" when both are given, N rounded to whole MB (512k -> 1).
+    unsigned threads = HostThreadCount();
+    if (options.threads > 0u && options.threads < threads) threads = options.threads;
+    os << "Threads: " << threads;
+    const auto mb = [](std::uint64_t b) { return (b + 512u * 1024u) >> 20; };
+    if (options.read_buffer_bytes && options.write_buffer_bytes)
+        os << ", IO-buffers: " << mb(options.read_buffer_bytes) << '+' << mb(options.write_buffer_bytes) << " MB";
+    else if (options.read_buffer_bytes)  os << ", IO-read-buffer: " << mb(options.read_buffer_bytes) << " MB";
+    else if (options.write_buffer_bytes) os << ", IO-write-buffer: " << mb(options.write_buffer_bytes) << " MB";
+    os << '\n';
+    // Rounding is the original's ((bytes >> 19) + 1) >> 1. Under -v it appends its
+    // IO buffer split: no read-ahead, a 1 MB write-behind for `t`, 4 MB for `x`.
+    // A parallel container gets one line per worker (the original emits them in
+    // thread-scheduling order; this port uses stream order), each sized from
+    // that worker's own window byte.
+    const std::size_t n = ctx.parallel_p1.empty() ? 1u : ctx.parallel_p1.size();
+    // The original prints a worker's line the first time that worker ticks, so
+    // the header carries only the workers already running when it goes out; the
+    // rest follow as they start (the progress engine prints them). For a single
+    // container the one worker is always running by then.
+    const bool parallel = !ctx.parallel_p1.empty();
+    // Cut before the first data record: the original never creates a
+    // decompressor, so no line at all.
+    if (!ctx.saw_data_record) return;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (parallel && !progress::SlotStarted(k, progress::E())) continue;
+        const std::string line = FormatCompressorLine(ctx, k, verbose, test_mode);
+        ClearStatusLine(os);
+        os.write(line.data(), static_cast<std::streamsize>(line.size()));
+        progress::MarkAnnounced(k);
+    }
+}
+
+// `<name>` then five spaces, then the running figure rewritten in place: back four,
+// four characters, four spaces -- and eight backspaces once the file is done. This
+// is the original's exact cursor dance.
+// The four-character field the original rewrites in place: megabytes done.
+std::string FormatSizeColumnCompact(std::uint64_t bytes) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%llu MB", (unsigned long long)((bytes + 512u * 1024u) / (1024u * 1024u)));
+    return std::string(b);
+}
+
+void PrintFileProgress(std::ostream& os, const std::string& name, const std::string& field4) {
+    ClearStatusLine(os);
+    os << name << "     " << "\b\b\b\b" << field4 << "    " << "\b\b\b\b\b\b\b\b";
+    os.flush();
+}
+
+void PrintDecodeFooter(std::ostream& os, std::uint64_t bytes, double seconds) {
+    const double bps = (seconds > 0.0) ? (double)bytes / seconds : 0.0;
+    char buf[192];
+    ClearStatusLine(os);
+    std::snprintf(buf, sizeof(buf), "Decompressed %s bytes in %s, %s.",
+                  FormatGrouped(bytes).c_str(), FormatElapsed(seconds).c_str(), FormatRate(bps).c_str());
+    os << buf << '\n';
+    // IO-in is the INPUT: the archive's bytes over the time spent acquiring
+    // them, which is what the original reports (4.6 GB in 1.05 s on the
+    // reporter's file). The rate is clamped the way the original's is, at one
+    // millisecond, so a sub-millisecond acquisition prints a rate rather than
+    // dividing by zero.
+    const ArchiveIoStats& io = LastArchiveIo();
+    const double io_s = (io.seconds > 0.001) ? io.seconds : 0.001;
+    const double io_bps = (io.bytes != 0u) ? (double)io.bytes / io_s : bps;
+    std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.",
+                  FormatElapsed(io.bytes != 0u ? io.seconds : seconds).c_str(),
+                  FormatRate(io_bps).c_str());
+    os << buf;
+    // IO-out: what an extraction wrote, on the same line without a trailing
+    // period, only when the writes took a measurable millisecond -- the
+    // original's shape on Linux and Windows alike. A test writes nothing.
+    const DecodeIoStats& wo = DecodeWriteIo();
+    const std::uint64_t write_ms = wo.nanos.load() / 1000000ull;
+    if (wo.bytes.load() != 0u && write_ms > 0u) {
+        std::snprintf(buf, sizeof(buf), " IO-out: %s, %s", FormatElapsedMs(write_ms).c_str(),
+                      FormatRate(static_cast<double>(wo.bytes.load()) * 1000.0 / static_cast<double>(write_ms)).c_str());
+        os << buf;
+    }
+    os << '\n';
+}
+
+// Every field of a context except its (possibly gigabytes of) payload -- the
+// re-entrant call below replaces the payload with the decoded bytes anyway, so
+// copying the compressed one first was pure memcpy waste on big archives.
+LegacyCnContext CloneLegacyMeta(const LegacyCnContext& c) {
+    LegacyCnContext r;
+    r.archive_path = c.archive_path;
+    r.checksum_mode = c.checksum_mode;
+    r.checksum_verification_supported = c.checksum_verification_supported;
+    r.legacy_method = c.legacy_method;
+    r.legacy_method_p0 = c.legacy_method_p0;
+    r.legacy_method_p1 = c.legacy_method_p1;
+    r.legacy_method_p2 = c.legacy_method_p2;
+    r.cm_a_bits = c.cm_a_bits;
+    r.cm_b_bits = c.cm_b_bits;
+    r.cm_window_size = c.cm_window_size;
+    r.native_payload_supported = c.native_payload_supported;
+    r.truncated_input = c.truncated_input;
+    r.parallel_p1 = c.parallel_p1;
+    r.checksums_verified = c.checksums_verified;
+    r.entry_checksum_ok = c.entry_checksum_ok;
+    r.decode_failed = c.decode_failed;
+    r.decode_eof = c.decode_eof;
+    r.payload_mode = c.payload_mode;
+    r.entries = c.entries;
+    r.data_offset = c.data_offset;
+    r.total_data_size = c.total_data_size;
+    // where each data record ends: what tells a failure in the archive's last
+    // record (reported shifted, status << 8) from one with records after it
+    r.payload_record_ends = c.payload_record_ends;
+    r.records_after_data = c.records_after_data;
+    return r;
+}
+
+int RunLegacyCnExtractOrTest(
+    const CliOptions& options,
+    const LegacyCnContext& legacy,
+    bool test_mode,
+    std::ostream& os,
+    // Start of the whole command (decode included): the footer's "in N s" is the
+    // original's total, not just the copy-out that follows a finished decode.
+    std::chrono::steady_clock::time_point run_start) {
+    if (legacy.sink_handled) {
+        if (legacy.decode_failed) return PrintCorruptLine(os, legacy);
+        PrintDecodeFooter(os, legacy.total_data_size, ElapsedSince(run_start));
+        return legacy.sink_failed_entries == 0u ? 0 : 2;
+    }
+    if (!legacy.native_payload_supported) {
+        std::vector<unsigned char> bridged_data;
+        std::string lzhd_decode_error;
+        // -cd/-cD: straight to the files, one data record at a time, as the
+        // optimum and CM paths below do; the entry's output never exists whole.
+        const bool lzhd_codec = (legacy.legacy_method == 0x2bu) &&
+                                (legacy.legacy_method_p0 == 3u || legacy.legacy_method_p0 == 4u);
+        if (lzhd_codec && psink::Available() && !legacy.entries.empty()) {
+            std::vector<psink::Stream> pstreams;
+            psink::Stream ps;
+            for (std::size_t i = 0; i < legacy.entries.size(); ++i) {
+                const LegacyCnEntry& en = legacy.entries[i];
+                psink::Slice sl;
+                sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                sl.cmode = legacy.checksum_mode; sl.cval = en.checksum;
+                sl.has_cksum = en.has_checksum; sl.group = i;   // one group per entry (see the optimum path)
+                ps.slices.push_back(sl);
+            }
+            pstreams.push_back(std::move(ps));
+            if (psink::Publish(legacy.entries, std::move(pstreams), psink::Policy::kProduced, 0u, psink::Family::kCd)) {
+                std::uint64_t streamed = 0;
+                const std::function<void(const unsigned char*, std::size_t)> to_sink =
+                    [&streamed](const unsigned char* q, std::size_t n) {
+                        if (n == 0u) return;
+                        if (streamed == 0u) psink::StreamBegin(0u);   // the first file on the first byte
+                        psink::StreamWrite(0u, q, n);
+                        streamed += n;
+                    };
+                const bool lz_ok = TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error, &to_sink);
+                if (lz_ok || (streamed != 0u && IsCorruptStreamFailure(lzhd_decode_error))) {
+                    psink::StreamEnd(0u, nullptr, streamed, lz_ok, false);
+                    LegacyCnContext done = CloneLegacyMeta(legacy);
+                    const psink::Outcome so = psink::Finish();
+                    done.sink_handled = true;
+                    done.sink_failed_entries = so.failed_entries;
+                    done.sink_plain_code = so.plain_code;
+                    if (lz_ok) {
+                        done.native_payload_supported = true;
+                        done.decode_failed = so.stream_failed;
+                        return RunLegacyCnExtractOrTest(options, done, test_mode, os, run_start);
+                    }
+                    // The records completed before the failure are on disk, as in
+                    // the original; report the way the buffered path below does.
+                    done.decode_failed = true;
+                    done.decode_eof = (lzhd_decode_error == "lzhd: unexpected end of file");
+                    AdoptDecodeError(done);
+                    return PrintCorruptLine(os, done);
+                }
+                // Nothing handed over: give the sink back unused and fall through
+                // to the paths below exactly as before.
+                psink::Reset();
+                psink::Configure(options, test_mode, os,
+                                 options.output_path.empty() ? fs::current_path()
+                                                             : PathFromNativeBytes(options.output_path));
+                bridged_data.clear();
+            }
+        }
+        if (bridged_data.empty() && lzhd_decode_error.empty() &&
+            TryDecodeLegacyLzhd(legacy, &bridged_data, &lzhd_decode_error)) {
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.checksums_verified = false;   // set below once the data is in place
+            bridged.data = std::move(bridged_data);
+            {
+                std::size_t bad = 0;
+                if (!CheckEntries(bridged.entries, bridged.checksum_mode, bridged.checksum_verification_supported,
+                                  bridged.data.data(), bridged.data.size(), &bridged.entry_checksum_ok, &bad)) {
+                    return kLegacyNeedCompat;   // decode did not produce the declared sizes
+                }
+                bridged.checksums_verified = bridged.checksum_verification_supported;
+                if (bad == 0u) bridged.entry_checksum_ok.clear();
+            }
+            if (NativeTrace()) {
+                os << "[native] decoded -cd payload natively ("
+                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
+                   << ").\n";
+            }
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
+        }
+        // Native -co (nz_optimum1, method_p0==5, single-container flag 0x05)
+        // AND -cO (nz_optimum2, method_p0==6, single-container flag 0x06) via
+        // TryDecodeLegacyOptimum, backed by NzOptimumLzDecoder (a byte-exact
+        // port of the real binary's FUN_0809e600) or NzOptimum2LzDecoder (a
+        // byte-exact port of FUN_080a5d90) respectively -- see
+        // tests/test_optimum_lz.cpp / tests/test_optimum2_lz.cpp and
+        // work/reports/decomp_optimum/optimum_lz_core_ARCHITECTURE.md. This
+        // supersedes the long-standing "wrong decoder" finding from an earlier
+        // session (NzLzhdDecode/DecLZ is never reached by a real -co decode;
+        // the real per-block core is FUN_0809e600, not FUN_080b5240).
+        // TryDecodeLegacyOptimum checksum-gates its own result internally
+        // (mirroring TryDecodeLegacyLzhd immediately above), so a mismatch or
+        // any malformed-bitstream/out-of-window condition already declines
+        // before reaching here -- no extra bridge cross-check needed.
+        // Parallel-container -cO (flag 0x0f) and decr_param==0 (BWT, either
+        // engine) -- historical note: both were once unported; both are native now,
+        // as does the parallel-container case for -co (TryDecodeLegacyOptimum
+        // only parses a single stream_tag's worth of blocks; parallel-
+        // container framing would fail that parse and decline harmlessly, or
+        // in the unlikely event it doesn't, the checksum gate still catches
+        // it).
+        std::string optimum_decode_error;
+        // Stream the output straight to the files when the sink is up, the way
+        // the original does: it creates the file at once and writes it as the
+        // blocks come out, where this reader used to hold a whole entry's
+        // output in memory before writing anything -- 4.8 GB on a large archive,
+        // which is also why a 32-bit build could never finish one.
+        // One stream, its slices the archive's entries in output order.
+        // ONLY for the codecs this path actually decodes: publishing the sink
+        // for an archive that then declines here (a -cc one reaches this code
+        // too) leaves it published, and the CM decoder below writes nothing.
+        const bool optimum_codec = (legacy.legacy_method == 0x3bu) &&
+                                   (legacy.legacy_method_p0 == 5u || legacy.legacy_method_p0 == 6u);
+        bool optimum_sink = false;
+        if (NZ_ENV("NZ_TRACE_SINK"))
+            std::fprintf(stderr, "[sink] optimum path: codec=%d available=%d entries=%zu\n",
+                         (int)optimum_codec, (int)psink::Available(), legacy.entries.size());
+        if (optimum_codec && psink::Available() && !legacy.entries.empty()) {
+            std::vector<psink::Stream> pstreams;
+            psink::Stream ps;
+            for (std::size_t i = 0; i < legacy.entries.size(); ++i) {
+                const LegacyCnEntry& en = legacy.entries[i];
+                psink::Slice sl;
+                sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                sl.cmode = legacy.checksum_mode; sl.cval = en.checksum;
+                // One group per ENTRY: in a single container the original opens
+                // the next output file only when a flush reaches it, so the file
+                // the cursor stands in when a decode stops is the one it leaves
+                // behind empty. With every slice in group 0 that file was never
+                // created (measured on a flipped multi-file -cc container: the
+                // original leaves a.cpp at 0 bytes, this left nothing).
+                sl.has_cksum = en.has_checksum; sl.group = i;
+                ps.slices.push_back(sl);
+            }
+            pstreams.push_back(std::move(ps));
+            optimum_sink = psink::Publish(legacy.entries, std::move(pstreams),
+                                          psink::Policy::kProduced, 0u,
+                                          legacy.legacy_method_p0 == 5u ? psink::Family::kCo
+                                                                        : psink::Family::kCO);
+        }
+        std::vector<unsigned char> optimum_native_data;
+        std::uint64_t optimum_streamed = 0;
+        OptimumOut optimum_out = optimum_sink
+            // StreamBegin on the FIRST byte, not before the decode: it creates
+            // the stream's first output file, and a decode that then produces
+            // nothing must leave no file at all -- the original opens the next
+            // output file only after a flush reaches it.
+            ? OptimumOut([&optimum_streamed](const unsigned char* q, std::size_t n) {
+                  if (optimum_streamed == 0u) psink::StreamBegin(0u);
+                  psink::StreamWrite(0u, q, n);
+                  optimum_streamed += n;
+              })
+            : OptimumOut(&optimum_native_data);
+        const bool optimum_ok = TryDecodeLegacyOptimum(legacy, &optimum_out, &optimum_decode_error);
+        if (optimum_sink && !optimum_ok && optimum_streamed == 0u) {
+            // Declined before producing anything: hand the sink back unused so
+            // whatever engine runs next can publish its own layout.
+            psink::Reset();
+            psink::Configure(options, test_mode, os,
+                             options.output_path.empty() ? fs::current_path()
+                                                         : PathFromNativeBytes(options.output_path));
+            optimum_sink = false;
+        }
+        if (optimum_sink) {
+            psink::StreamEnd(0u, nullptr, optimum_streamed, optimum_ok, false);
+            if (optimum_ok) {
+                LegacyCnContext done = CloneLegacyMeta(legacy);
+                done.native_payload_supported = true;
+                const psink::Outcome so = psink::Finish();
+                done.sink_handled = true;
+                done.sink_failed_entries = so.failed_entries;
+                done.decode_failed = so.stream_failed;
+                done.sink_plain_code = so.plain_code;
+                return RunLegacyCnExtractOrTest(options, done, test_mode, os, run_start);
+            }
+            // The sink wrote whatever completed before the failure, which is what
+            // the original leaves behind too; report through the same path.
+            LegacyCnContext failed = CloneLegacyMeta(legacy);
+            const psink::Outcome so = psink::Finish();
+            failed.sink_handled = true;
+            failed.decode_failed = true;
+            failed.sink_failed_entries = so.failed_entries;
+            failed.sink_plain_code = so.plain_code;
+            AdoptDecodeError(failed);
+            return PrintCorruptLine(os, failed);
+        }
+        if (optimum_ok) {
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.checksums_verified = false;   // set below once the data is in place
+            bridged.data = std::move(optimum_native_data);
+            {
+                std::size_t bad = 0;
+                if (!CheckEntries(bridged.entries, bridged.checksum_mode, bridged.checksum_verification_supported,
+                                  bridged.data.data(), bridged.data.size(), &bridged.entry_checksum_ok, &bad)) {
+                    return kLegacyNeedCompat;   // decode did not produce the declared sizes
+                }
+                bridged.checksums_verified = bridged.checksum_verification_supported;
+                if (bad == 0u) bridged.entry_checksum_ok.clear();
+            }
+            if (NativeTrace()) {
+                os << "[native] decoded " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
+                   << " payload natively ("
+                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
+                   << ").\n";
+            }
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
+        } else if (NativeTrace() && !optimum_decode_error.empty()) {
+            os << "[native] " << (legacy.legacy_method_p0 == 6u ? "-cO" : "-co")
+               << " native decode declined: " << optimum_decode_error << '\n';
+        }
+        std::string cm_decode_error;
+        std::vector<unsigned char> cm_native_data;
+        // Same single-stream sink the optimum family publishes above: the CM
+        // decoder hands each block over and the entry's output never has to
+        // exist. Only for -cc, and only after the engines above have declined,
+        // so the sink is free again by the time this runs.
+        const bool cm_codec = (legacy.legacy_method == 0x4bu && legacy.legacy_method_p0 == 7u);
+        bool cm_sink = false;
+        if (cm_codec && psink::Available() && !legacy.entries.empty()) {
+            std::vector<psink::Stream> pstreams;
+            psink::Stream ps;
+            for (std::size_t i = 0; i < legacy.entries.size(); ++i) {
+                const LegacyCnEntry& en = legacy.entries[i];
+                psink::Slice sl;
+                sl.entry = i; sl.file_off = 0u; sl.len = en.size;
+                sl.cmode = legacy.checksum_mode; sl.cval = en.checksum;
+                sl.has_cksum = en.has_checksum; sl.group = i;   // one group per entry, see above
+                ps.slices.push_back(sl);
+            }
+            pstreams.push_back(std::move(ps));
+            cm_sink = psink::Publish(legacy.entries, std::move(pstreams),
+                                     psink::Policy::kProduced, 0u, psink::Family::kCm);
+        }
+        std::uint64_t cm_streamed = 0;
+        OptimumOut cm_out = cm_sink
+            ? OptimumOut([&cm_streamed](const unsigned char* q, std::size_t n) {
+                  if (cm_streamed == 0u) psink::StreamBegin(0u);   // see above
+                  psink::StreamWrite(0u, q, n);
+                  cm_streamed += n;
+              })
+            : OptimumOut(&cm_native_data);
+        const bool cm_native_ok = TryDecodeLegacyCm(legacy, &cm_out, &cm_decode_error);
+        if (cm_sink && !cm_native_ok && cm_streamed == 0u) {
+            // Declined before producing anything: hand the sink back unused.
+            psink::Reset();
+            psink::Configure(options, test_mode, os,
+                             options.output_path.empty() ? fs::current_path()
+                                                         : PathFromNativeBytes(options.output_path));
+            cm_sink = false;
+        }
+        if (cm_sink) {
+            psink::StreamEnd(0u, nullptr, cm_streamed, cm_native_ok, false);
+            LegacyCnContext done = CloneLegacyMeta(legacy);
+            const psink::Outcome so = psink::Finish();
+            done.sink_handled = true;
+            done.sink_failed_entries = so.failed_entries;
+            done.sink_plain_code = so.plain_code;
+            if (cm_native_ok) {
+                done.native_payload_supported = true;
+                done.decode_failed = so.stream_failed;
+                return RunLegacyCnExtractOrTest(options, done, test_mode, os, run_start);
+            }
+            // The sink wrote whatever completed before the failure, which is what
+            // the original leaves behind too; report through the same path.
+            done.decode_failed = true;
+            AdoptDecodeError(done);
+            return PrintCorruptLine(os, done);
+        }
+        // Native -cc CM decode; checksum-gated inside TryDecodeLegacyCm.
+        if (cm_native_ok) {
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.checksums_verified = false;   // set below once the data is in place
+            bridged.data = std::move(cm_native_data);
+            {
+                std::size_t bad = 0;
+                if (!CheckEntries(bridged.entries, bridged.checksum_mode, bridged.checksum_verification_supported,
+                                  bridged.data.data(), bridged.data.size(), &bridged.entry_checksum_ok, &bad)) {
+                    return kLegacyNeedCompat;   // decode did not produce the declared sizes
+                }
+                bridged.checksums_verified = bridged.checksum_verification_supported;
+                if (bad == 0u) bridged.entry_checksum_ok.clear();
+            }
+            if (NativeTrace()) {
+                os << "[native] decoded -cc payload natively ("
+                   << LegacyCompressorLabel(legacy.legacy_method, legacy.legacy_method_p0, legacy.legacy_method_p1)
+                   << ").\n";
+            }
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
+        }
+        if (NativeTrace() && !cm_decode_error.empty()) {
+            os << "[native] -cc native decode declined: " << cm_decode_error << '\n';
+        }
+        // A corrupt stream: the decoder that owns this method left the blocks it
+        // completed in its output vector. The original has already written the
+        // files those blocks cover (and created, empty, the file the failing
+        // block starts with) when it prints "Archive corrupted"; do the same.
+        std::vector<unsigned char>* partial = nullptr;
+        if (IsCorruptStreamFailure(lzhd_decode_error)) partial = &bridged_data;
+        else if (IsCorruptStreamFailure(optimum_decode_error)) partial = &optimum_native_data;
+        else if (IsCorruptStreamFailure(cm_decode_error)) partial = &cm_native_data;
+        // Measured: when nothing was completed the original creates no file at all
+        // (the next output file is opened only after a flush reaches it).
+        if (partial != nullptr && !partial->empty() && partial->size() < legacy.total_data_size) {
+            LegacyCnContext bridged = CloneLegacyMeta(legacy);
+            bridged.native_payload_supported = true;
+            bridged.data_offset = 0u;
+            bridged.checksums_verified = false;
+            bridged.entry_checksum_ok.clear();
+            bridged.decode_failed = true;
+            bridged.decode_eof = (lzhd_decode_error == "lzhd: unexpected end of file");
+            AdoptDecodeError(bridged);
+            bridged.data = std::move(*partial);
+            return RunLegacyCnExtractOrTest(options, bridged, test_mode, os, run_start);
+        }
+        return kLegacyNeedCompat;
+    }
+    // The payload as a RANGE SOURCE. It is `legacy.data` when a decoder handed
+    // over a buffer, and a view onto the archive when the parse could describe
+    // the payload instead of copying it -- a stored entry, above all, where the
+    // payload IS the file. Nothing below wants a pointer at the whole thing:
+    // that is what put a >4 GB entry out of a 32-bit build's reach even after
+    // the decode itself had stopped needing one.
+    const ByteView payload = legacy.Payload();
+    if (!legacy.decode_failed && legacy.total_data_size != payload.size()) {
+        os << "Data corrupted while reading file payload.\n";
+        return 2;
+    }
+
+    const fs::path output_root = options.output_path.empty() ? fs::current_path() : PathFromNativeBytes(options.output_path);
+
+    std::size_t processed = 0;
+    std::size_t failed = 0;
+    std::uint64_t bytes_ok = 0;
+    ArcPos cursor = 0;
+
+    // The header (Archive / Threads / Compressor) is printed by the caller before
+    // the decode is attempted, as the original does, so a failing decode shows
+    // it too. `yes_to_all` is a local copy: the "Always" answer flips it.
+    bool yes_to_all = options.yes_to_all;
+    DecodeProgress progress(os);
+    StageMark("extract start");
+    // After a part-way decode failure: the entry the decode stopped inside (or
+    // exactly at the start of) is the last one touched -- it is created with the
+    // bytes that were completed, 0 of them included -- and nothing follows.
+    bool stopped = false;
+    bool disk_full_reported = false;
+    for (const LegacyCnEntry& e : legacy.entries) {
+        if (stopped) break;
+        bool last_partial = false;
+        ArcPos n = e.size;
+        if (cursor > payload.size() || e.size > payload.size() - cursor) {
+            if (!legacy.decode_failed) {
+                os << "Data corrupted while reading file payload: " << e.path << '\n';
+                return 2;
+            }
+            last_partial = true;
+            stopped = true;
+            n = payload.size() - cursor;
+            if (SafeMode()) break;   // never write unverified bytes in safe mode
+        }
+
+        // -x<pattern> excludes (`*` crosses directories); -forceout keeps the
+        // filter but names every output file after the first file argument ("*"
+        // when there is none), so later entries overwrite earlier ones.
+        const bool selected = MatchesAnyPattern(e.path, options.positional) &&
+                              !IsExcluded(e.path, options.exclude_patterns);
+        const ArcPos entry_off = cursor;
+        cursor += n;
+        if (nzr::selfcheck::Recorder::Get().Active()) {
+            bool whole = true;
+            const std::uint64_t crc = SelfCheckCrcRange(payload, entry_off, n, &whole);
+            nzr::selfcheck::Recorder::Get().Add({e.path, 0u, n, crc, whole && !last_partial && n == e.size});
+        }
+
+        // The original decodes the whole stream whatever the file filter says, so
+        // its progress display and the "Decompressed N bytes" footer cover EVERY
+        // entry -- and it CHECKS every entry too: the filter only decides what
+        // gets written. Measured: `x bad.nz a.txt`, with b.txt's stored checksum
+        // damaged, writes a.txt alone and still prints b.txt's mismatch line, and
+        // so does a filter naming only an entry after it. (The streaming sink,
+        // psink, already judged unselected entries; this loop skipped them.)
+        progress.Begin(e.path);
+
+        // Measured: "Checksum mismatch [<stored> <computed>]: <path>" on its own
+        // cleared line, then the run CONTINUES (the file is still written, the
+        // footer still counts its bytes, and the exit status stays 0).
+        // Option (c) for damaged archives: an entry whose checksum does not match
+        // is reported the way the original reports it and NOT written; the run
+        // continues with the other entries and exits with status 2.
+        bool checksum_bad = false;
+        // An EMPTY entry is judged in `x` and not in `t`: with an empty file's
+        // stored checksum damaged the original prints the mismatch when it
+        // extracts and says nothing when it tests.
+        const bool judge_empty = !(test_mode && e.size == 0u);
+        if (!last_partial && judge_empty && e.has_checksum && legacy.checksum_verification_supported && options.checksum != ChecksumMode::kNone) {
+            const std::size_t idx = static_cast<std::size_t>(&e - legacy.entries.data());
+            const bool known_bad = legacy.checksums_verified && idx < legacy.entry_checksum_ok.size() && !legacy.entry_checksum_ok[idx];
+            if (known_bad || !legacy.checksums_verified) {
+                const std::uint32_t got = ChecksumRange(legacy.checksum_mode, payload, entry_off, n);
+                if (got != e.checksum) {
+                    checksum_bad = true;
+                    ClearStatusLine(os);
+                    os << "Checksum mismatch [" << FormatChecksum(legacy.checksum_mode, e.checksum)
+                       << ' ' << FormatChecksum(legacy.checksum_mode, got) << "]: " << e.path << '\n';
+                }
+            }
+        }
+        if (checksum_bad) ++failed;
+        if (!selected || (checksum_bad && SafeMode())) {
+            bytes_ok += e.size;
+            progress.Advance(e.size);
+            continue;
+        }
+        // Default: a mismatching entry is written anyway, as the original does.
+        StageMark("entry checksum");
+
+        if (!test_mode) {
+            // -sp strips the stored directories on extraction too.
+            fs::path safe_rel = options.strip_paths
+                ? fs::path(SanitizeExtractPath(e.path)).filename()
+                : SanitizeExtractPath(e.path);
+            if (options.forceout) safe_rel = PathFromNativeBytes(options.positional.empty() ? std::string("*") : options.positional.front());
+            if (safe_rel.empty()) {
+                // The original writes such a path as it is (`../../x`, `/abs/x` with
+                // the leading slash dropped) -- a deliberate departure, pending the
+                // community's decision (ORIGINAL_QUIRKS). Reported on stderr so the
+                // stdout stays byte-identical; counted like every other entry.
+                std::cerr << "Skipping unsafe path in archive: " << e.path << '\n';
+                ++failed;
+                bytes_ok += e.size;
+                progress.Advance(e.size);
+                continue;
+            }
+
+            const fs::path out_path = output_root / safe_rel;
+            std::error_code ec;
+            // "Overwrite <name> (Yes/No/Always)? " -- the original asks per existing
+            // file unless -y; it reads a key, so any other answer re-asks. End of
+            // input counts as No (the original would spin forever there).
+            bool write_it = true;
+            if (!yes_to_all && fs::exists(out_path, ec)) {
+                for (;;) {
+                    // Measured through a pty: the status line is cleared, then one more
+                    // '\r', then the question; the answer is a LINE whose first character
+                    // must be a lowercase y / n / a -- anything else (uppercase included,
+                    // an empty line) asks again.
+                    ClearStatusLine(os);
+                    os << '\r' << "Overwrite " << progress::Name40(e.path) << " (Yes/No/Always)? ";
+                    os.flush();
+                    std::string answer;
+                    if (!std::getline(std::cin, answer)) { write_it = false; break; }
+                    const char k = answer.empty() ? '\0' : answer[0];
+                    if (k == 'y') break;
+                    if (k == 'n') { write_it = false; break; }
+                    if (k == 'a') { yes_to_all = true; break; }
+                }
+            }
+            if (write_it) {
+                if (out_path.has_parent_path()) {
+                    MakeDirs0700(out_path.parent_path());
+                }
+                int werr = 0;
+                if (!WriteExtractedFileRange(out_path, payload, entry_off, n,
+                                        e.has_permissions ? e.permissions : 0600u,
+                                        (options.restore_ownership && e.has_owner) ? static_cast<long>(e.uid) : -1L,
+                                        (options.restore_ownership && e.has_owner) ? static_cast<long>(e.gid) : -1L,
+                                        &werr)) {
+                    // Measured: "Cannot write: <path>" on a fresh line, per file, and
+                    // the run goes on to the footer -- except for a full disk, which
+                    // the original reports as "Out of disk space!" on a cleared line,
+                    // ONCE however many files it hits, and then goes on too.
+                    if (werr == ENOSPC) {
+                        if (!disk_full_reported) { ClearStatusLine(os); os << "Out of disk space!" << '\n'; }
+                        disk_full_reported = true;
+                    } else {
+                        os << '\n' << "Cannot write: " << (options.output_path.empty() ? safe_rel.string() : out_path.string()) << '\n';
+                    }
+                    ++failed;
+                    bytes_ok += e.size;
+                    progress.Advance(e.size);
+                    continue;
+                }
+                if (e.has_win_attr) SetExtractedWinAttributes(out_path, e.win_attr);
+                if (e.has_mtime && !SetExtractedMtime(out_path, e.mtime_unix) && NativeTrace()) {
+                    os << "Warning: cannot apply mtime to " << out_path.string() << '\n';
+                }
+            }
+        }
+
+        StageMark("entry written");
+        ++processed;
+        bytes_ok += e.size;
+        progress.Advance(e.size);
+    }
+
+    if (legacy.decode_failed) {
+        // Measured: no footer, just the error line (code 100; 25600 when the
+        // archive is cut short -- the original has more codes, see
+        // docs/ORIGINAL_QUIRKS.md).
+        return PrintCorruptLine(os, legacy);
+    }
+    // The original prints its normal footer after a checksum mismatch; so do we.
+    // Status 2 marks the damage; main() maps it to the original's 0 unless
+    // NZ_SAFE or NZ_STRICT_EXIT is set.
+    PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
+    return failed == 0 ? 0 : 2;
+}
+
+}  // namespace
+
+ArchiveOpenError OpenArchive(
+    const std::string& archive_path,
+    ArchiveContext* out_context,
+    std::string* out_error_message) {
+    std::ifstream input(archive_path, std::ios::binary);
+    if (!input) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Cannot open archive!";
+        }
+        return ArchiveOpenError::kCannotOpen;
+    }
+
+    std::array<unsigned char, 2> magic{};
+    input.read(reinterpret_cast<char*>(magic.data()), static_cast<std::streamsize>(magic.size()));
+    if (input.gcount() != static_cast<std::streamsize>(magic.size()) || magic != kMagicPrefix) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "File is not a NanoZip archive.";
+        }
+        return ArchiveOpenError::kNotNanoZip;
+    }
+
+    std::string signature(kKnownSignatureBytes, '\0');
+    input.read(&signature[0], static_cast<std::streamsize>(signature.size()));
+    if (input.gcount() != static_cast<std::streamsize>(signature.size()) ||
+        signature.rfind(kKnownSignaturePrefix, 0) != 0) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "File is not a NanoZip archive.";
+        }
+        return ArchiveOpenError::kNotNanoZip;
+    }
+
+    unsigned version_major = 0;
+    unsigned version_minor = 0;
+    if (!ParseVersionFromSignature(signature, &version_major, &version_minor)) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "File is not a NanoZip archive.";
+        }
+        return ArchiveOpenError::kNotNanoZip;
+    }
+
+    if (version_major > kSupportedMajor ||
+        (version_major == kSupportedMajor && version_minor > kSupportedMinor)) {
+        if (out_error_message != nullptr) {
+            std::ostringstream oss;
+            oss << "Archive file is made with incompatible version (" << version_major << '.';
+            if (version_minor < 10) {
+                oss << '0';
+            }
+            oss << version_minor << ").";
+            *out_error_message = oss.str();
+        }
+        return ArchiveOpenError::kIncompatibleVersion;
+    }
+
+    std::array<char, 4> marker{};
+    input.read(marker.data(), static_cast<std::streamsize>(marker.size()));
+    if (input.gcount() != static_cast<std::streamsize>(marker.size())) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return ArchiveOpenError::kCorrupt;
+    }
+
+    if (marker != kReconMarker) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Archive layout is not reconstructed yet (legacy NanoZip stream).";
+        }
+        return ArchiveOpenError::kUnsupportedFormat;
+    }
+
+    std::uint8_t recon_major = 0;
+    std::uint8_t recon_minor = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t checksum_mode = 0;
+    std::uint8_t compressor = 0;
+    std::uint8_t reserved = 0;
+    std::uint16_t reserved2 = 0;
+    std::uint32_t entry_count = 0;
+
+    if (!ReadLE(input, &recon_major) || !ReadLE(input, &recon_minor) || !ReadLE(input, &flags) ||
+        !ReadLE(input, &checksum_mode) || !ReadLE(input, &compressor) || !ReadLE(input, &reserved) ||
+        !ReadLE(input, &reserved2) || !ReadLE(input, &entry_count)) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return ArchiveOpenError::kCorrupt;
+    }
+
+    ArchiveContext ctx;
+    ctx.archive_path = archive_path;
+    ctx.header.signature = signature;
+    ctx.header.version_major = static_cast<std::uint8_t>(version_major);
+    ctx.header.version_minor = static_cast<std::uint8_t>(version_minor);
+    ctx.header.reconstructed_layout = true;
+    ctx.header.recon_format_major = recon_major;
+    ctx.header.recon_format_minor = recon_minor;
+    ctx.header.compressor = static_cast<Compressor>(compressor);
+    ctx.header.checksum = static_cast<ChecksumMode>(checksum_mode);
+    ctx.header.has_timestamps = (flags & kFlagHasTimestamps) != 0;
+    ctx.header.has_permissions = (flags & kFlagHasPermissions) != 0;
+
+    if (entry_count > 1000000u) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return ArchiveOpenError::kCorrupt;
+    }
+
+    ctx.entries.reserve(entry_count);
+    for (std::uint32_t i = 0; i < entry_count; ++i) {
+        std::uint16_t name_len = 0;
+        if (!ReadLE(input, &name_len)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return ArchiveOpenError::kCorrupt;
+        }
+
+        std::string name(name_len, '\0');
+        if (name_len > 0) {
+            input.read(&name[0], static_cast<std::streamsize>(name_len));
+            if (input.gcount() != static_cast<std::streamsize>(name_len)) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "Data corrupted while reading headers!";
+                }
+                return ArchiveOpenError::kCorrupt;
+            }
+        }
+
+        ArchiveEntry e;
+        e.path = name;
+
+        if (!ReadLE(input, &e.original_size) || !ReadLE(input, &e.stored_size) || !ReadLE(input, &e.permissions) ||
+            !ReadLE(input, &e.mtime_unix) || !ReadLE(input, &e.checksum) || !ReadLE(input, &e.method)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return ArchiveOpenError::kCorrupt;
+        }
+
+        std::array<char, 7> entry_reserved{};
+        input.read(entry_reserved.data(), static_cast<std::streamsize>(entry_reserved.size()));
+        if (input.gcount() != static_cast<std::streamsize>(entry_reserved.size())) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return ArchiveOpenError::kCorrupt;
+        }
+
+        ctx.entries.push_back(std::move(e));
+    }
+
+    const std::streamoff data_offset = input.tellg();
+    if (data_offset < 0) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return ArchiveOpenError::kCorrupt;
+    }
+    ctx.data_offset = static_cast<std::uint64_t>(data_offset);
+
+    input.seekg(0, std::ios::end);
+    const std::streamoff end_offset = input.tellg();
+    if (end_offset < 0) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "Data corrupted while reading headers!";
+        }
+        return ArchiveOpenError::kCorrupt;
+    }
+
+    std::uint64_t needed = ctx.data_offset;
+    for (const ArchiveEntry& e : ctx.entries) {
+        needed += e.stored_size;
+        if (needed > static_cast<std::uint64_t>(end_offset)) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "Data corrupted while reading headers!";
+            }
+            return ArchiveOpenError::kCorrupt;
+        }
+    }
+
+    if (out_context != nullptr) {
+        *out_context = std::move(ctx);
+    }
+    if (out_error_message != nullptr) {
+        out_error_message->clear();
+    }
+    return ArchiveOpenError::kNone;
+}
+
+
+
+
+enum class LegacyNativeWrapper {
+    kLzpfLiteralBits,
+    kLzhdLiteralTag,
+    kOptimumBwt,
+    kCmRaw
+};
+
+struct LegacyNativeSpec {
+    std::uint8_t method = 0u;
+    std::uint8_t method_p0 = 0u;
+    std::uint8_t method_p1 = 0u;
+    LegacyNativeWrapper wrapper = LegacyNativeWrapper::kLzpfLiteralBits;
+};
+
+bool ResolveLegacyNativeSpec(Compressor compressor, LegacyNativeSpec* out_spec) {
+    if (out_spec == nullptr) {
+        return false;
+    }
+
+    switch (compressor) {
+        case Compressor::kLzpf:
+            *out_spec = LegacyNativeSpec{0x2bu, 1u, 0u, LegacyNativeWrapper::kLzpfLiteralBits};
+            return true;
+        case Compressor::kLzpfLarge:
+            *out_spec = LegacyNativeSpec{0x2bu, 2u, 0u, LegacyNativeWrapper::kLzpfLiteralBits};
+            return true;
+        case Compressor::kLzhd:
+            *out_spec = LegacyNativeSpec{0x2bu, 3u, 0u, LegacyNativeWrapper::kLzhdLiteralTag};
+            return true;
+        case Compressor::kLzhds:
+            *out_spec = LegacyNativeSpec{0x2bu, 4u, 0u, LegacyNativeWrapper::kLzhdLiteralTag};
+            return true;
+        case Compressor::kOptimum1:
+            *out_spec = LegacyNativeSpec{0x3bu, 5u, 0u, LegacyNativeWrapper::kOptimumBwt};
+            return true;
+        case Compressor::kOptimum2:
+            *out_spec = LegacyNativeSpec{0x3bu, 6u, 0u, LegacyNativeWrapper::kOptimumBwt};
+            return true;
+        case Compressor::kCm:
+            *out_spec = LegacyNativeSpec{0x4bu, 7u, 0u, LegacyNativeWrapper::kCmRaw};
+            return true;
+        default:
+            break;
+    }
+
+    return false;
+}
+
+const char* LegacyNativeWrapperLabel(LegacyNativeWrapper wrapper) {
+    switch (wrapper) {
+        case LegacyNativeWrapper::kLzpfLiteralBits:
+            return "native literal-only stream";
+        case LegacyNativeWrapper::kLzhdLiteralTag:
+            return "native literal-wrapper stream";
+        case LegacyNativeWrapper::kOptimumBwt:
+            return "native BWT-wrapper stream";
+        case LegacyNativeWrapper::kCmRaw:
+            return "native raw-wrapper stream";
+        default:
+            return "native stream";
+    }
+}
+
+bool IsNativeLegacyCompressionAvailable(const CliOptions& options) {
+    if (options.command != Command::kAdd && options.command != Command::kSimulate) {
+        return false;
+    }
+    LegacyNativeSpec spec;
+    return ResolveLegacyNativeSpec(options.compressor, &spec);
+}
+
+
+bool BuildLegacyLiteralFilenameTable(
+    const std::vector<SourceFile>& sources,
+    std::vector<unsigned char>* out_table,
+    std::string* out_error_message) {
+    if (out_table == nullptr) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "internal error: null legacy table output";
+        }
+        return false;
+    }
+
+    out_table->clear();
+    for (const SourceFile& src : sources) {
+        if (src.archive_name.find('\0') != std::string::npos) {
+            if (out_error_message != nullptr) {
+                *out_error_message = "legacy filename table does not support NUL in names";
+            }
+            return false;
+        }
+        WriteLegacyVarint(src.size, out_table);
+        out_table->insert(out_table->end(), src.archive_name.begin(), src.archive_name.end());
+        out_table->push_back(0u);
+    }
+
+    if (out_table->size() < 2u) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "legacy filename table too small";
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool BuildNativeLegacyStreamPayload(
+    const LegacyNativeSpec& spec,
+    const std::vector<SourceFile>& sources,
+    std::uint64_t total_bytes,
+    std::vector<unsigned char>* out_prefix_or_payload,
+    bool* out_append_raw_sources,
+    std::uint64_t* out_stream_bytes,
+    std::string* out_error_message) {
+    if (out_prefix_or_payload == nullptr || out_append_raw_sources == nullptr || out_stream_bytes == nullptr) {
+        if (out_error_message != nullptr) {
+            *out_error_message = "internal error: null native stream payload output";
+        }
+        return false;
+    }
+
+    out_prefix_or_payload->clear();
+    *out_append_raw_sources = true;
+    *out_stream_bytes = 0u;
+
+    static constexpr std::uint64_t kNativeBwtMaxBytes = 1u << 15u;  // keep O(n^2 log n) path bounded
+
+    switch (spec.wrapper) {
+        case LegacyNativeWrapper::kLzpfLiteralBits: {
+            if (total_bytes > (std::numeric_limits<std::uint64_t>::max() / 8u)) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "input too large for legacy literal bit-length tag";
+                }
+                return false;
+            }
+            WriteLegacyVarint(total_bytes * 8u, out_prefix_or_payload);
+            *out_stream_bytes = static_cast<std::uint64_t>(out_prefix_or_payload->size()) + total_bytes;
+            return true;
+        }
+        case LegacyNativeWrapper::kLzhdLiteralTag: {
+            WriteLegacyVarint(0u, out_prefix_or_payload);
+            out_prefix_or_payload->push_back(0x00u);
+            *out_stream_bytes = static_cast<std::uint64_t>(out_prefix_or_payload->size()) + total_bytes;
+            return true;
+        }
+        case LegacyNativeWrapper::kCmRaw: {
+            if (total_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "input too large for native -cc raw-size wrapper";
+                }
+                return false;
+            }
+            AppendU32LE(static_cast<std::uint32_t>(total_bytes), out_prefix_or_payload);
+            *out_stream_bytes = static_cast<std::uint64_t>(out_prefix_or_payload->size()) + total_bytes;
+            return true;
+        }
+        case LegacyNativeWrapper::kOptimumBwt: {
+            if (total_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "input too large for native -co/-cO BWT wrapper";
+                }
+                return false;
+            }
+            if (total_bytes > kNativeBwtMaxBytes) {
+                if (out_error_message != nullptr) {
+                    std::ostringstream oss;
+                    oss << "native -co/-cO writer currently supports up to " << kNativeBwtMaxBytes
+                        << " bytes";
+                    *out_error_message = oss.str();
+                }
+                return false;
+            }
+            if (total_bytes > 0x00ffffffu) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "input too large for native -co/-cO 24-bit primary index";
+                }
+                return false;
+            }
+
+            std::vector<unsigned char> raw;
+            std::string raw_error;
+            if (!LoadSourcesRawData(sources, &raw, &raw_error)) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = raw_error;
+                }
+                return false;
+            }
+
+            std::vector<unsigned char> bwt_last;
+            std::uint32_t primary_index = 0u;
+            if (!ForwardBwt(raw, &bwt_last, &primary_index)) {
+                if (out_error_message != nullptr) {
+                    *out_error_message = "failed to build native BWT wrapper stream";
+                }
+                return false;
+            }
+
+            out_prefix_or_payload->reserve(4u + bwt_last.size() + 3u);
+            AppendU32LE(static_cast<std::uint32_t>(raw.size()), out_prefix_or_payload);
+            out_prefix_or_payload->insert(out_prefix_or_payload->end(), bwt_last.begin(), bwt_last.end());
+            out_prefix_or_payload->push_back(static_cast<unsigned char>((primary_index >> 16u) & 0xffu));
+            out_prefix_or_payload->push_back(static_cast<unsigned char>((primary_index >> 8u) & 0xffu));
+            out_prefix_or_payload->push_back(static_cast<unsigned char>(primary_index & 0xffu));
+
+            *out_append_raw_sources = false;
+            *out_stream_bytes = static_cast<std::uint64_t>(out_prefix_or_payload->size());
+            return true;
+        }
+        default:
+            break;
+    }
+
+    if (out_error_message != nullptr) {
+        *out_error_message = "native legacy stream wrapper is not supported";
+    }
+    return false;
+}
+
+int RunAddNativeLegacyStream(const CliOptions& options, const std::vector<SourceFile>& sources, std::ostream& os) {
+    const auto add_start = std::chrono::steady_clock::now();
+    LegacyNativeSpec spec;
+    if (!ResolveLegacyNativeSpec(options.compressor, &spec)) {
+        os << "Error: native legacy writer is not available for compressor "
+           << CompressorToString(options.compressor) << ".\n";
+        return 1;
+    }
+
+    std::uint64_t total_bytes = 0u;
+    for (const SourceFile& src : sources) {
+        if (src.size > (std::numeric_limits<std::uint64_t>::max() - total_bytes)) {
+            os << "Error: input size overflow while building legacy stream.\n";
+            return 1;
+        }
+        total_bytes += src.size;
+    }
+
+    const ChecksumMode legacy_checksum_mode = LegacyNormalizeChecksumModeForCompression(options.checksum);
+    const bool checksum_mode_remapped =
+        (options.checksum != ChecksumMode::kNone && legacy_checksum_mode != options.checksum);
+    const std::uint8_t legacy_checksum_header = LegacyChecksumHeaderByte(legacy_checksum_mode);
+
+    std::vector<unsigned char> table;
+    std::string table_error;
+    if (!BuildLegacyLiteralFilenameTable(sources, &table, &table_error)) {
+        os << "Error: " << table_error << '\n';
+        return 1;
+    }
+
+    std::vector<unsigned char> table_span;
+    if (!WriteLegacyTableSpan(static_cast<std::uint64_t>(table.size()) - 2u, &table_span)) {
+        os << "Error: legacy filename table is too large for current encoder path.\n";
+        return 1;
+    }
+
+    std::vector<unsigned char> stream_payload;
+    bool append_raw_sources = true;
+    std::uint64_t stream_bytes = 0u;
+    std::string stream_error;
+    if (!BuildNativeLegacyStreamPayload(
+            spec,
+            sources,
+            total_bytes,
+            &stream_payload,
+            &append_raw_sources,
+            &stream_bytes,
+            &stream_error)) {
+        os << "Error: " << stream_error << ".\n";
+        return 1;
+    }
+    std::vector<unsigned char> stream_tag;
+    WriteLegacyVarint(stream_bytes << 4u, &stream_tag);
+
+    std::vector<unsigned char> checksum_bytes;
+    std::string checksum_error;
+    if (!BuildLegacyChecksumBytes(sources, legacy_checksum_mode, &checksum_bytes, &checksum_error)) {
+        os << "Error: " << checksum_error << '\n';
+        return 1;
+    }
+
+    const fs::path out_path = ResolveArchivePath(options);
+    std::error_code ec;
+    if (out_path.has_parent_path()) {
+        MakeDirs0700(out_path.parent_path());
+    }
+
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        os << "Cannot open output archive for writing: " << out_path.string() << '\n';
+        return 1;
+    }
+
+    out.write(reinterpret_cast<const char*>(kMagicPrefix.data()), static_cast<std::streamsize>(kMagicPrefix.size()));
+    out.write(kKnownSignature, static_cast<std::streamsize>(kKnownSignatureBytes));
+
+    static constexpr std::array<unsigned char, 3> kLegacyHeaderPrefix = {0x1fu, 0x0fu, 0x09u};
+    out.write(
+        reinterpret_cast<const char*>(kLegacyHeaderPrefix.data()),
+        static_cast<std::streamsize>(kLegacyHeaderPrefix.size()));
+    if (legacy_checksum_header != 0u) {
+        out.put(static_cast<char>(legacy_checksum_header));
+    }
+
+    // spec.method is the chunk varint: (csize<<4)|11.  Write exactly csize payload
+    // bytes so the chunk scanner can locate the following type-1 table chunk.
+    // p0 and p1 occupy slots 0 and 1; fill remaining slots with zeros.
+    out.put(static_cast<char>(spec.method));
+    out.put(static_cast<char>(spec.method_p0));
+    out.put(static_cast<char>(spec.method_p1));
+    {
+        const unsigned codec_csize = static_cast<unsigned>(spec.method) >> 4u;
+        for (unsigned i = 2u; i < codec_csize; ++i) {
+            out.put(static_cast<char>(0u));
+        }
+    }
+
+    // WriteLegacyTableSpan(N-2) and WriteLegacyVarint((N<<4)|1) produce identical
+    // bytes, so table_span doubles as the type-1 chunk varint for the scanner.
+    out.write(reinterpret_cast<const char*>(table_span.data()), static_cast<std::streamsize>(table_span.size()));
+    out.write(reinterpret_cast<const char*>(table.data()), static_cast<std::streamsize>(table.size()));
+    if (!checksum_bytes.empty()) {
+        if (sources.size() == 1u) {
+            const std::uint8_t checksum_tag = LegacyChecksumTag(legacy_checksum_mode);
+            if (checksum_tag != 0u) {
+                out.put(static_cast<char>(checksum_tag));
+            }
+        }
+        out.write(reinterpret_cast<const char*>(checksum_bytes.data()), static_cast<std::streamsize>(checksum_bytes.size()));
+    }
+    out.write(reinterpret_cast<const char*>(stream_tag.data()), static_cast<std::streamsize>(stream_tag.size()));
+
+    if (!stream_payload.empty()) {
+        out.write(reinterpret_cast<const char*>(stream_payload.data()), static_cast<std::streamsize>(stream_payload.size()));
+        if (!out) {
+            os << "Error: write failure while building archive.\n";
+            return 1;
+        }
+    }
+    if (append_raw_sources) {
+        std::string write_error;
+        if (!WriteSourcesRawData(sources, &out, &write_error)) {
+            os << "Error: " << write_error << ".\n";
+            return 1;
+        }
+    }
+
+    if (options.verbose) {
+        os << "Warning: native " << CompressorToString(options.compressor)
+           << " writer currently emits " << LegacyNativeWrapperLabel(spec.wrapper)
+           << " (RE-substream), not full legacy compressed stream.\n";
+    }
+    if (checksum_mode_remapped) {
+        os << "Note: -hf was mapped to legacy Fletcher32 checksum variant for this stream.\n";
+    }
+    PrintEncodeHeader(os, out_path.string(), CompressorToString(options.compressor),
+                      /*engine_bytes=*/0u, /*memory_mb=*/512u, /*read_mb=*/20u,
+                      /*write_mb=*/4u, options.verbose);
+    if (options.verbose) {
+        ClearStatusLine(os);
+        os << "wrapper: " << LegacyNativeWrapperLabel(spec.wrapper) << '\n';
+    }
+    for (const auto& src : sources) {
+        PrintFileProgress(os, src.archive_name, "100%");
+    }
+    {
+        // Take the produced size from the stream itself and flush first: reading the
+        // path before the ofstream is closed reports 0.
+        const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
+        out.flush();
+        PrintEncodeFooter(os, total_bytes, produced, ElapsedSince(add_start), options.verbose);
+    }
+    return 0;
+}
+
+int RunSimulateNativeLegacyStream(
+    const CliOptions& options,
+    const std::vector<SourceFile>& sources,
+    std::ostream& os) {
+    LegacyNativeSpec spec;
+    if (!ResolveLegacyNativeSpec(options.compressor, &spec)) {
+        os << "Error: native legacy simulation is not available for compressor "
+           << CompressorToString(options.compressor) << ".\n";
+        return 1;
+    }
+
+    std::uint64_t total_input = 0u;
+    for (const SourceFile& src : sources) {
+        if (src.size > (std::numeric_limits<std::uint64_t>::max() - total_input)) {
+            os << "Error: input size overflow while simulating legacy stream.\n";
+            return 1;
+        }
+        total_input += src.size;
+    }
+
+    const ChecksumMode legacy_checksum_mode = LegacyNormalizeChecksumModeForCompression(options.checksum);
+    const bool checksum_mode_remapped =
+        (options.checksum != ChecksumMode::kNone && legacy_checksum_mode != options.checksum);
+    const std::size_t checksum_bytes_per_file = LegacyChecksumBytesPerFile(legacy_checksum_mode);
+    const std::size_t checksum_value_bytes = checksum_bytes_per_file * sources.size();
+    const std::size_t checksum_tag_bytes =
+        (checksum_value_bytes > 0u && sources.size() == 1u && LegacyChecksumTag(legacy_checksum_mode) != 0u) ? 1u : 0u;
+    const std::size_t checksum_header_bytes = (LegacyChecksumHeaderByte(legacy_checksum_mode) != 0u) ? 1u : 0u;
+
+    std::vector<unsigned char> table;
+    std::string table_error;
+    if (!BuildLegacyLiteralFilenameTable(sources, &table, &table_error)) {
+        os << "Error: " << table_error << '\n';
+        return 1;
+    }
+
+    std::vector<unsigned char> table_span;
+    if (!WriteLegacyTableSpan(static_cast<std::uint64_t>(table.size()) - 2u, &table_span)) {
+        os << "Error: legacy filename table is too large for current encoder path.\n";
+        return 1;
+    }
+
+    std::vector<unsigned char> stream_payload;
+    bool append_raw_sources = true;
+    std::uint64_t stream_bytes = 0u;
+    std::string stream_error;
+    if (!BuildNativeLegacyStreamPayload(
+            spec,
+            sources,
+            total_input,
+            &stream_payload,
+            &append_raw_sources,
+            &stream_bytes,
+            &stream_error)) {
+        os << "Error: " << stream_error << ".\n";
+        return 1;
+    }
+    (void)append_raw_sources;
+
+    std::vector<unsigned char> stream_tag;
+    WriteLegacyVarint(stream_bytes << 4u, &stream_tag);
+
+    const std::uint64_t estimated_archive_bytes =
+        2u + kKnownSignatureBytes + 3u + static_cast<std::uint64_t>(checksum_header_bytes) + 3u +
+        static_cast<std::uint64_t>(table_span.size()) +
+        static_cast<std::uint64_t>(table.size()) +
+        static_cast<std::uint64_t>(checksum_tag_bytes + checksum_value_bytes) +
+        static_cast<std::uint64_t>(stream_tag.size()) +
+        stream_bytes;
+
+    if (checksum_mode_remapped) {
+        os << "Note: -hf was mapped to legacy Fletcher32 checksum variant for this stream.\n";
+    }
+    os << "Simulation mode (no output written)\n";
+    os << "Compressor: " << CompressorToString(options.compressor)
+       << " (" << LegacyNativeWrapperLabel(spec.wrapper) << ")\n";
+    os << "Files    : " << sources.size() << '\n';
+    os << "Input    : " << total_input << " bytes\n";
+    os << "Estimate : " << estimated_archive_bytes << " bytes\n";
+    return 0;
+}
+
+
+
+// ===========================================================================
+// The legacy container WRITER (encode phase, milestone 1: `-cn`).
+//
+// Everything below is a transcription of the original's `a` path as read from
+// the decompile (~/.cache/nzre_tools/encode/decomp/, inventory.txt) and
+// measured against it byte for byte with tests/encode/oracle.sh:
+//   * the file scan (FUN_0804a3d0): per argument, readdir of the directory
+//     part, fnmatch of the pattern against each name, regular files appended
+//     in readdir order, directories recursed with pattern "*" under -r;
+//   * the sort (FUN_08052200 / FUN_08051f40): a merge sort that splits the
+//     list at n/2, takes the LEFT element when it compares less and the right
+//     one on ties; -se compares the extension with tolower(), then the size,
+//     then the whole name; -sa the name; -ss the size; -sn does not sort;
+//   * the byte-float (FUN_0804c930 / FUN_0804c9f0): the NEAREST encodable
+//     size, `(size + 0x8000) >> 16` first, then a 4-bit mantissa with
+//     half-ulp rounding;
+//   * the record chain: type 14 with the version string, type 30 with 0x09,
+//     the checksum kind (type 5/6/7, size 0), the codec record, then per block
+//     of `window` bytes read from the files as one continuous stream: the
+//     table of the files that START in the block, their mtimes (u32 absolute
+//     + zigzag deltas), their permission runs, uid/gid runs under -fo, the
+//     checksums of the files that END in the block, and the DATA record
+//     (FUN_0804f0a0 + FUN_0804df90 and the emitters FUN_0804e2c0/ec30/ee40/
+//     e6e0/e870). Every metadata emitter buffers 32768 bytes and splits its
+//     record there.
+// ===========================================================================
+
+struct EncodeSource {
+    std::string archive_name;     // the name written to the table
+    fs::path fs_path;             // where the bytes are
+    std::uint64_t size = 0;
+    std::uint32_t mode = 0644;    // st_mode & 0xfff
+    // Windows: the attribute nibble the original stores instead of a POSIX mode
+    // -- 8 | READONLY | HIDDEN<<1 | SYSTEM<<2, with 8 (the archive bit) always
+    // set, so 8 means "plain" and an all-plain block omits the record entirely.
+    std::uint8_t win_attr = 8u;
+    std::int64_t mtime = 0;       // epoch seconds
+    std::uint16_t uid = 0, gid = 0;
+    std::string display;          // the path as scanned ("./x" under `.`, "sub/x"): the console's name
+    // -x matches and unreadable files stay in the list: they count for the
+    // worker split and the window, and when the reader reaches one it prints
+    // "Cannot open: <display>" and stores nothing (measured; an explicit
+    // `b.bin` under -xb.bin, a chmod 000 file, both the same).
+    bool ghost = false;
+};
+
+// FUN_0804c930: the byte-float NEAREST to `size` (the encoded byte, 1-based
+// like the original's; the codec record stores it minus one).
+std::uint32_t LegacyByteFloatEncode(std::uint64_t size) {
+    std::uint64_t u = (size + 0x8000u) >> 16u;          // 64 KB units, rounded
+    if (u < 16u) return static_cast<std::uint32_t>(u);
+    unsigned hi = 63u;
+    while (((u >> hi) & 1u) == 0u) --hi;                 // highest set bit
+    // mantissa = the 4 bits below the top one, rounded to nearest (half up)
+    const unsigned shift = hi - 4u;
+    std::uint64_t m = u;
+    if (shift > 0u) m = (u + (std::uint64_t{1} << (shift - 1u))) >> shift;
+    if (m >= 32u) { m >>= 1u; ++hi; }                    // rounding carried
+    // x = (exponent + 1) << 4 | mantissa, where the decoder does (m + 16) << (exponent - 1)
+    return static_cast<std::uint32_t>(((hi - 3u) << 4u) | (m & 0xfu));
+}
+
+// The decoder's own byte-float reading (x = p1 + 1): m = x & 15, s = x >> 4,
+// if (s) m = (m + 16) << (s - 1); size = m << 16.
+std::uint64_t LegacyByteFloatDecode(std::uint32_t x) {
+    std::uint64_t m = x & 0xfu;
+    const unsigned sft = x >> 4u;
+    if (sft != 0u) m = (m + 16u) << (sft - 1u);
+    return m << 16u;
+}
+
+// The original's record header: varint of (size << 4) | type, or | 15 plus an
+// extension byte (stream << 4 | type, minus 15 when the stream is 0) when the
+// type is 15 or more or the stream is not the main one. FUN_08051900.
+void WriteLegacyRecordHeader(std::vector<unsigned char>* out, unsigned type, unsigned stream, std::uint64_t size) {
+    const bool ext = (stream != 0u) || (type >= 15u);
+    WriteLegacyVarint((size << 4u) | (ext ? 15u : type), out);
+    if (ext) {
+        std::uint32_t e = stream * 16u + type - (stream == 0u ? 15u : 0u);
+        if (e > 0xf7u) { out->push_back(static_cast<unsigned char>(e | 0xf8u)); e = (e >> 3u) - 0x1fu; }
+        out->push_back(static_cast<unsigned char>(e));
+    }
+}
+
+void WriteLegacyRecord(std::ostream& out, unsigned type, unsigned stream, const unsigned char* data, std::size_t size) {
+    std::vector<unsigned char> hdr;
+    WriteLegacyRecordHeader(&hdr, type, stream, size);
+    out.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    if (size != 0u) out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+}
+
+// A metadata emitter's buffer: 32768 bytes, flushed as a record of its type
+// whenever the next item would not fit (the original's `0x8000 - used < need`).
+struct LegacyMetaBuffer {
+    unsigned type; unsigned stream; std::ostream& out; std::vector<unsigned char> buf;
+    LegacyMetaBuffer(unsigned t, unsigned s, std::ostream& o) : type(t), stream(s), out(o) { buf.reserve(0x8000u); }
+    void Need(std::size_t n) { if (0x8000u - buf.size() < n) Flush(); }
+    void Put(const unsigned char* d, std::size_t n) { buf.insert(buf.end(), d, d + n); }
+    void Flush() { if (!buf.empty()) { WriteLegacyRecord(out, type, stream, buf.data(), buf.size()); buf.clear(); } }
+};
+
+// The original's file scan. `dir_part` is the directory to read (the argument
+// up to its last slash), `pattern` what each name must match; `prefix` is what
+// the archive names start with.
+void LegacyScanDirectory(const std::string& dir_part, const std::string& pattern, const std::string& prefix,
+                         bool recurse, std::vector<EncodeSource>* out) {
+    std::error_code ec;
+    const fs::path dir = dir_part.empty() ? fs::path(".") : PathFromNativeBytes(dir_part);
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = NativeBytesFromPath(it->path().filename());
+        if (!WildcardMatch(pattern, name)) continue;
+#if defined(_WIN32)
+        // No lstat/st_mode on mingw: std::filesystem gives the kind, size and
+        // time, and the Windows original stores ATTRIBUTES rather than a POSIX
+        // mode (quirk 48) -- read below and written as the type-3 record.
+        std::error_code sec;
+        fs::file_status fst = fs::symlink_status(it->path(), sec);
+        if (sec) continue;
+        if (!fs::is_regular_file(fst) && !fs::is_directory(fst)) { fst = fs::status(it->path(), sec); if (sec) continue; }
+        const bool is_reg = fs::is_regular_file(fst), is_dir = fs::is_directory(fst);
+        if (is_reg) {
+            EncodeSource e;
+            e.archive_name = prefix + name;
+            e.fs_path = it->path();
+            e.display = dir_part.empty() ? name : dir_part + "/" + name;
+            {
+                const DWORD at = ::GetFileAttributesW(it->path().wstring().c_str());
+                if (at != INVALID_FILE_ATTRIBUTES) {
+                    e.win_attr = static_cast<std::uint8_t>(
+                        8u | ((at & FILE_ATTRIBUTE_READONLY) ? 1u : 0u)
+                           | ((at & FILE_ATTRIBUTE_HIDDEN) ? 2u : 0u)
+                           | ((at & FILE_ATTRIBUTE_SYSTEM) ? 4u : 0u));
+                }
+            }
+            { std::ifstream probe(it->path(), std::ios::binary); e.ghost = !probe.is_open(); }
+            // The original scans the directory with the ANSI API too, so a name
+            // its active code page cannot express comes back as `???` and it
+            // then cannot open the file: it prints "Cannot open: ??? ???.txt"
+            // and stores nothing. Measured on nine languages under a CP1252
+            // Windows -- Cyrillic, Chinese, Japanese, Arabic and Hindi all
+            // refused, German and Nordic stored.
+            //
+            // Matching that is not pedantry. Scanning with the wide API instead
+            // opens all of them and stores them under their MANGLED names, and
+            // two different files (a Russian and a Hindi one, here) then collapse
+            // onto the same stored name. The original's refusal loses nothing.
+            if (!e.ghost && !NameSurvivesNativeCodePage(it->path().filename()))
+                e.ghost = true;
+            e.size = fs::file_size(it->path(), sec); if (sec) e.size = 0u;
+            e.mode = 0644u;
+            const fs::file_time_type ft = fs::last_write_time(it->path(), sec);
+            e.mtime = sec ? 0 : FileTimeToUnix(ft);
+            out->push_back(std::move(e));
+        } else if (is_dir && recurse && name != "." && name != "..") {
+#else
+        struct stat st{};
+        if (::lstat(it->path().c_str(), &st) != 0) continue;
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+            // stat() follows links in the original: a symlink to a file is taken as the file
+            if (::stat(it->path().c_str(), &st) != 0) continue;
+        }
+        if (S_ISREG(st.st_mode)) {
+            EncodeSource e;
+            e.archive_name = prefix + name;
+            e.fs_path = it->path();
+            e.display = dir_part.empty() ? name : dir_part + "/" + name;
+            e.ghost = ::access(it->path().c_str(), R_OK) != 0;
+            e.size = static_cast<std::uint64_t>(st.st_size);
+            e.mode = static_cast<std::uint32_t>(st.st_mode & 0xfffu);
+            e.mtime = static_cast<std::int64_t>(st.st_mtime);
+            e.uid = static_cast<std::uint16_t>(st.st_uid); e.gid = static_cast<std::uint16_t>(st.st_gid);
+            out->push_back(std::move(e));
+        } else if (S_ISDIR(st.st_mode) && recurse && name != "." && name != "..") {
+#endif
+            // the directory's path is built by concatenation, as the original
+            // does ("sub/c.dat" for the argument `sub`, "./sub/c.dat" under `.`)
+            LegacyScanDirectory(dir_part.empty() ? name : dir_part + "/" + name, "*", prefix + name + "/", recurse, out);
+        }
+    }
+}
+
+// The stored name loses the front of the path it was typed with, and only the
+// front (measured on both originals, Linux and Windows): a drive ("C:"), then
+// any run of "/", "./" and "../". So `a x.nz /etc/hostname` stores
+// `etc/hostname`, `C:\data\f` stores `data/f`, `../../d1/f` stores `d1/f` and
+// `d1/.` recursed stores `d1/./f`; a "./" or "../" further in stays. The
+// directory to read keeps the whole path; only the stored name loses it.
+std::string StripStoredNameFront(std::string s) {
+    if (s.size() >= 2u && s[1] == ':') s.erase(0, 2);
+    for (;;) {
+        if (!s.empty() && s[0] == '/') s.erase(0, 1);
+        else if (s.compare(0, 2, "./") == 0) s.erase(0, 2);
+        else if (s.compare(0, 3, "../") == 0) s.erase(0, 3);
+        else return s;
+    }
+}
+
+// One argument of `a`: split at the last slash, scan. "." and ".." as the
+// pattern name the directory itself (`a -r x.nz .` stores names without "./").
+void LegacyScanArgument(const std::string& arg_in, bool recurse, std::vector<EncodeSource>* out) {
+    // On Windows the separator a user types is '\\', and the original takes it:
+    // `nz a out.nz in\001.bin` stores the entry as `in/001.bin`. This scan splits
+    // on '/' alone, so a backslash path matched nothing and `a` answered "No files
+    // found with in\001.bin" -- every codec, since the encoder first shipped.
+    // Converting here fixes the scan AND the stored name in one step, because the
+    // name is built from the same string. Windows only: on a unix filesystem a
+    // backslash is an ordinary character in a filename.
+    std::string arg = arg_in;
+#ifdef _WIN32
+    for (char& c : arg) if (c == '\\') c = '/';
+#endif
+    std::string dir_part, pattern = arg;
+    const std::size_t slash = arg.find_last_of('/');
+    if (slash != std::string::npos) { dir_part = arg.substr(0, slash); pattern = arg.substr(slash + 1u); if (dir_part.empty()) dir_part = "/"; }
+    const std::string prefix = dir_part.empty() ? std::string() : dir_part + "/";
+    if (pattern.empty()) pattern = "*";   // `a x.nz dir/` takes what `dir/*` takes (measured)
+    if (pattern == "." || pattern == "..") {
+        if (recurse) LegacyScanDirectory(dir_part.empty() ? pattern : dir_part + "/" + pattern, "*",
+                                         StripStoredNameFront(prefix + pattern + "/"), recurse, out);
+        return;
+    }
+    LegacyScanDirectory(dir_part, pattern, StripStoredNameFront(prefix), recurse, out);
+}
+
+// FUN_08051f40's comparison, mode 1 = extension, 2 = name, 3 = size. Returns
+// true when `a` goes BEFORE `b`; equal keys return false (the merge then takes b).
+bool LegacyEncodeLess(const EncodeSource& a, const EncodeSource& b, unsigned mode) {
+    if (mode == 3u) return a.size < b.size;
+    if (mode == 2u) return a.archive_name < b.archive_name;
+    // extension: from the end back to the last '.' that follows the last '/';
+    // none -> the empty string
+    auto ext_of = [](const std::string& n) -> std::string {
+        std::size_t i = n.size();
+        while (i > 0u) { const char c = n[i - 1u]; if (c == '/') return std::string(); if (c == '.') return n.substr(i); --i; }
+        return std::string();
+    };
+    const std::string ea = ext_of(a.archive_name), eb = ext_of(b.archive_name);
+    std::size_t k = 0;
+    for (;; ++k) {
+        const int ca = (k < ea.size()) ? std::tolower(static_cast<unsigned char>(ea[k])) : 0;
+        const int cb = (k < eb.size()) ? std::tolower(static_cast<unsigned char>(eb[k])) : 0;
+        if (ca != cb) return ca < cb;
+        if (ca == 0) break;
+    }
+    if (a.size != b.size) return a.size < b.size;
+    return a.archive_name < b.archive_name;
+}
+
+// FUN_08052200: split at n/2 (the FIRST n/2 nodes stay in the left list), sort
+// both halves, merge taking the left when it is less and the right otherwise.
+void LegacyMergeSort(std::vector<EncodeSource>* v, unsigned mode) {
+    if (v->size() < 2u) return;
+    const std::size_t half = v->size() >> 1u;
+    std::vector<EncodeSource> left(v->begin(), v->begin() + static_cast<std::ptrdiff_t>(half));
+    std::vector<EncodeSource> right(v->begin() + static_cast<std::ptrdiff_t>(half), v->end());
+    LegacyMergeSort(&left, mode); LegacyMergeSort(&right, mode);
+    v->clear(); std::size_t i = 0, j = 0;
+    while (i < left.size() && j < right.size()) {
+        if (LegacyEncodeLess(left[i], right[j], mode)) v->push_back(std::move(left[i++]));
+        else v->push_back(std::move(right[j++]));
+    }
+    while (i < left.size()) v->push_back(std::move(left[i++]));
+    while (j < right.size()) v->push_back(std::move(right[j++]));
+}
+
+// The writer's UTC offset (quirk 31): the stored stamp is mtime - offset.
+long LegacyLocalUtcOffsetSeconds() {
+    static const long off = [] {
+        const std::time_t now = std::time(nullptr);
+        std::tm tmv{};
+#if defined(_WIN32)
+        localtime_s(&tmv, &now);
+        return static_cast<long>(-_timezone + (tmv.tm_isdst > 0 ? 3600 : 0));
+#else
+        localtime_r(&now, &tmv);
+        return static_cast<long>(tmv.tm_gmtoff);
+#endif
+    }();
+    return off;
+}
+
+// Running checksum over one file's bytes, finished the way the archive stores it.
+struct LegacyFileChecksum {
+    ChecksumMode mode; std::uint32_t c16 = 0xffffu, c32 = 0xffffffffu, f1 = 0, f2 = 0; std::uint8_t pend = 0; bool has_pend = false;
+    explicit LegacyFileChecksum(ChecksumMode m) : mode(m) {}
+    void Update(const unsigned char* d, std::size_t n) {
+        switch (mode) {
+            case ChecksumMode::kCrc16: c16 = UpdateCrc16(c16, d, n); break;
+            case ChecksumMode::kCrc32: c32 = UpdateCrc32(c32, d, n); break;
+            case ChecksumMode::kFletcher32: UpdateFletcher32(&f1, &f2, &pend, &has_pend, d, n); break;
+            default: break;
+        }
+    }
+    std::uint32_t Final() const {
+        switch (mode) {
+            case ChecksumMode::kCrc16: return (c16 ^ 0xffffu) & 0xffffu;
+            case ChecksumMode::kCrc32: return c32 ^ 0xffffffffu;
+            case ChecksumMode::kFletcher32: return FinalizeFletcher32(f1, f2, pend, has_pend);
+            default: return 0u;
+        }
+    }
+};
+
+// Table + mtimes + permissions (+ owners) for the entries [from, to) -- the
+// files that START in the block about to be written (FUN_0804f0a0's first
+// four emitters), then the checksums of [ck_from, ck_to) -- the files that
+// END in it.
+void LegacyEmitBlockMetadata(std::ostream& out, unsigned stream, const std::vector<EncodeSource>& src,
+                             const std::vector<std::uint32_t>& checksums, std::size_t from, std::size_t to,
+                             std::size_t ck_from, std::size_t ck_to, ChecksumMode ckmode,
+                             const CliOptions& options) {
+    if (from < to) {
+        LegacyMetaBuffer table(1u, stream, out);
+        for (std::size_t i = from; i < to; ++i) {
+            std::vector<unsigned char> item;
+            WriteLegacyVarint(src[i].size, &item);
+            item.insert(item.end(), src[i].archive_name.begin(), src[i].archive_name.end());
+            item.push_back(0u);
+            table.Need(item.size()); table.Put(item.data(), item.size());
+        }
+        table.Flush();
+        if (!options.no_timestamps) {
+            LegacyMetaBuffer mt(2u, stream, out);
+            const long off = LegacyLocalUtcOffsetSeconds();
+            std::uint32_t prev = static_cast<std::uint32_t>(src[from].mtime - off);
+            unsigned char b4[4] = {static_cast<unsigned char>(prev), static_cast<unsigned char>(prev >> 8), static_cast<unsigned char>(prev >> 16), static_cast<unsigned char>(prev >> 24)};
+            mt.Put(b4, 4u);
+            for (std::size_t i = from + 1u; i < to; ++i) {
+                const std::uint32_t cur = static_cast<std::uint32_t>(src[i].mtime - off);
+                const std::int32_t d = static_cast<std::int32_t>(cur - prev);
+                const std::uint32_t zz = (static_cast<std::uint32_t>(d) << 1u) ^ static_cast<std::uint32_t>(d >> 31);
+                std::vector<unsigned char> v; WriteLegacyVarint(zz, &v);
+                mt.Need(v.size()); mt.Put(v.data(), v.size());
+                prev = cur;
+            }
+            mt.Flush();
+        }
+        if (!options.no_permissions) {
+            bool all_default = true;
+            for (std::size_t i = from; i < to; ++i) if ((src[i].mode & 0xfffu) != 0x180u) { all_default = false; break; }
+            if (!all_default) {
+                LegacyMetaBuffer pm(4u, stream, out);
+                std::size_t i = from;
+                while (i < to) {
+                    const std::uint32_t m = src[i].mode & 0xfffu;
+                    std::size_t run = 1u;
+                    if (m < 0x200u) {
+                        while (i + run < to && (src[i + run].mode & 0xfffu) == m && (0x1000u + 0x200u * (run - 1u) + m) <= 0xfdffu) ++run;
+                    }
+                    const std::uint32_t v = (run == 1u) ? m : (0x1000u + 0x200u * (run - 2u) + m);
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    pm.Need(2u); pm.Put(b2, 2u);
+                    i += run;
+                }
+                pm.Flush();
+            }
+        }
+        if (options.restore_ownership) {
+            for (unsigned t = 8u; t <= 9u; ++t) {
+                LegacyMetaBuffer ow(t, stream, out);
+                for (std::size_t i = from; i < to; ++i) {
+                    const std::uint16_t v = (t == 8u) ? src[i].uid : src[i].gid;
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    ow.Put(b2, 2u); ow.Need(2u);
+                }
+                ow.Flush();
+            }
+        }
+    }
+    if (ck_from < ck_to && ckmode != ChecksumMode::kNone) {
+        const unsigned type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        const std::size_t width = (ckmode == ChecksumMode::kCrc16) ? 2u : 4u;
+        LegacyMetaBuffer ck(type, stream, out);
+        for (std::size_t i = ck_from; i < ck_to; ++i) {
+            const std::uint32_t c = checksums[i];
+            unsigned char b4[4] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 24)};
+            ck.Need(width); ck.Put(b4, width);
+        }
+        ck.Flush();
+    }
+}
+
+// One worker stream of the store container: the global bytes [begin, end) as
+// its own record run (kind, codec, then per block: table / mtimes / perms /
+// owners of the files that start, checksums of the files that end, data).
+// A file only partly inside the range is a SLICE: listed with the slice's size,
+// PREPENDED to the stream's entry list (whole files are appended, in order),
+// followed by a type-10 record with the slice's offset inside its file, and
+// checksummed as a slice. Measured on the original with -pN -t1 (the only
+// deterministic thread count): FUN_0804f0a0's emitters over the reader's
+// per-worker entry list (FUN_0804f260).
+struct LegacyStreamPiece {           // one entry of a worker's list
+    std::size_t src = 0;             // index into the sorted sources
+    std::uint64_t file_off = 0;      // where this piece starts inside the file
+    std::uint64_t len = 0;           // bytes stored (0 for a ghost)
+    bool slice = false;              // partial file: OFF record, flag 0x10
+    std::uint64_t planned = 0;       // the reader's budget for the entry: its bytes, ghost or not
+};
+
+void LegacyEmitPieceMetadata(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
+                             const std::vector<LegacyStreamPiece>& pieces, const std::vector<std::uint32_t>& piece_ck,
+                             std::size_t from, std::size_t to, std::size_t ck_from, std::size_t ck_to,
+                             ChecksumMode ckmode, const CliOptions& options) {
+    struct VecStream { std::vector<unsigned char>& v; } vs{out};
+    auto rec = [&](unsigned type, const unsigned char* d, std::size_t n) {
+        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, type, stream, n);
+        out.insert(out.end(), hdr.begin(), hdr.end()); if (n) out.insert(out.end(), d, d + n);
+    };
+    struct Buf { unsigned type; std::vector<unsigned char> b; };
+    auto flush = [&](Buf& bf) { if (!bf.b.empty()) { rec(bf.type, bf.b.data(), bf.b.size()); bf.b.clear(); } };
+    auto need = [&](Buf& bf, std::size_t n) { if (0x8000u - bf.b.size() < n) flush(bf); };
+    if (from < to) {
+        Buf table{1u, {}};
+        for (std::size_t i = from; i < to; ++i) {
+            const EncodeSource& e = src[pieces[i].src];
+            std::vector<unsigned char> item;
+            WriteLegacyVarint(pieces[i].len, &item);
+            item.insert(item.end(), e.archive_name.begin(), e.archive_name.end());
+            item.push_back(0u);
+            need(table, item.size()); table.b.insert(table.b.end(), item.begin(), item.end());
+            if (pieces[i].slice) {
+                // a slice ends the table record and gets its offset record at once
+                flush(table);
+                unsigned char off[8]; const std::uint64_t o = pieces[i].file_off;
+                for (unsigned k = 0; k < 8u; ++k) off[k] = static_cast<unsigned char>(o >> (8u * k));
+                rec(10u, off, 8u);
+            }
+        }
+        flush(table);
+        if (!options.no_timestamps) {
+            Buf mt{2u, {}};
+            const long off = LegacyLocalUtcOffsetSeconds();
+            std::uint32_t prev = static_cast<std::uint32_t>(src[pieces[from].src].mtime - off);
+            unsigned char b4[4] = {static_cast<unsigned char>(prev), static_cast<unsigned char>(prev >> 8), static_cast<unsigned char>(prev >> 16), static_cast<unsigned char>(prev >> 24)};
+            mt.b.insert(mt.b.end(), b4, b4 + 4);
+            for (std::size_t i = from + 1u; i < to; ++i) {
+                const std::uint32_t cur = static_cast<std::uint32_t>(src[pieces[i].src].mtime - off);
+                const std::int32_t d = static_cast<std::int32_t>(cur - prev);
+                const std::uint32_t zz = (static_cast<std::uint32_t>(d) << 1u) ^ static_cast<std::uint32_t>(d >> 31);
+                std::vector<unsigned char> v; WriteLegacyVarint(zz, &v);
+                need(mt, v.size()); mt.b.insert(mt.b.end(), v.begin(), v.end());
+                prev = cur;
+            }
+            flush(mt);
+        }
+        if (!options.no_permissions) {
+#if defined(_WIN32)
+            // The Windows original writes ATTRIBUTES, one nibble per entry, high
+            // nibble first, zero-padded to a byte -- and omits the record when
+            // every file is plain, which is why an archive of one ordinary file
+            // carries no permission record at all. Writing a POSIX type-4 here
+            // instead put three bytes in an archive the original leaves out.
+            bool attrs_plain = true;
+            for (std::size_t i = from; i < to; ++i)
+                if (src[pieces[i].src].win_attr != 8u) { attrs_plain = false; break; }
+            if (!attrs_plain) {
+                std::vector<unsigned char> ab;
+                for (std::size_t i = from; i < to; i += 2u) {
+                    const unsigned hi = src[pieces[i].src].win_attr & 0xfu;
+                    const unsigned lo = (i + 1u < to) ? (src[pieces[i + 1u].src].win_attr & 0xfu) : 0u;
+                    ab.push_back(static_cast<unsigned char>((hi << 4u) | lo));
+                }
+                rec(3u, ab.data(), ab.size());
+            }
+#else
+            bool all_default = true;
+            for (std::size_t i = from; i < to; ++i) if ((src[pieces[i].src].mode & 0xfffu) != 0x180u) { all_default = false; break; }
+            if (!all_default) {
+                Buf pm{4u, {}};
+                std::size_t i = from;
+                while (i < to) {
+                    const std::uint32_t m = src[pieces[i].src].mode & 0xfffu;
+                    std::size_t run = 1u;
+                    if (m < 0x200u)
+                        while (i + run < to && (src[pieces[i + run].src].mode & 0xfffu) == m && (0x1000u + 0x200u * (run - 1u) + m) <= 0xfdffu) ++run;
+                    const std::uint32_t v = (run == 1u) ? m : (0x1000u + 0x200u * (run - 2u) + m);
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    need(pm, 2u); pm.b.insert(pm.b.end(), b2, b2 + 2);
+                    i += run;
+                }
+                flush(pm);
+            }
+#endif
+        }
+        if (options.restore_ownership) {
+            for (unsigned t = 8u; t <= 9u; ++t) {
+                Buf ow{t, {}};
+                for (std::size_t i = from; i < to; ++i) {
+                    const EncodeSource& e = src[pieces[i].src];
+                    const std::uint16_t v = (t == 8u) ? e.uid : e.gid;
+                    unsigned char b2[2] = {static_cast<unsigned char>(v), static_cast<unsigned char>(v >> 8)};
+                    ow.b.insert(ow.b.end(), b2, b2 + 2); need(ow, 2u);
+                }
+                flush(ow);
+            }
+        }
+    }
+    if (ck_from < ck_to && ckmode != ChecksumMode::kNone) {
+        const unsigned type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        const std::size_t width = (ckmode == ChecksumMode::kCrc16) ? 2u : 4u;
+        Buf ck{type, {}};
+        for (std::size_t i = ck_from; i < ck_to; ++i) {
+            const std::uint32_t c = piece_ck[i];
+            unsigned char b4[4] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16), static_cast<unsigned char>(c >> 24)};
+            need(ck, width); ck.b.insert(ck.b.end(), b4, b4 + width);
+        }
+        flush(ck);
+    }
+    (void)vs;
+}
+
+// Writes one worker stream's whole record run into `out`: the global bytes
+// [begin, end) of the concatenated sources, in blocks of `window`.
+// The original's `a` console for the store (measured 2026-09-05 against
+// linux32/nz; the decoder's engine in namespace progress is the same code seen
+// from the other side, FUN_0804b740 / FUN_0804ab00):
+//  * one slot per worker: done = input bytes of the blocks it has completed,
+//    total = the bytes of its range; a slot draws "<pct>%" with
+//    pct = ((done>>10)|1)*100 / ((total>>10)|1) -- KB units OR'd with 1, so a
+//    two-block 75501-byte store shows 89 % (65*100/73), not 86;
+//  * the fields of slots 0.. up to the first slot still at 0 are joined by '|',
+//    then four spaces and one backspace per character written;
+//  * a worker tick (every completed block) redraws only when the whole second
+//    of time() differs from the previous worker tick; the file-start tick has a
+//    gate of its own and prints the name in 40 columns plus a space first.
+//    Hence, in a run under a second: name, empty fields, then ONE field draw
+//    after the first block -- 100 % for a one-block store, the block-1 figure
+//    for two; and with -pN under -t1 an EMPTY field, since worker N-1 runs
+//    first and slot 0 is still at zero.
+struct EncodeStatus {
+    std::vector<std::uint64_t> done, total;
+    std::time_t writer_sec = 0, worker_sec = 0;
+    // Worker streams compressed concurrently all tick this: every method takes the
+    // lock, and so does Line(), the one way a buffered message reaches the console
+    // while they run, so a redraw never lands in the middle of a line.
+    mutable std::mutex mu;
+    explicit EncodeStatus(std::size_t workers) : done(workers, 0u), total(workers, 0u), pending(workers, 0u) {}
+    static std::string Pct(std::uint64_t d, std::uint64_t t) {
+        return std::to_string((((d >> 10u) | 1u) * 100u) / ((t >> 10u) | 1u)) + "%";
+    }
+    std::string Fields() const {
+        std::string f;
+        for (std::size_t k = 0; k < done.size() && k < 8u; ++k) {
+            if (done[k] == 0u) break;
+            if (!f.empty()) f += '|';
+            f += Pct(done[k], total[k]);
+        }
+        return f;
+    }
+    void DrawFields(std::ostream& os) const {
+        const std::string f = Fields();
+        os << f << "    " << std::string(f.size() + 4u, '\b');
+        os.flush();
+    }
+    void FileStart(std::ostream& os, const std::string& name) {
+        std::lock_guard<std::mutex> lk(mu);
+        const std::time_t sec = std::time(nullptr);
+        if (sec == writer_sec) return;
+        writer_sec = sec;
+        ClearStatusLine(os);
+        os << progress::Name40(name) << ' ';
+        DrawFields(os);
+    }
+    // A ghost's bytes join the slot at the next block end (the name tick before
+    // the first block shows an empty field even after "Cannot open"): the slot
+    // counts what the worker has consumed of its range, block by block.
+    std::vector<std::uint64_t> pending;
+    void Passed(std::size_t k, std::uint64_t bytes) { std::lock_guard<std::mutex> lk(mu); if (k < done.size()) pending[k] += bytes; }
+    // a chunked codec's ghost leaves its slot's total (see the stream writer)
+    void DropFromTotal(std::size_t k, std::uint64_t bytes) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (k < total.size()) total[k] -= std::min<std::uint64_t>(total[k], bytes);
+    }
+    // a whole message line, written while no redraw can interleave
+    void Line(std::ostream& os, const std::string& text) {
+        std::lock_guard<std::mutex> lk(mu);
+        os << text;
+        os.flush();
+    }
+    void BlockDone(std::ostream& os, std::size_t k, std::uint64_t bytes) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (k < done.size()) { done[k] += bytes + pending[k]; pending[k] = 0u; }
+        const std::time_t sec = std::time(nullptr);
+        if (sec == worker_sec) return;
+        worker_sec = sec;
+        DrawFields(os);
+    }
+};
+
+// "Threads: T, memory: 512 MB[, IO-buffers: R+W MB]" -- T = min(-t, host), the
+// buffers only with more than one thread (a -t1 run has none: -v then says
+// "Setting up IO write buffer: 0 MB" and the Compressor lines carry no
+// IO-buffer). A -pN above T is preceded by the warning line. One Compressor
+// line per worker, "[M MB]" from that worker's window, -v adding its share of
+// the read buffer (R/N, half-up MB).
+// What a worker stream compresses with. p0 0 = store; 1/2 = lzpf (-cf/-cF), whose
+// state (window, hash tables) lives in `lz` and is created per stream.
+// `a -co`: the nz_optimum1 blocks of one DATA record. The decoder walks the
+// stream as a chain of segments, each tagged by a varint (bytes<<4)|0 -- and that
+// tag is the DATA record header itself, so one record is one segment. A block is [u32 payload size][payload][descriptor], the
+// descriptor coming AFTER its payload; for a plain LZ block it is decr_param 1,
+// param6 1, the block's output size, the staged check bytes, and five zero flag
+// bytes (param2, param1, param16, text transform, dece).
+//
+// The staged bytes are Fletcher32(stage output) % 255 and the decoder pops them
+// LAST first, so with the two stages a plain LZ block has -- its payload and the
+// LZ output -- they go out as { check(LZ output), check(payload) }.
+// FUN_0808d7f0: LZ or BWT for this block? A sample of min(n >> 3, 512 KB) is
+// coded both ways -- with a FRESH LZ engine (a new coder object with a 1 MB
+// window, thrown away after) and with the BWT bucket coder -- and LZ is taken
+// only when it comes out strictly smaller. A sample the bucket coder cannot
+// shrink at all makes it "LZ if LZ shrank the sample", else BWT, whose stored
+// form is what an incompressible block becomes.
+// Which decision type an optimum engine parses into -- the two are the same
+// shape, so everything below is written once for both.
+// Which decision type an optimum engine parses into, and the one header field
+// that tells the two apart: a compressed BWT block's param7, which the decoder
+// reads and never uses. Measured over every such block of a 180-file corpus,
+// both codecs: -co writes 0 in all 18, -cO writes 1 in all 18.
+template <class E> struct OptimumDecisionOf;
+template <> struct OptimumDecisionOf<nzr::optimum::NzOptimumLzDecoder> {
+    using type = nzr::optimum::OptimumDecision;
+    static constexpr unsigned char kBwtParam7 = 0u;
+};
+template <> struct OptimumDecisionOf<nzr::optimum2::NzOptimum2LzDecoder> {
+    using type = nzr::optimum2::Optimum2Decision;
+    static constexpr unsigned char kBwtParam7 = 1u;
+};
+
+static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
+    const std::uint32_t sample = (n >> 3) < 0x80000u ? (n >> 3) : 0x80000u;
+    // Under 8 bytes the sample is empty and FUN_0808d7f0 compares two sizes of
+    // nothing: the block goes BWT (measured: `a -co` of 1..7 bytes writes a
+    // stored BWT block). Calling it LZ declined every such input, since no LZ
+    // payload comes out smaller than the block.
+    if (sample == 0u) return false;
+    std::vector<std::uint8_t> lzpay;
+    {
+        // 1 MB, read out of the running binary: its ring descriptor says
+        // 0x100000 and its match finder is sized from the same number (shift 20,
+        // mask 0xfffff). The window decides the finder's tag width, so a 3 MB
+        // one -- which is the TREE's size, not the window's -- makes the chain
+        // walk confirm different entries and the sample come out a few bytes
+        // off, which is enough to flip a block from LZ to BWT.
+        // ALWAYS the compact engine, even under -cO: FUN_0808d7f0 is shared and
+        // builds its own coder rather than borrowing the codec's. Sampling with
+        // the large engine instead made 14 of the corpus's blocks come out LZ
+        // where the original takes BWT -- it shrinks the sample more, so it wins
+        // a comparison the original loses.
+        nzr::optimum::NzOptimumLzDecoder sampler(0x100000u);
+        if (!sampler.EncodeBlockParsed(data, sample, lzpay, nullptr)) lzpay.clear();
+    }
+    std::uint32_t lz = static_cast<std::uint32_t>(lzpay.size());
+    if (lz == 0u) lz = sample;
+    std::vector<std::uint8_t> bwt(sample + 4u), bpay;
+    NzBwtTransform(data, sample, bwt.data());
+    const std::uint32_t b = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, bpay);
+    if (NZ_ENV("NZOPT_TRACE_TDO"))
+        std::fprintf(stderr, "[tdo] kind n=%u sample=%u lz=%u bwt=%u -> %s\n", n, sample, lz, b,
+                     (b == 0u ? (lz < sample) : (lz < b)) ? "LZ" : "BWT");
+    if (b == 0u) return lz < sample;
+    return lz < b;
+}
+
+// The whole post-filter chain and block framing is shared between `-co` and
+// `-cO`: the two differ only in which LZ engine codes the block and samples the
+// LZ-or-BWT decision, exactly as the decode side's own framed loop does.
+// The audio block writer's stream state: the encoder itself (its models carry
+// across blocks) and the span the reference's driver tracks in its probe.
+struct CoAudioState {
+    nzr::audio::NzAudioEncoder enc;
+    nzr::lzpf_enc::ImageEncModel img;
+    bool img_ready = false;
+    std::uint64_t pos = 0, end = 0;   // the stream offset and where the recognised header says the audio ends
+    
+    bool ready = false;
+};
+
+// The -co/-cO block read-back: every coded LZ block decoded by a second engine
+// and compared before it is committed, a failure declining the archive. Since
+// the whole-archive self-check (v0.17.4-pre) decodes everything `a`/`w32c` wrote
+// and refuses to keep an archive that does not read back, the block check proves
+// nothing more there -- and it was ~14 % of a -co encode (perf, 16 MB of real
+// files) plus a second engine's memory per stream. It stays where the self-check
+// does not run: `s` (nothing is written) and NZ_NO_SELFCHECK=1.
+static bool BlockReadBackWanted(const CliOptions& options) {
+    return options.command == Command::kSimulate || NZ_ENV("NZ_NO_SELFCHECK") != nullptr;
+}
+
+template <class Engine>
+static bool OptimumEncodeSegment(Engine& co, Engine* verifier, NzExeFilterEnc& exe_enc,
+                                 nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
+                                 const unsigned char* data, std::uint32_t len, unsigned stream,
+                                 std::vector<unsigned char>& out, bool final,
+                                 CoAudioState* audio = nullptr, unsigned p0 = 0) {
+    // One type-0 DATA record PER BLOCK: the record header is the chain segment's
+    // tag, so a stream of N blocks is N records, not one. Walking a two-block
+    // archive the original wrote shows exactly that -- 2 type-0 records where a
+    // single wrapping record would have made 1, three bytes of header apart.
+    std::vector<unsigned char> seg;
+    // Blocks accumulate here and are committed to `out` only when the WHOLE
+    // segment succeeded: any decline past the first block would otherwise
+    // leave a truncated stream in the archive, which reads as corruption
+    // rather than as the refusal it is.
+    std::vector<unsigned char> emitted;
+    const auto put32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) seg.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xffu));
+    };
+    const auto flush_block = [&]() {
+        std::vector<unsigned char> hdr;
+        WriteLegacyRecordHeader(&hdr, 0u, stream, seg.size());
+        emitted.insert(emitted.end(), hdr.begin(), hdr.end());
+        emitted.insert(emitted.end(), seg.begin(), seg.end());
+        seg.clear();
+    };
+    // The dece filter's run state: the recent-target caches and the base
+    // persist across a RUN of consecutive filtered blocks and reset as soon as
+    // a block goes unfiltered (reference FUN_080b98a0 / FUN_080b98e0 on the
+    // codec object's own state at obj+0x90).
+    // FUN_0808d0b0 decides the block's length before anything looks at it: an
+    // order-1 entropy split over what its 1 MB buffer holds, capped at the block
+    // size. The buffer spans the calls -- it is filled from the STREAM, not from
+    // this one piece -- so a piece that does not fill it codes nothing and waits.
+    if (audio != nullptr && !feeder.span_probe) {
+        // Tell the feeder where a recognised audio span ends, so a block stops
+        // there instead of being cut by the entropy split -- the reference sets
+        // that length in its read loop and never reaches the split at all.
+        feeder.span_probe = [](const std::uint8_t* p, std::uint32_t n) -> std::uint32_t {
+            nzr::audio::NzAudioChunkParams probe;
+            nzr::audio::NzAudioEncoder::SpanOf(p, n, &probe);
+            return probe.span_len;
+        };
+    }
+    feeder.Feed(reinterpret_cast<const std::uint8_t*>(data), len);
+    while (feeder.Next(block_size, final)) {
+        const std::uint8_t* src = feeder.Data();
+        const std::uint32_t n = feeder.Len();
+        // The stream offset of THIS block: the span the audio probe opens is
+        // measured in stream coordinates, so it has to advance on every block,
+        // audio or not.
+        const std::uint64_t bpos = (audio != nullptr) ? audio->pos : 0u;
+        if (audio != nullptr) audio->pos += n;
+
+        // FUN_0808da10 tries the AUDIO block before anything else: probe the
+        // block, encode it, and keep it when the payload beats an entropy
+        // estimate of the raw bytes by the reference's 17/16 margin. No LZ trial
+        // is involved. `mode2_type` is "no audio span was in progress", which is
+        // what tells the decoder to reset the predictor.
+        // FUN_0808da10's block analysis. The image block is not written yet, so
+        // a block that would take that path declines instead of coming out
+        // wrong; the exe and text paths are complete.
+        //
+        // dece (the exe filter, FUN_08090360) comes FIRST and, when it is kept,
+        // the analysis skips the text detector entirely and the block goes down
+        // the LZ path (the reference never calls FUN_0808d7f0 on a filtered
+        // block, and its LZ-or-BWT flag is left true).
+        std::vector<std::uint8_t> exe_buf, exe_side;
+        bool exe_on = false;
+        const std::uint8_t* exe_out = src;
+        std::uint32_t exe_len = n;
+        if (nzr::lzpf_enc::ExeMetric(src, n) / ((n >> 12u) + 1u) != 0u) {
+            const std::uint32_t r = exe_enc.Encode(src, n, &exe_buf, &exe_side);
+            if (r != 0u) {
+                exe_on = true;
+                exe_out = exe_buf.data();
+                exe_len = r;
+                exe_enc.Advance(n);
+            } else {
+                exe_enc.Reset();
+            }
+        } else {
+            exe_enc.Reset();
+        }
+
+        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16;
+        std::uint8_t applied = 0;
+        bool tt_on = false;
+        const std::uint8_t* lz_in = exe_out;
+        std::uint32_t m = exe_len;
+        if (!exe_on) {
+            bool route = false;
+            std::uint32_t mask;
+            {   // the detector's scratch: only when the exe filter did not take the block, and only for the detection
+                std::vector<std::uint8_t> scratch(n + 0x2000u, 0);
+                mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), false, &route);
+            }
+            if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, true, false)) {
+                tbuf.assign(src, src + n);
+                tbuf.resize(n + 0x2000u, 0);
+                // The number step's entropy estimate reads FOUR bytes past the
+                // range it measures, and for the block's second half that lands
+                // just past the block -- where the original's buffer holds the
+                // bytes that follow in the input, not zeros. One block of one
+                // corpus file turns on it (4839 against our 4822).
+                std::memcpy(tbuf.data() + n, src + n, 0x2000u);
+                tmp.assign(n + 0x2000u, 0);
+                std::uint8_t* pa = tbuf.data();
+                std::uint8_t* pb = tmp.data();
+                const std::uint32_t r = nzr::opt_enc::CoTextPipeline(mask, pa, n, pb, block_size + 0x40u,
+                                                                     &applied, &tt2, &tt16, true, false);
+                if (r != 0u) { tt_on = true; lz_in = pa; m = r; }
+            }
+        }
+
+        // LAB_0808ebc8 / the audio branch's own guard: the image and audio
+        // block kinds are only tried when NEITHER the exe filter NOR a text
+        // transform claimed this block (`local_74[0] == 0 && local_74[5] == 0`).
+        // Trying them first, as this did, took blocks the original codes as LZ:
+        // an .a3s matched byte for byte the moment the audio path was skipped
+        // where the reference never reaches it.
+        if (!exe_on && !tt_on) {
+            // The image block (decr_param 3) is tried before the audio one -- the
+            // reference's driver skips audio entirely once the image path took the
+            // block. Its acceptance test lives inside the encoder (a payload that
+            // does not beat the raw block returns 0), and the record carries no
+            // mode2_type byte.
+            if (audio != nullptr && NZ_ENV("NZOPT_NO_IMAGE") == nullptr) {
+                if (!audio->img_ready) {
+                    if (p0 == 5u) audio->img.Configure(0x07u, 32u, 48u, true);
+                    else          audio->img.Configure(0x0fu, 32u, 48u, false);
+                    audio->img_ready = true;
+                }
+                std::vector<std::uint8_t> ipay;
+                const bool img_taken =
+                    nzr::lzpf_enc::ImageEncodeBlock(audio->img, src, n, ipay) != 0u && !ipay.empty();
+                // LAB_0808dcfc: a block the image path does not take resets the image
+                // model (FUN_080b6170) before the audio branch runs.
+                if (!img_taken) audio->img.Reset();
+                if (img_taken) {
+                    put32(static_cast<std::uint32_t>(ipay.size()));
+                    seg.insert(seg.end(), ipay.begin(), ipay.end());
+                    seg.push_back(3u);          // decr_param: image
+                    put32(n);                   // the block's output size
+                    flush_block();
+                    continue;
+                }
+            }
+            if (audio != nullptr && !audio->ready) {
+                // ConfigureOptimumModels' encoder twin: -co runs the second bit-count
+                // class and the shorter predictor, -cO and -cc the default.
+                if (p0 == 5u) {
+                    audio->enc.SetContextFlags(0x13u);
+                    audio->enc.SetPlaneOrders(64u, 8u, 8u);
+                    audio->enc.SetStereoParam(4u);
+                    audio->enc.SetBitcountVariantB(true);
+                } else {
+                    audio->enc.SetContextFlags(0x03u);
+                    audio->enc.SetPlaneOrders(96u, 8u, 8u);
+                    audio->enc.SetStereoParam(8u);
+                }
+                audio->enc.Reset();
+                audio->ready = true;
+            }
+            if (audio != nullptr && NZ_ENV("NZOPT_NO_AUDIO") == nullptr) {
+                nzr::audio::NzAudioChunkParams ap;
+                audio->enc.ChooseFormat(src, n, &ap);
+                if (ap.hdr_found && ap.hdr_end != 0u) audio->end = bpos + ap.hdr_end;
+                const bool span = bpos < audio->end;
+                // A recognised header opens a span; without one this port does not
+                // take the block (the reference's headerless test, FUN_08081760, is
+                // not ported yet, so those blocks go down the LZ/BWT path as before).
+                bool take = span || ap.is_audio;
+                if (NZ_ENV("NZOPT_TRACE_AUDENC"))
+                    std::fprintf(stderr, "[audenc] block n=%u hdr=%u take=%d span=%d\n", n, ap.header_bytes, (int)take, (int)span);
+                // The driver resets the model whenever no span is in progress
+                // (LAB_0808f1a5: `local_6b = 1; FUN_080b1950(obj + 0x4c0)`), and that
+                // same flag is the mode2_type byte -- so a block written with
+                // mode2_type 1 is DECODED from a fresh model and must be ENCODED from
+                // one too. Without the reset, a block that follows rejected audio
+                // attempts carries their state into a payload the decoder reads with
+                // none: a .ppm whose third block went down this path decoded to
+                // garbage in the original's binary as well as in ours.
+                const bool fresh = !(span || ap.hdr_found);
+                if (take) {
+                    if (fresh) audio->enc.Reset();
+                    std::vector<std::uint8_t> apay;
+                    if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
+                        // The reference's estimate: over the FIRST 64 KB only, scaled
+                        // to the block, and recomputed exactly over the rest only when
+                        // the payload already beats the scaled figure. Inside a span in
+                        // progress there is no estimate at all -- the raw size is the
+                        // bar. Estimating the whole block in one go (what this did
+                        // first) accepted audio where the reference declines it.
+                        std::uint64_t est = n;
+                        if (!span) {
+                            const std::uint32_t n0 = (n < 0x10000u) ? n : 0x10000u;
+                            const std::uint32_t e0 = nzr::opt_enc::CoEntropyEstimate(src, n0);
+                            est = static_cast<std::uint64_t>(
+                                (static_cast<long double>(n) / static_cast<long double>(n0)) *
+                                static_cast<long double>(e0) + 0.5L);
+                            if (static_cast<std::uint64_t>(apay.size()) < est && n > n0)
+                                est = static_cast<std::uint64_t>(e0) +
+                                      nzr::opt_enc::CoEntropyEstimate(src + n0, n - n0);
+                        }
+                        if (NZ_ENV("NZOPT_TRACE_AUDENC"))
+                            std::fprintf(stderr, "[audenc] n=%u hdr=%u ch=%u payload=%zu est=%u -> %s\n",
+                                         n, ap.header_bytes, ap.channels, apay.size(), (unsigned)est,
+                                         ((std::uint64_t)apay.size() * 0x11ull < est * 0x10ull) ? "AUDIO" : "no");
+                        if (static_cast<std::uint64_t>(apay.size()) * 0x11ull < est * 0x10ull) {
+                            // mode2_type is "no audio span was in progress" -- and a
+                            // recognised header opens the span before the block is
+                            // coded, which is why a RIFF file writes 0 and a NIST one
+                            // (whose header the detector does not know) writes 1.
+                            const std::uint8_t mode2 = fresh ? 1u : 0u;
+                            put32(static_cast<std::uint32_t>(apay.size()));
+                            seg.insert(seg.end(), apay.begin(), apay.end());
+                            seg.push_back(2u);          // decr_param: audio
+                            seg.push_back(mode2);       // mode2_type
+                            put32(n);                   // the block's output size
+                            flush_block();
+                            continue;
+                        }
+                    }
+                }
+            }
+            // LAB_0808dcc7: every block that is NOT written as audio resets the
+            // audio model (FUN_080b1950) before the LZ path -- so the model only
+            // ever carries across CONSECUTIVE audio blocks, which is exactly what
+            // the decoder's mode2_type rule assumes.
+            if (audio != nullptr) audio->enc.Reset();
+
+        } else if (audio != nullptr) {
+            // Skipped, but the models still go back to their initial state --
+            // the reference resets both on this path too.
+            audio->img.Reset();
+            audio->enc.Reset();
+        }
+
+        // param1 (FUN_0806e7a0), the first of the two post-filters the driver
+        // attempts when NO text transform applied: a delta filter over the
+        // regions where coding `data[k] - data[k - offset]` shrinks the
+        // order-2.5 alphabet, the region triples going to a side stream.
+        std::vector<std::uint8_t> p1buf, p1side;
+        bool p1_on = false;
+        const std::uint8_t* pre_p1 = lz_in;
+        std::uint32_t pre_p1_len = m;
+        if (!tt_on) {
+            if (nzr::opt_enc::NzOptimumParam1Encode(lz_in, m, &p1buf, &p1side, 0x1000u, feeder.front + 768)) {
+                p1_on = true;
+                lz_in = p1buf.data();
+            }
+        }
+
+        // param2 (FUN_0808ff20), the second: collapse runs of six or more equal
+        // 32-bit words, the run lengths to a side stream. Taken only when the
+        // side stream plus the collapsed size beat the input by more than
+        // min(n >> 7, 2 KB).
+        std::vector<std::uint8_t> p2buf, p2side;
+        bool p2_on = false;
+        const std::uint8_t* pre_p2 = lz_in;
+        std::uint32_t pre_p2_len = m;
+        if (!tt_on) {
+            p2buf.assign(m + 0x40u, 0);
+            std::vector<std::uint8_t> side;
+            const std::uint32_t r = NzPostfilterParam2Encode(lz_in, m, p2buf.data(), m + 0x40u,
+                                                             &side, nzr::opt_enc::kCoAuxStreamBytes);
+            const std::uint32_t slack = ((m >> 7u) < 0x800u) ? (m >> 7u) : 0x800u;
+            if (r != 0u && static_cast<std::uint64_t>(side.size()) + r < m - slack) {
+                p2side = side;
+                p2_on = true;
+                lz_in = p2buf.data();
+                m = r;
+            }
+        }
+
+        // NZOPT_DUMP_LZIN=<path>: the exact bytes the LZ/BWT stage is handed for
+        // each block, appended with a one-line header -- for diffing an encoder
+        // block against the same block decoded out of the original's archive.
+        if (const char* dl = NZ_ENV("NZOPT_DUMP_LZIN")) {
+            static int blkno = 0;
+            char path[512];
+            std::snprintf(path, sizeof path, "%s.%d", dl, blkno++);
+            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(lz_in, 1, m, f); std::fclose(f); }
+        }
+        if (NZ_ENV("NZOPT_TRACE_STAGES"))
+            std::fprintf(stderr, "[STG] n=%u -> m=%u exe=%d tt=%d p1=%d p2=%d\n",
+                         n, m, (int)exe_on, (int)tt_on, (int)p1_on, (int)p2_on, 0, 0);
+        std::vector<std::uint8_t> payload;
+        // A dece block never reaches FUN_0808d7f0 in the reference: the
+        // LZ-or-BWT flag it would set is left true, so the block goes LZ.
+        const bool lz_kind = exe_on ? true : OptimumBlockIsLz(lz_in, m);
+        if (lz_kind) {
+            std::vector<typename OptimumDecisionOf<Engine>::type> our_dec;
+            const char* const edp = NZ_ENV("NZOPT_DUMP_DEC");
+            if (!co.EncodeBlockParsed(lz_in, m, payload, edp ? &our_dec : nullptr)) return false;
+            if (edp != nullptr) {
+                static int enc_blk = 0;
+                if (FILE* df = fopen(edp, "a")) {
+                    fprintf(df, "# block %d out_size=%u payload=%zu ndec=%zu\n",
+                            enc_blk, m, payload.size(), our_dec.size());
+                    for (const auto& d : our_dec) {
+                        if (d.is_literal) fprintf(df, "L %u\n", (unsigned)d.byte);
+                        else fprintf(df, "M %u %u %u\n", (unsigned)d.sg, d.len, d.dist);
+                    }
+                    fclose(df);
+                }
+                ++enc_blk;
+            }
+            // A block the engine cannot shrink goes out STORED. FUN_0808da10 calls
+            // the engine's encode (vtable +0x24) and, when it gives back nothing,
+            // vtable +0x1c (FUN_08073be0): a cold start of the model and nothing
+            // else -- the finder, the long-range index and the reset flag stay as
+            // the attempt left them -- the same cold start the decoder makes after
+            // a stored LZ block, while the window keeps the bytes. So: the block raw, decr_param 1, param6 0 and NO size18, and
+            // one stage check fewer, since the payload IS the LZ input. The encode
+            // above has already run the block through this engine's window, in the
+            // same 32 KB chunks the decoder's store (StoreBlock) uses; the
+            // verifier never saw it, so it gets the decoder's stored branch.
+            if (payload.empty() || payload.size() >= m) {
+                co.ResetModel();
+                if (verifier != nullptr) { verifier->StoreBlock(lz_in, m); verifier->ResetModel(); }
+                put32(m);
+                seg.insert(seg.end(), lz_in, lz_in + m);
+                seg.push_back(1u);                       // decr_param: LZ
+                seg.push_back(0u);                       // param6: stored, no size18
+                seg.push_back(static_cast<unsigned char>(1u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                         (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+                if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+                if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+                if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+                if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+                seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+                goto block_tail;
+            }
+            if (verifier != nullptr) {
+                // prove the block reads back before committing it
+                std::vector<std::uint8_t> chk(m);
+                if (!verifier->DecodeBlock(payload.data(), static_cast<std::uint32_t>(payload.size()),
+                                          chk.data(), m) ||
+                    std::memcmp(chk.data(), lz_in, m) != 0) {
+                    if (NZ_ENV("NZOPT_TRACE_TDO"))
+                        std::fprintf(stderr, "[TDOENC] decline: LZ block does not read back (m=%u payload=%zu)\n",
+                                     m, payload.size());
+                    return false;
+                }
+            }
+            put32(static_cast<std::uint32_t>(payload.size()));
+            seg.insert(seg.end(), payload.begin(), payload.end());
+            seg.push_back(1u);                       // decr_param: LZ
+            seg.push_back(1u);                       // param6: a compressed layer
+            put32(m);                                // size18: the LZ output, i.e. the transformed block
+            // The staged check bytes, one per stage the decoder passes through and
+            // popped last-first: with a text transform the stages are the payload,
+            // the LZ output and the text, so the text's check goes first.
+            seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+            if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+        } else {
+            // A BWT block: the transformed bytes through the forward BWT and the
+            // bucket coder.
+            //
+            // When no text transform applied, TWO more passes run first, in
+            // this order: param15 (an LZ77 whose matches are absolute offsets
+            // into the whole accumulated stream) and then param14 (an LZ77 over
+            // the block, matches tagged in the byte stream). param14 is
+            // written; param15 is not, so a block the reference would have
+            // taken it on comes out valid but different.
+            std::vector<std::uint8_t> p14buf, p14side, p15buf, p15side;
+            bool p14_on = false, p15_on = false;
+            // The block's own bytes: what the window is fed and what the param15
+            // stage check covers. Captured before either pass swaps lz_in.
+            const std::uint8_t* const blk = lz_in;
+            const std::uint32_t blk_len = m;
+            const std::uint8_t* pre_p14 = lz_in;
+            std::uint32_t pre_p14_len = m;
+            if (!tt_on) {
+                // FUN_0808da10: the rarity stats are built ONCE over the block's
+                // original bytes and serve both passes -- param14 later runs on
+                // param15's output with the same table.
+                std::vector<std::uint16_t> stats;
+                NzBwtParam14Stats(blk, blk_len, &stats);
+                // param15 first (FUN_08083570), skipped while the engine's set-up
+                // flag is up (codec+0x3f738, see WindowResetPending: raised once at
+                // set-up, cleared by the first feed or LZ encode -- so only a BWT
+                // block that opens the stream skips it). The pass reads up to 256
+                // bytes past the block -- the bytes that follow it in the
+                // original's input buffer -- so hand it those where they exist
+                // and zeros where the segment ends.
+                if (!co.WindowResetPending() && co.LongRangeTable() != nullptr) {
+                    std::vector<std::uint8_t> padded(static_cast<std::size_t>(blk_len) + 0x200u, 0u);
+                    std::memcpy(padded.data(), blk, blk_len);
+                    if (blk == src) std::memcpy(padded.data() + blk_len, src + blk_len, 0x200u);
+                    const std::uint32_t r15 = NzBwtParam15Encode(padded.data(), blk_len, stats,
+                                                                 co.LongRangeTable(), co.LongRangeMask(),
+                                                                 co.WindowBase(), co.WindowCapacity(),
+                                                                 co.WindowFill(), co.WindowScrolled(),
+                                                                 &p15buf, &p15side, 0x1000u);
+                    // NZOPT_DUMP_P15ENC=<dir>: the pass's inputs and outputs and the
+                    // engine state it read, in the layout tdo/p15cap captures from
+                    // the original, so the two can be diffed call by call.
+                    if (const char* dd = NZ_ENV("NZOPT_DUMP_P15ENC")) {
+                        static int call_no = 0; ++call_no;
+                        char path[512];
+                        auto wr = [&](const char* what, const void* q, std::size_t nb) {
+                            std::snprintf(path, sizeof path, "%s/%03d.%s", dd, call_no, what);
+                            if (FILE* f = std::fopen(path, "wb")) { std::fwrite(q, 1, nb, f); std::fclose(f); }
+                        };
+                        wr("in", blk, blk_len);
+                        wr("out", p15buf.data(), p15buf.size());
+                        wr("side", p15side.data(), p15side.size());
+                        wr("win", co.WindowBase(), co.WindowCapacity());
+                        wr("tbl", co.LongRangeTable(), (static_cast<std::size_t>(co.LongRangeMask()) + 1u) * 4u);
+                        std::fprintf(stderr, "[P15ENC] call=%d n=%u -> r=%u side=%zu fill=%u scrolled=%d\n",
+                                     call_no, blk_len, r15, p15side.size(), co.WindowFill(), (int)co.WindowScrolled());
+                    }
+                    if (r15 != 0u) { p15_on = true; lz_in = p15buf.data(); m = r15; pre_p14 = lz_in; pre_p14_len = m; }
+                }
+                // vtable+0x0c: the window takes the block's ORIGINAL bytes, after
+                // param15 has looked and before anything else -- both engines.
+                co.FeedWindow(blk, blk_len);
+                if (verifier != nullptr) verifier->FeedWindow(blk, blk_len);
+                // param14 loads a 32-bit word per position (P14Load32) and
+                // compares candidates at `cur - 3`, so it reads up to three bytes
+                // past the last one it counts, and what it finds there CHANGES
+                // WHAT IT WRITES. In the reference that is the block buffer's
+                // own slack -- the tail the split pushed back -- so when the
+                // block is still the buffer's own bytes it is read straight out
+                // of the feeder, whose dst carries that slack. Only when an
+                // earlier pass has replaced them (param15's output) is a padded
+                // copy the right shape, and then the slack is the caller's to
+                // provide, exactly as it is for param1's front padding.
+                std::vector<std::uint8_t> p14in;
+                const std::uint8_t* p14src = lz_in;
+                if (lz_in != src) {
+                    p14in.assign(static_cast<std::size_t>(m) + 0x10u, 0u);
+                    std::memcpy(p14in.data(), lz_in, m);
+                    p14src = p14in.data();
+                }
+                // NZOPT_P14_ARENA=1: lend param14 the parser's match-finder
+                // tree, which in the reference IS its pair of hash tables
+                // (quirk 72). OFF by default: measured 2026-09-15, it costs two
+                // corpus files (292 -> 290) and fixes none, because the tree we
+                // would lend has itself already diverged -- the two passes feed
+                // each other, so a half-right layout is worse than none.
+                static const bool p14_arena = (NZ_ENV("NZOPT_P14_ARENA") != nullptr);
+                const std::uint32_t r = NzBwtParam14Encode(
+                    p14src, m, stats, &p14buf, &p14side, 0x80000u,
+                    p14_arena ? co.ParserArena() : nullptr,
+                    p14_arena ? co.ParserArenaWords() : 0u);
+                if (r != 0u) { p14_on = true; lz_in = p14buf.data(); m = r; }
+            } else {
+                co.FeedWindow(blk, blk_len);
+                if (verifier != nullptr) verifier->FeedWindow(blk, blk_len);
+            }
+            if (NZ_ENV("NZOPT_TRACE_STAGES"))
+                std::fprintf(stderr, "[STG2] m=%u p15=%d p14=%d\n", m, (int)p15_on, (int)p14_on);
+            std::vector<std::uint8_t> bwt(m + 4u);
+            const std::uint32_t primary = NzBwtTransform(lz_in, m, bwt.data());
+            // The reference sorts this block in the codec's block buffer and wraps
+            // it around that buffer on the way: what is left in front of it is
+            // what the next blocks' param1 reads behind their first byte.
+            nzr::opt_enc::CoNoteBwtWrap(feeder.front, lz_in, m);
+            // FUN_0806c350's capacity argument is `block_size * 5 + 0x100487`,
+            // not a constant: the 0x600487 this used to pass is that formula
+            // frozen at a 1 MB block. With a bigger block the bucket coder
+            // refused outright (its own `cap < n * 5 + ...` guard) and the block
+            // went out STORED -- a 1.9 MB .pbm the original codes 18x smaller.
+            const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, block_size * 5u + 0x100487u, payload);
+            if (psz == 0u) {
+                // STORED: the bucket coder could not get under the BWT string's
+                // own size, so the block carries it raw. param6 == 0, and then
+                // there is NO size18 field at all -- the block expands to
+                // exactly its payload size. Its stage list loses one entry with
+                // it, since the payload IS the BWT output.
+                put32(m);
+                seg.insert(seg.end(), bwt.begin(), bwt.begin() + m);
+                seg.push_back(0u);                   // decr_param: BWT
+                seg.push_back(0u);                   // param6: stored
+                seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                         (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u) +
+                                                         (p15_on ? 1u : 0u) + (p14_on ? 1u : 0u)));
+                if (exe_on || tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+                if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+                if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+                if (p15_on) seg.push_back(static_cast<unsigned char>(StageCheck255(blk, blk_len)));
+                if (p14_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p14, pre_p14_len)));
+                seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+                seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
+                // NOTE: param7 exists only when param6 is set. A stored block
+                // goes straight from the staged bytes to bwt_start_pos.
+                put32(primary);                      // bwt_start_pos
+                seg.push_back(static_cast<unsigned char>(p14_on ? 1u : 0u));
+                if (p14_on) {
+                    put32(static_cast<std::uint32_t>(p14side.size()));
+                    seg.insert(seg.end(), p14side.begin(), p14side.end());
+                }
+                seg.push_back(static_cast<unsigned char>(p15_on ? 1u : 0u));
+                if (p15_on) {
+                    put32(static_cast<std::uint32_t>(p15side.size()));
+                    seg.insert(seg.end(), p15side.begin(), p15side.end());
+                }
+                goto block_tail;
+            }
+            {
+                // The bucket coder is the one stage whose output this writer
+                // cannot check against the reference block by block, and it has
+                // a known size-dependent defect (buckets over ~18 KB of rank
+                // data). Verify the payload decodes back to the bytes it was
+                // made from and decline if it does not: a block that cannot be
+                // read must never reach the disk.
+                std::vector<std::uint8_t> chk(m);
+                if (!NzBwtDecodeInput(payload.data(), psz, m, chk.data()) ||
+                    std::memcmp(chk.data(), bwt.data(), m) != 0) {
+                    if (NZ_ENV("NZOPT_TRACE_TDO"))
+                        std::fprintf(stderr, "[TDOENC] decline: BWT payload does not read back (m=%u psz=%u)\n",
+                                     m, psz);
+                    return false;
+                }
+            }
+            put32(psz);
+            seg.insert(seg.end(), payload.begin(), payload.end());
+            seg.push_back(0u);                       // decr_param: BWT
+            seg.push_back(1u);                       // param6: a compressed layer
+            put32(m);                                // size18: the BWT's size, i.e. the transformed block
+            // [raw] + one per applied transform + [payload], the same rule the
+            // LZ branch follows: raw, the text output, param14's output, the
+            // BWT's output, the payload.
+            seg.push_back(static_cast<unsigned char>(3u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u) +
+                                                     (p15_on ? 1u : 0u) + (p14_on ? 1u : 0u)));
+            if (exe_on || tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            if (p15_on) seg.push_back(static_cast<unsigned char>(StageCheck255(blk, blk_len)));
+            if (p14_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p14, pre_p14_len)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(lz_in, m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(bwt.data(), m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+            seg.push_back(OptimumDecisionOf<Engine>::kBwtParam7);   // param7
+            put32(primary);                          // bwt_start_pos
+            seg.push_back(static_cast<unsigned char>(p14_on ? 1u : 0u));
+            if (p14_on) {
+                put32(static_cast<std::uint32_t>(p14side.size()));
+                seg.insert(seg.end(), p14side.begin(), p14side.end());
+            }
+            seg.push_back(static_cast<unsigned char>(p15_on ? 1u : 0u));
+            if (p15_on) {
+                put32(static_cast<std::uint32_t>(p15side.size()));
+                seg.insert(seg.end(), p15side.begin(), p15side.end());
+            }
+        }
+    block_tail:
+        seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));
+        if (p2_on) {
+            put32(static_cast<std::uint32_t>(p2side.size()));
+            seg.insert(seg.end(), p2side.begin(), p2side.end());
+        }
+        seg.push_back(static_cast<unsigned char>(p1_on ? 1u : 0u));
+        if (p1_on) {
+            put32(static_cast<std::uint32_t>(p1side.size()));
+            seg.insert(seg.end(), p1side.begin(), p1side.end());
+        }
+        seg.push_back(0u);                       // param16
+        seg.push_back(static_cast<unsigned char>(tt_on ? 1u : 0u));
+        if (tt_on) {
+            seg.push_back(applied);
+            std::vector<std::uint8_t> side;
+            nzr::opt_enc::CoSideStreamBytes(applied, tt2, tt16, &side);   // LEB128 length + bytes, tt2 then tt16
+            seg.insert(seg.end(), side.begin(), side.end());
+        }
+        seg.push_back(static_cast<unsigned char>(exe_on ? 1u : 0u));
+        if (exe_on) {
+            put32(static_cast<std::uint32_t>(exe_side.size()));
+            seg.insert(seg.end(), exe_side.begin(), exe_side.end());
+        }
+        flush_block();
+    }
+    out.insert(out.end(), emitted.begin(), emitted.end());
+    return true;
+}
+
+// The `-cc` block writer. The framing, the detector, the text pipeline, dece and
+// param1/param2 are the ones the optimum family already writes -- what differs is
+// the middle: there is no LZ-or-BWT decision and no BWT at all, the block's bytes
+// go straight through the CM, and a block the CM cannot shrink is STORED
+// (param6 == 0, no size18 field) rather than declined. Coding a block and then
+// storing it anyway leaves the model exactly where a decoder's byte feed would:
+// CM_Input_Bit is the same update in both directions.
+static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
+                            nzr::opt_enc::CoBlockFeeder& feeder, std::uint32_t block_size,
+                            const unsigned char* data, std::uint32_t len, unsigned stream,
+                            std::vector<unsigned char>& out, bool final,
+                            CoAudioState* audio = nullptr) {
+    std::vector<unsigned char> seg;
+    std::vector<unsigned char> emitted;
+    const auto put32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) seg.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xffu));
+    };
+    const auto flush_block = [&]() {
+        std::vector<unsigned char> hdr;
+        WriteLegacyRecordHeader(&hdr, 0u, stream, seg.size());
+        emitted.insert(emitted.end(), hdr.begin(), hdr.end());
+        emitted.insert(emitted.end(), seg.begin(), seg.end());
+        seg.clear();
+    };
+    if (audio != nullptr && !feeder.span_probe) {
+        feeder.span_probe = [](const std::uint8_t* p, std::uint32_t n) -> std::uint32_t {
+            nzr::audio::NzAudioChunkParams probe;
+            nzr::audio::NzAudioEncoder::SpanOf(p, n, &probe);
+            return probe.span_len;
+        };
+    }
+    feeder.Feed(reinterpret_cast<const std::uint8_t*>(data), len);
+    while (feeder.Next(block_size, final)) {
+        const std::uint8_t* src = feeder.Data();
+        const std::uint32_t n = feeder.Len();
+        // The stream offset of THIS block: the span the audio probe opens is
+        // measured in stream coordinates, so it has to advance on every block,
+        // audio or not.
+        const std::uint64_t bpos = (audio != nullptr) ? audio->pos : 0u;
+        if (audio != nullptr) audio->pos += n;
+
+        std::vector<std::uint8_t> exe_buf, exe_side;
+        bool exe_on = false;
+        const std::uint8_t* exe_out = src;
+        std::uint32_t exe_len = n;
+        if (nzr::lzpf_enc::ExeMetric(src, n) / ((n >> 12u) + 1u) != 0u) {
+            const std::uint32_t r = exe_enc.Encode(src, n, &exe_buf, &exe_side);
+            if (r != 0u) { exe_on = true; exe_out = exe_buf.data(); exe_len = r; exe_enc.Advance(n); }
+            else exe_enc.Reset();
+        } else {
+            exe_enc.Reset();
+        }
+
+        std::vector<std::uint8_t> tbuf, tmp, tt2, tt16;
+        std::uint8_t applied = 0;
+        bool tt_on = false;
+        const std::uint8_t* cm_in = exe_out;
+        std::uint32_t m = exe_len;
+        if (!exe_on) {
+            bool route = false;
+            // `cm` true and the dictionary's ASCII reorder OFF: the two flags the
+            // text machinery already carries for this codec.
+            std::uint32_t mask;
+            {   // the detector's scratch: only when the exe filter did not take the block, and only for the detection
+                std::vector<std::uint8_t> scratch(n + 0x2000u, 0);
+                mask = nzr::opt_enc::CoTextFlags(src, n, scratch.data(), true, &route);
+            }
+            if (mask != 0u && nzr::opt_enc::CoTrialGate(src, n, mask, false, true)) {
+                tbuf.assign(src, src + n);
+                tbuf.resize(n + 0x2000u, 0);
+                // see the same note in OptimumEncodeSegment: the estimate reads
+                // past the block and the original's buffer has the next bytes
+                std::memcpy(tbuf.data() + n, src + n, 0x2000u);
+                tmp.assign(n + 0x2000u, 0);
+                std::uint8_t* pa = tbuf.data();
+                std::uint8_t* pb = tmp.data();
+                const std::uint32_t r = nzr::opt_enc::CoTextPipeline(mask, pa, n, pb, block_size + 0x40u,
+                                                                     &applied, &tt2, &tt16, false, true);
+                if (r != 0u) { tt_on = true; cm_in = pa; m = r; }
+            }
+        }
+
+        // As in the optimum writer: only when neither the exe filter nor a
+        // text transform claimed the block.
+        if (!exe_on && !tt_on) {
+            // The audio block, exactly as the optimum writers try it (-cc shares the
+            // reference's driver; only the fallback below differs).
+            if (audio != nullptr && NZ_ENV("NZOPT_NO_IMAGE") == nullptr) {
+                if (!audio->img_ready) {
+                    audio->img.Configure(0x0fu, 32u, 48u, false);
+                    audio->img_ready = true;
+                }
+                std::vector<std::uint8_t> ipay;
+                const bool img_taken =
+                    nzr::lzpf_enc::ImageEncodeBlock(audio->img, src, n, ipay) != 0u && !ipay.empty();
+                // LAB_0808dcfc: a block the image path does not take resets the image
+                // model (FUN_080b6170) before the audio branch runs.
+                if (!img_taken) audio->img.Reset();
+                if (img_taken) {
+                    put32(static_cast<std::uint32_t>(ipay.size()));
+                    seg.insert(seg.end(), ipay.begin(), ipay.end());
+                    seg.push_back(3u);          // decr_param: image
+                    put32(n);                   // the block's output size
+                    flush_block();
+                    continue;
+                }
+            }
+            if (audio != nullptr && NZ_ENV("NZOPT_NO_AUDIO") == nullptr) {
+                if (!audio->ready) {
+                    // -cc's own audio configuration, the one its decode path sets:
+                    // context 0x0f, plane orders 384/16/8, stereo parameter 16.
+                    audio->enc.SetContextFlags(0x0fu);
+                    audio->enc.SetPlaneOrders(384u, 16u, 8u);
+                    audio->enc.SetStereoParam(16u);
+                    audio->enc.Reset();
+                    audio->ready = true;
+                }
+                nzr::audio::NzAudioChunkParams ap;
+                audio->enc.ChooseFormat(src, n, &ap);
+                if (ap.hdr_found && ap.hdr_end != 0u) audio->end = bpos + ap.hdr_end;
+                const bool span = bpos < audio->end;
+                bool take = span || ap.is_audio;
+                // The driver resets the model whenever no span is in progress
+                // (LAB_0808f1a5: `local_6b = 1; FUN_080b1950(obj + 0x4c0)`), and that
+                // same flag is the mode2_type byte -- so a block written with
+                // mode2_type 1 is DECODED from a fresh model and must be ENCODED from
+                // one too. Without the reset, a block that follows rejected audio
+                // attempts carries their state into a payload the decoder reads with
+                // none: a .ppm whose third block went down this path decoded to
+                // garbage in the original's binary as well as in ours.
+                const bool fresh = !(span || ap.hdr_found);
+                if (take) {
+                    if (fresh) audio->enc.Reset();
+                    std::vector<std::uint8_t> apay;
+                    if (audio->enc.Encode(src, n, ap, &apay) && !apay.empty()) {
+                        std::uint64_t est = n;
+                        if (!span) {
+                            const std::uint32_t n0 = (n < 0x10000u) ? n : 0x10000u;
+                            const std::uint32_t e0 = nzr::opt_enc::CoEntropyEstimate(src, n0);
+                            est = static_cast<std::uint64_t>(
+                                (static_cast<long double>(n) / static_cast<long double>(n0)) *
+                                static_cast<long double>(e0) + 0.5L);
+                            if (static_cast<std::uint64_t>(apay.size()) < est && n > n0)
+                                est = static_cast<std::uint64_t>(e0) +
+                                      nzr::opt_enc::CoEntropyEstimate(src + n0, n - n0);
+                        }
+                        if (static_cast<std::uint64_t>(apay.size()) * 0x11ull < est * 0x10ull) {
+                            const std::uint8_t mode2 = fresh ? 1u : 0u;
+                            put32(static_cast<std::uint32_t>(apay.size()));
+                            seg.insert(seg.end(), apay.begin(), apay.end());
+                            seg.push_back(2u);
+                            seg.push_back(mode2);
+                            put32(n);
+                            flush_block();
+                            continue;
+                        }
+                    }
+                }
+            }
+            // LAB_0808dcc7, as in the optimum writer: a block not written as audio
+            // resets the model.
+            if (audio != nullptr) audio->enc.Reset();
+
+        } else if (audio != nullptr) {
+            audio->img.Reset();
+            audio->enc.Reset();
+        }
+
+        std::vector<std::uint8_t> p1buf, p1side;
+        bool p1_on = false;
+        const std::uint8_t* pre_p1 = cm_in;
+        const std::uint32_t pre_p1_len = m;
+        if (!tt_on) {
+            if (nzr::opt_enc::NzOptimumParam1Encode(cm_in, m, &p1buf, &p1side)) {
+                p1_on = true;
+                cm_in = p1buf.data();
+            }
+        }
+
+        std::vector<std::uint8_t> p2buf, p2side;
+        bool p2_on = false;
+        const std::uint8_t* pre_p2 = cm_in;
+        const std::uint32_t pre_p2_len = m;
+        if (!tt_on) {
+            p2buf.assign(m + 0x40u, 0);
+            std::vector<std::uint8_t> side;
+            const std::uint32_t r = NzPostfilterParam2Encode(cm_in, m, p2buf.data(), m + 0x40u,
+                                                             &side, nzr::opt_enc::kCoAuxStreamBytes);
+            const std::uint32_t slack = ((m >> 7u) < 0x800u) ? (m >> 7u) : 0x800u;
+            if (r != 0u && static_cast<std::uint64_t>(side.size()) + r < m - slack) {
+                p2side = side; p2_on = true; cm_in = p2buf.data(); m = r;
+            }
+        }
+
+        std::vector<std::uint8_t> payload;
+        NzCmEncode(cm, cm_in, m, &payload);
+        const bool stored = (payload.size() >= m);
+        if (stored) {
+            // The model has already seen every byte through the coding pass, which
+            // is the same update the decoder's NzCmFeedByte performs over a stored
+            // payload -- nothing to undo.
+            put32(m);
+            seg.insert(seg.end(), cm_in, cm_in + m);
+            seg.push_back(0u);                       // decr_param: do not reset the model
+            seg.push_back(0u);                       // param6: stored, and NO size18 after it
+            seg.push_back(static_cast<unsigned char>(1u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+            if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(cm_in, m)));
+        } else {
+            put32(static_cast<std::uint32_t>(payload.size()));
+            seg.insert(seg.end(), payload.begin(), payload.end());
+            seg.push_back(0u);                       // decr_param
+            seg.push_back(1u);                       // param6: a compressed layer
+            put32(m);                                // size18: the CM's input size
+            seg.push_back(static_cast<unsigned char>(2u + (exe_on ? 1u : 0u) + (tt_on ? 1u : 0u) +
+                                                     (p1_on ? 1u : 0u) + (p2_on ? 1u : 0u)));
+            if (exe_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (tt_on) seg.push_back(static_cast<unsigned char>(StageCheck255(src, n)));
+            if (p1_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p1, pre_p1_len)));
+            if (p2_on) seg.push_back(static_cast<unsigned char>(StageCheck255(pre_p2, pre_p2_len)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(cm_in, m)));
+            seg.push_back(static_cast<unsigned char>(StageCheck255(payload.data(), payload.size())));
+        }
+        seg.push_back(static_cast<unsigned char>(p2_on ? 1u : 0u));
+        if (p2_on) {
+            put32(static_cast<std::uint32_t>(p2side.size()));
+            seg.insert(seg.end(), p2side.begin(), p2side.end());
+        }
+        seg.push_back(static_cast<unsigned char>(p1_on ? 1u : 0u));
+        if (p1_on) {
+            put32(static_cast<std::uint32_t>(p1side.size()));
+            seg.insert(seg.end(), p1side.begin(), p1side.end());
+        }
+        seg.push_back(0u);                       // param16
+        seg.push_back(static_cast<unsigned char>(tt_on ? 1u : 0u));
+        if (tt_on) {
+            seg.push_back(applied);
+            std::vector<std::uint8_t> side;
+            nzr::opt_enc::CoSideStreamBytes(applied, tt2, tt16, &side);
+            seg.insert(seg.end(), side.begin(), side.end());
+        }
+        seg.push_back(static_cast<unsigned char>(exe_on ? 1u : 0u));
+        if (exe_on) {
+            put32(static_cast<std::uint32_t>(exe_side.size()));
+            seg.insert(seg.end(), exe_side.begin(), exe_side.end());
+        }
+        flush_block();
+    }
+    out.insert(out.end(), emitted.begin(), emitted.end());
+    return true;
+}
+
+struct EncodeCodec {
+    unsigned p0 = 0;
+    std::uint32_t co_window = 0;
+    std::unique_ptr<nzr::lzpf_enc::State> lz;
+    std::unique_ptr<nzr::lzhd_enc::State> cd;
+    std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;    // the -co engine carries its own encode side
+    std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO;  // ... and so does -cO's
+    NzCmDecoder* cc = nullptr;                               // -cc's CM, freed by the caller
+    // A second engine in the decoder's role, fed exactly what the real decoder
+    // will be fed, so every block written is proved readable before it is
+    // committed -- and the dece filter's run state. BOTH belong to the STREAM,
+    // not to one call: the driver hands the codec one piece of at most 1 MB at a
+    // time (and stops early at a file boundary), so a multi-file archive gets
+    // several calls. Building them per call left the verifier cold from the
+    // second piece on, and `a -co f1 f2 f3` declined its own output.
+    std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co_v;
+    std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO_v;
+    NzExeFilterEnc exe_enc;
+    int cm_a_bits = 22, cm_b_bits = 18;
+    std::uint32_t co_block = 0x100000u;
+    // FUN_0808d0b0's 1 MB staging buffer and the block it assembles: STREAM
+    // state, like the verifier above -- the block boundaries depend on what the
+    // whole stream has fed it, not on where the reader's pieces fall.
+    nzr::opt_enc::CoBlockFeeder feeder;
+    // The audio block writer (decr_param 2) and the span state the reference's
+    // driver keeps in its probe: how much of the stream has gone by and where
+    // the recognised header says the audio ends. A span in progress is what
+    // decides mode2_type and whether the model is reset before coding.
+    CoAudioState audio;
+    // What this stream actually read, piece by piece (stored name, offset in the
+    // file, length, CRC-64), for the whole-archive self-check after `a`.
+    std::vector<nzr::selfcheck::Item> expected;
+    // Once the stream is compressed nothing here is needed but `expected` (and the
+    // labels): the windows, tables, verifiers and the feeder's 1 MB ring go back.
+    void ReleaseEngines() {
+        lz.reset(); cd.reset(); co.reset(); co_v.reset(); cO.reset(); cO_v.reset();
+        if (cc != nullptr) { NzCmDestroy(cc); cc = nullptr; }
+        feeder = nzr::opt_enc::CoBlockFeeder{};
+    }
+    const char* Label() const {
+        return p0 == 0u ? "none" : p0 == 1u ? "nz_lzpf" : p0 == 2u ? "nz_lzpf_large"
+             : p0 == 3u ? "nz_lzhd" : p0 == 4u ? "nz_lzhds" : p0 == 5u ? "nz_optimum1"
+             : p0 == 6u ? "nz_optimum2" : "nz_cm";
+    }
+    // FUN_0805a110: the working set the Compressor line reports -- the window, the
+    // hash tables (0x208000 for -cf, 64 MB for -cF), the two 1 MB buffers and the
+    // 2 MB analysis object; the store has just its window.
+    std::uint64_t MemoryBytes(std::uint64_t window, unsigned threads = 1u) const {
+        if (p0 == 0u) return window;
+        // FUN_0808d4d0, the optimum encoder's memory method: the window object
+        // FUN_080c0070 (the same term the DECODE figure starts from, with the
+        // block as its primary buffer) + the image object 0x210000 + 0x80000 +
+        // the LZ engine's own method (vtable slot 2: 0x0806f4a0 compact,
+        // 0x08083130 large) + 0x3f740 + 0x8b640 (-co) or 0x110e2c0 (-cO) + the
+        // BWT object FUN_0808c400 = 0x201000. The LZ engine's method is its ring
+        // (0 -- it borrows the window) + 0x100008 + 4 * (H + T): T the
+        // FUN_08082e50 table, 2^16 - 1 below a 512 KB window and 2^(bits-4) - 1
+        // from there (bits = bsr(W - 1) + 1), H the FUN_08059b20 hash, 2^19 - 1
+        // below a 16 MB window and 2^(bsr(W/32 - 1) + 1) - 1 from there. Every term
+        // read with GDB at those addresses (W = 64 KB, 320 KB, 3 MB, 30 MB, both
+        // engines). Against the decode figure that comes to exactly LZ + 0x200080
+        // for both codecs. It used to be a flat 18/34 MB, right only for a budget
+        // of 16 MB or less (the original prints 37/53 MB at -m64m on 4 MB).
+        if (p0 == 5u || p0 == 6u) {
+            (void)threads;
+            LegacyCnContext ctx;
+            ctx.legacy_method = 0x3bu;
+            ctx.legacy_method_p0 = p0;
+            ctx.legacy_method_p2 = static_cast<std::uint8_t>(LegacyByteFloatEncode(co_block) - 1u);
+            const std::uint64_t W = window;
+            const auto bsr = [](std::uint64_t v) -> unsigned { unsigned e = 0; while (v >>= 1) ++e; return e; };
+            const unsigned bits = bsr(std::max<std::uint64_t>(W - 1u, 0x3ffu)) + 1u;
+            const unsigned tb = bits < 20u ? 16u : bits - 4u;
+            const std::uint64_t T = (1ull << tb) - 1u;
+            const std::uint64_t hx = std::max<std::uint64_t>(W >> 5u, 0x80000u) - 0x80000u + 0x7ffffu;
+            const std::uint64_t H = (1ull << (bsr(hx) + 1u)) - 1u;
+            const std::uint64_t lz = 0x100008ull + 4ull * (H + T);
+            return LegacyCmFamilyWorkingSet(ctx, W) + lz + 0x200080ull;
+        }
+        if (p0 == 7u) {
+            // -cc reports the DECODE working set of the object it just sized --
+            // the same FUN_080aafb0 the console prints when reading such an
+            // archive -- plus a flat 2.5 MB the compressor carries on top.
+            // Measured on 13 (input, budget) pairs spanning windows of 1..168 MB
+            // and both table widths: the difference is constant to within the
+            // rounding, and 0x280000 is the only round value the whole set allows.
+            LegacyCnContext ctx;
+            ctx.legacy_method = 0x4bu;
+            ctx.legacy_method_p0 = 7u;
+            ctx.cm_a_bits = cm_a_bits;
+            ctx.cm_b_bits = cm_b_bits;
+            (void)threads;
+            return LegacyCmFamilyWorkingSet(ctx, window) + 0x280000ull;
+        }
+        if (p0 == 4u) return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + nzr::lzhd_enc::HdsMemoryBytes(static_cast<std::uint32_t>(window), threads);   // FUN_0805ed20 + FUN_0805d3d0
+        if (p0 >= 3u) {
+            // FUN_0805ed20: the image object (0x210000) + the text object + the LZ
+            // object (FUN_0805d590: window, the finder table, one 0xe0080 token
+            // buffer per thread -- FUN_0805ed90 allocates DAT_08183620 + 1 of them,
+            // the thread count being kept zero-based -- and 0x30000 per finder)
+            const std::uint64_t finder = nzr::lzhd_enc::FinderTableBytes(static_cast<std::uint32_t>(window));
+            return 0x210000ull + nzr::lzhd_enc::kTextObjectBytes + window + finder + 0xe0080ull * threads + 0x30000ull;
+        }
+        return window + (p0 == 2u ? 0x4000000ull : 0x208000ull) + 0x200000ull + 0x210000ull;
+    }
+};
+
+void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window, const EncodeCodec& codec,
+                            bool archive_line_printed = false) {
+    const unsigned host = HostThreadCount();
+    unsigned threads = host;
+    if (options.threads > 0u && options.threads < host) threads = options.threads;
+    const auto mb = [](std::uint64_t b) { return ((b >> 19u) + 1u) >> 1u; };
+    // The automatic read-ahead is keyed on the CODEC and on nothing else: the
+    // same figure across -m4m..-m4g, across input sizes, and for every parallel
+    // variant. The write-behind is always 1 MB. Measured on all eight
+    // selectors; getting this from one codec and assuming the rest is exactly
+    // what a first pass here did, and the encode oracle caught it.
+    //   -cn -cf -cF -cd -cD (and -cdp/-cdP/-cDp/-cDP)   20 MB
+    //   -co -cO                                          4 MB
+    //   -cc                                              1 MB
+    const auto auto_read_mb = [](Compressor c) -> std::uint64_t {
+        switch (c) {
+            case Compressor::kOptimum1: case Compressor::kOptimum2: return 4ull;
+            case Compressor::kCm: return 1ull;
+            default: return 20ull;
+        }
+    };
+    // The write-behind is 4 MB only for the 20 MB family AND only when the
+    // command actually writes: `s` produces no file and reports 1 MB for the
+    // same codec. Everything else is 1 MB. (`-br` moves the read figure alone --
+    // `-br40m` gives 40+4 for -cn and 40+1 for -co, so the two are independent.)
+    const auto auto_write_mb = [&](Compressor c) -> std::uint64_t {
+        const bool writes = (options.command != Command::kSimulate);
+        return (writes && auto_read_mb(c) == 20ull) ? 4ull : 1ull;
+    };
+    // -br/-bw override them, and an explicit `-br0` means NO read buffer, which
+    // changes the line's shape rather than its numbers (measured:
+    // `IO-write-buffer: 1 MB`).
+    const std::uint64_t rbuf = options.read_buffer_set ? options.read_buffer_bytes
+                                                       : (auto_read_mb(options.compressor) << 20u);
+    const std::uint64_t wbuf = options.write_buffer_set ? options.write_buffer_bytes
+                                                        : (auto_write_mb(options.compressor) << 20u);
+    if (workers > threads) os << "Warning: number of compressors set is higher than the number of threads!\n";
+    if (!archive_line_printed) os << "Archive: " << options.archive_path << '\n';
+    os << "Threads: " << threads << ", memory: " << mb(options.memory_bytes) << " MB";   // the -m budget, half-up MB (-m256k prints 0)
+    if (threads > 1u) {
+        if (rbuf && wbuf)   os << ", IO-buffers: " << mb(rbuf) << '+' << mb(wbuf) << " MB";
+        else if (rbuf)      os << ", IO-read-buffer: " << mb(rbuf) << " MB";
+        else if (wbuf)      os << ", IO-write-buffer: " << mb(wbuf) << " MB";
+    }
+    // A budget above the free memory the banner shows ends the line with a
+    // warning, in `a` and `s` alike (measured: -m8937m with 8877 MB free warns,
+    // -m8817m does not; `Threads: 16, memory: 61440 MB, IO-buffers: 20+4 MB -
+    // Warning: only 8570 MB free!`).
+    {
+        const std::uint64_t free_mb = HostFreeMemoryMB();
+        if (free_mb != 0u && mb(options.memory_bytes) > free_mb)
+            os << " - Warning: only " << free_mb << " MB free!";
+    }
+    os << '\n';
+    if (options.verbose) os << "Setting up IO write buffer: " << (threads > 1u ? mb(wbuf) : 0u) << " MB\n";
+    for (unsigned k = 0; k < workers; ++k) {
+        ClearStatusLine(os);
+        os << "Compressor #" << k << ": " << codec.Label() << " [" << mb(codec.MemoryBytes(window, threads)) << " MB]";
+        if (options.verbose && threads > 1u) os << " IO-buffer: " << mb(rbuf / workers) << " MB.";
+        os << '\n';
+    }
+}
+
+// "Compressed X into Y in T, R[ (bpb)]" then "IO-in: T, R.[ IO-out: T, R]" --
+// times in whole milliseconds (1 byte in under a millisecond prints "1000 B/s"),
+// the IO-in figure from the time spent reading, IO-out only when writing took a
+// measurable millisecond.
+void PrintStoreEncodeFooter(std::ostream& os, std::uint64_t in_bytes, std::uint64_t out_bytes,
+                            std::uint64_t total_ms, std::uint64_t read_ms, std::uint64_t write_ms, bool verbose) {
+    const auto rate = [](std::uint64_t bytes, std::uint64_t ms) {
+        return FormatRate(static_cast<double>(bytes) * 1000.0 / static_cast<double>(ms ? ms : 1u));
+    };
+    char buf[256];
+    ClearStatusLine(os);
+    std::snprintf(buf, sizeof(buf), "Compressed %s into %s in %s, %s",
+                  FormatGrouped(in_bytes).c_str(), FormatGrouped(out_bytes).c_str(),
+                  FormatElapsedMs(total_ms).c_str(), rate(in_bytes, total_ms).c_str());
+    os << buf;
+    if (verbose) {
+        std::snprintf(buf, sizeof(buf), " (%.3f bpb)", static_cast<double>(out_bytes) * 8.0 / static_cast<double>(in_bytes + 1u));
+        os << buf;
+    }
+    os << '\n';
+    std::snprintf(buf, sizeof(buf), "IO-in: %s, %s.", FormatElapsedMs(read_ms).c_str(), rate(in_bytes, read_ms).c_str());
+    os << buf;
+    if (write_ms > 0u) {
+        std::snprintf(buf, sizeof(buf), " IO-out: %s, %s", FormatElapsedMs(write_ms).c_str(), rate(out_bytes, write_ms).c_str());
+        os << buf;
+    }
+    os << '\n';
+}
+
+// A worker stream's header: the checksum-kind record, then the codec record.
+// Its length depends on the codec: two bytes (p0, the window's byte-float) for
+// store/lzpf/lzhd, a third for the optimum family (the block size's byte-float)
+// and a fourth for -cc (its two hash widths). The last worker's header is
+// written ahead of every other stream in a parallel container, and writing it
+// with the two-byte form made every `-co`/`-cO`/`-cc` parallel archive
+// unreadable -- including the default `a` of a large file, which the thread
+// count alone turns into one.
+static void LegacyWriteStreamHeader(std::vector<unsigned char>& out, unsigned stream, std::uint64_t window,
+                                    ChecksumMode ckmode, const EncodeCodec& codec) {
+    std::vector<unsigned char> hdr;
+    if (ckmode != ChecksumMode::kNone) {
+        const unsigned kind_type = (ckmode == ChecksumMode::kCrc16) ? 6u : (ckmode == ChecksumMode::kCrc32) ? 7u : 5u;
+        WriteLegacyRecordHeader(&hdr, kind_type, stream, 0u);
+    }
+    const std::uint32_t p1 = static_cast<std::uint32_t>(LegacyByteFloatEncode(window) - 1u);   // every codec: the same byte-float of the window
+    if (codec.p0 == 7u) {
+        // -cc adds a FOURTH byte: the two hash-table widths, packed as
+        // (a - 20) << 4 | (b - 18).
+        const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
+        const unsigned char cd = static_cast<unsigned char>(((codec.cm_a_bits - 20) << 4) |
+                                                            (codec.cm_b_bits - 18));
+        const unsigned char rec[4] = {7u, static_cast<unsigned char>(p1),
+                                      static_cast<unsigned char>(p2), cd};
+        // NZ_SELFCHECK_FAULT=hdr: the -cc form of quirk 77's short header, two bytes short.
+        const char* const fault = NZ_ENV("NZ_SELFCHECK_FAULT");
+        const bool short_hdr = stream != 0u && fault != nullptr && std::strcmp(fault, "hdr") == 0;
+        WriteLegacyRecordHeader(&hdr, 11u, stream, short_hdr ? 2u : 4u); hdr.insert(hdr.end(), rec, rec + (short_hdr ? 2 : 4));
+    } else if (codec.p0 >= 5u) {
+        // the optimum family adds the block-size byte-float as a third byte
+        const std::uint32_t p2 = static_cast<std::uint32_t>(LegacyByteFloatEncode(codec.co_block) - 1u);
+        const unsigned char rec[3] = {static_cast<unsigned char>(codec.p0),
+                                      static_cast<unsigned char>(p1),
+                                      static_cast<unsigned char>(p2)};
+        // NZ_SELFCHECK_FAULT=hdr (tests only): a worker header one byte short, the
+        // defect v0.15.0-pre to v0.17.0-pre wrote (quirk 77), for the self-check
+        // test to prove it is caught.
+        const char* const fault = NZ_ENV("NZ_SELFCHECK_FAULT");
+        const bool short_hdr = stream != 0u && fault != nullptr && std::strcmp(fault, "hdr") == 0;
+        WriteLegacyRecordHeader(&hdr, 11u, stream, short_hdr ? 2u : 3u); hdr.insert(hdr.end(), rec, rec + (short_hdr ? 2 : 3));
+    } else {
+        const unsigned char codec_rec[2] = {static_cast<unsigned char>(codec.p0), static_cast<unsigned char>(p1)};
+        WriteLegacyRecordHeader(&hdr, 11u, stream, 2u); hdr.insert(hdr.end(), codec_rec, codec_rec + 2);
+    }
+    out.insert(out.end(), hdr.begin(), hdr.end());
+}
+
+bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, const std::vector<EncodeSource>& src,
+                            const std::vector<std::uint64_t>& start, std::uint64_t begin, std::uint64_t end,
+                            std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
+                            bool with_header, bool last_stream, std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms, EncodeCodec& codec,
+                            std::ostream* live_os = nullptr,
+                            const std::function<void(const unsigned char*, std::size_t)>* drain = nullptr) {
+    // `drain` (the serial writer): after each block what `out` holds goes to it and
+    // `out` is emptied, so the stream is never held whole (264 MiB for `a -cn` of
+    // 128 MB, the original 129); a stored block goes to it straight from `block`.
+    // Nothing here writes back into bytes already in `out`, so this changes no byte.
+    // `os` takes the permanent lines ("Cannot open:", "Error: cannot read"); the
+    // status redraws go to `live` -- the same stream on one thread, the console
+    // itself while `os` is a worker's buffer, replayed in the serial order later.
+    std::ostream& live = (live_os != nullptr) ? *live_os : os;
+    if (with_header) LegacyWriteStreamHeader(out, stream, window, ckmode, codec);
+    if ((codec.p0 == 1u || codec.p0 == 2u) && !codec.lz) { codec.lz = std::make_unique<nzr::lzpf_enc::State>(); codec.lz->Init(codec.p0 == 2u, static_cast<std::size_t>(window)); }
+    if ((codec.p0 == 3u || codec.p0 == 4u) && !codec.cd) { codec.cd = std::make_unique<nzr::lzhd_enc::State>(); codec.cd->Init(static_cast<std::uint32_t>(window), codec.p0 == 4u); }
+    if (codec.p0 == 5u && !codec.co) {
+        codec.co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+        // BEFORE EnableParser, which is what builds the finder: its tree is
+        // sized from this and the size is fixed once.
+        codec.co->SetBlockSize(codec.co_block);
+        // The finder has to exist before the first FeedWindow, or a leading BWT
+        // block's bytes reach the window without reaching the hash.
+        codec.co->EnableParser();
+        if (BlockReadBackWanted(options)) {
+            codec.co_v = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(static_cast<std::uint32_t>(window));
+            codec.co_v->SetBlockSize(codec.co_block);
+        }
+        codec.co_window = static_cast<std::uint32_t>(window);
+    }
+    if (codec.p0 == 7u && !codec.cc) {
+        NzCmInitAll();
+        codec.cc = NzCmCreate(codec.cm_a_bits, codec.cm_b_bits, static_cast<std::uint32_t>(window));
+        if (codec.cc) NzCmReset(codec.cc);
+    }
+    if (codec.p0 == 6u && !codec.cO) {
+        codec.cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
+        codec.cO->SetBlockSize(codec.co_block);
+        codec.cO->EnableParser();
+        if (BlockReadBackWanted(options)) {
+            codec.cO_v = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(static_cast<std::uint32_t>(window));
+            codec.cO_v->SetBlockSize(codec.co_block);
+        }
+        codec.co_window = static_cast<std::uint32_t>(window);
+    }
+    // The pieces of this range, in the order the reader meets them, then the
+    // original's list order: slices prepended, whole files appended. Ghosts (-x
+    // matches, unreadable files) take their bytes in the split but store none.
+    std::vector<LegacyStreamPiece> met;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        const std::uint64_t fb = start[i], fe = start[i] + src[i].size;
+        // A 0-byte file at the very end of the stream (offset == total) is still
+        // this stream's: the reader passes it when it runs out of bytes.
+        if (src[i].size == 0u) { if (fb >= begin && (fb < end || (last_stream && fb == end))) met.push_back({i, 0u, 0u, false}); continue; }
+        if (fe <= begin || fb >= end) continue;
+        const std::uint64_t pb = std::max(fb, begin), pe = std::min(fe, end);
+        if (pe <= pb) continue;
+        met.push_back({i, pb - fb, src[i].ghost ? 0u : pe - pb, (pb != fb) || (pe != fe), pe - pb});
+    }
+    // The worker's list IS its reading order: the stream's bytes come out in
+    // list order too (measured: -p3 -t1 over 7/5/8 MB files, worker 1's data
+    // starts with the head of the third file, then the tail of the first, then
+    // the whole second one -- exactly its table).
+    {
+        std::vector<LegacyStreamPiece> ordered;
+        for (const LegacyStreamPiece& pc : met) { if (pc.slice) ordered.insert(ordered.begin(), pc); else ordered.push_back(pc); }
+        met = ordered;
+    }
+    // An empty range with no file to announce: the header was all there is.
+    if (begin == end && met.empty()) return true;
+    // `pieces` = the list without its ghosts (what the tables, stamps and
+    // checksums describe); piece_of maps a reading position to it.
+    std::vector<LegacyStreamPiece> pieces;
+    std::vector<std::size_t> piece_of(met.size(), 0u);
+    for (std::size_t m = 0; m < met.size(); ++m) {
+        if (src[met[m].src].ghost) { piece_of[m] = static_cast<std::size_t>(-1); continue; }
+        piece_of[m] = pieces.size(); pieces.push_back(met[m]);
+    }
+    std::vector<std::uint64_t> piece_pos(pieces.size(), 0u);
+    std::uint64_t total = 0;   // the bytes this stream stores
+    for (std::size_t k = 0; k < pieces.size(); ++k) { piece_pos[k] = total; total += pieces[k].len; }
+    std::vector<std::uint32_t> piece_ck(pieces.size(), 0u);
+    // The self-check's view of the same bytes: a CRC-64 per piece, independent
+    // of the archive's own checksum mode (which may be none, or 16 bits).
+    std::vector<std::uint64_t> piece_crc(pieces.size(), nzr::selfcheck::Crc64::Empty());
+    nzr::selfcheck::Crc64 pcrc;
+    // "started" / "finished" are decided in READING order but emitted in list
+    // order; the original's list is what its emitters walk, so mark per piece.
+    std::vector<bool> announced(pieces.size(), false), summed(pieces.size(), false);
+    std::uint64_t written = 0;
+    // Only ghosts: their reports, and no block at all (`-xa.txt a.txt` gives a
+    // 27-byte archive -- kind and codec records, nothing else).
+    if (pieces.empty()) {
+        for (const LegacyStreamPiece& pc : met) { ClearStatusLine(os); os << "Cannot open: " << src[pc.src].display << '\n'; }
+        return true;
+    }
+    std::ifstream in;
+    std::size_t cur_met = 0; std::uint64_t cur_off = 0;   // reading cursor over `met`
+    std::vector<unsigned char> block, iobuf(1u << 16u);
+    LegacyFileChecksum ck(ckmode);
+    // Ghosts and 0-byte files at the reading cursor: the ghost is reported, the
+    // empty file gets its (empty) checksum; both are passed without a read.
+    // The compressing codecs' reader (FUN_08065a40's slot-8 call, shared with lzpf)
+    // keeps a ghost's byte count as the current entry's budget after the open
+    // fails, and fills it from the files that follow -- `unread.bin(5000) b.bin`
+    // stores b.bin as 5000 + 25000 bytes in two DATA records; a second ghost met
+    // while filling adds nothing. When the budget is spent the boundary rule runs
+    // with the OPEN file as "the file just read" (measured, 27 shapes; see
+    // ORIGINAL_QUIRKS 56). The store reader has no such budget.
+    std::uint64_t ghost_budget = 0; bool budget_end = false;
+    const bool chunked = codec.p0 != 0u;
+    const auto pass_empty = [&]() {
+        while (cur_met < met.size() && (piece_of[cur_met] == static_cast<std::size_t>(-1) || met[cur_met].len == 0u)) {
+            if (piece_of[cur_met] == static_cast<std::size_t>(-1)) {
+                ClearStatusLine(os);
+                os << "Cannot open: " << src[met[cur_met].src].display << '\n';
+                // its bytes count as done for the slot (a one-block store with a
+                // ghost still shows 100 %; a two-block one shows block 1 over the
+                // total WITH the ghost)
+                // the compressing reader's slot counts REAL bytes only: when the open
+                // fails the ghost leaves the slot's total, and its budget is filled by
+                // the next files' bytes (`unread(5000) b(30000)` shows 17 % = 5000 of
+                // 30000 after the first piece; `b(30000) unread(5000) s(100)` still 82 %
+                // = 30000 of 35100, the ghost not yet met at that tick)
+                if (!chunked) status.Passed(stream, src[met[cur_met].src].size);
+                else {
+                    status.DropFromTotal(stream, met[cur_met].planned);
+                    if (ghost_budget == 0u) ghost_budget = met[cur_met].planned;
+                }
+            } else {
+                status.FileStart(live, src[met[cur_met].src].display);   // an empty file is opened too
+                piece_ck[piece_of[cur_met]] = LegacyFileChecksum(ckmode).Final();
+            }
+            ++cur_met; cur_off = 0;
+        }
+    };
+    // The compressing codecs read the stream in CHUNKS (FUN_0805b020's reader call
+    // with max 1 MB, min 64 KB): at a file boundary the read stops once 64 KB are in
+    // hand, and a file LARGER than 64 KB is never appended to a started chunk (a
+    // 12000-byte file before a 300000-byte one is a chunk of its own; small files
+    // before a 65536-byte one share theirs). Each chunk is one DATA record of
+    // 32 KB blocks; the store's unit is its window.
+    // FUN_0805b020 reads 1 MB pieces with a 64 KB file-boundary rule; FUN_08065a40 (lzhd) with 16 KB
+    // ... and the optimum/CM family does not stop at a file boundary AT ALL: it
+    // fills its 1 MB piece across as many files as fit. Measured on the original
+    // with pairs of 0.1/0.2/0.3/0.5/0.7/0.9 MB, a 2 MB file followed by a 50 KB
+    // one, and the reverse: ONE filename table every time, where a 64 KB rule
+    // would have cut the piece at the first boundary. Using the lzhd bound here
+    // put each file in its own piece and every multi-file archive diverged from
+    // the original's at the first table.
+    const std::uint64_t piece_bound = codec.p0 >= 5u ? ~std::uint64_t{0}
+                                                     : (codec.p0 >= 3u ? 0x4000u : 0x10000u);
+    // The optimum/CM family's block driver (FUN_0808d0b0) buffers the stream:
+    // what a piece leaves under its 0xff000 threshold is not coded here but
+    // carried into the next piece, and what is left when the stream ends comes
+    // out in the flush below. Cutting each piece on its own instead put a block
+    // boundary at every megabyte, which the original does not.
+    // the metadata run the reads have produced since the last DATA record
+    std::size_t pend_a_from = pieces.size(), pend_a_to = 0;
+    std::size_t pend_c_from = pieces.size(), pend_c_to = 0;
+    const auto flush_pending_meta = [&]() {
+        // The ranges are normalised into LOCALS. Doing it in place left an empty
+        // pair at [0,0) when there was nothing to write -- a block that ends in the
+        // middle of a file -- and the next merge then took min(0, k): the run
+        // re-announced every entry from the first one, so a file that spans two
+        // blocks was listed in the next table a second time and its checksum
+        // written twice. Neither the original nor this port could read the
+        // archive back (`a -co` of two 3 MB files; -cO and -cc too).
+        const std::size_t a0 = std::min(pend_a_from, pend_a_to), c0 = std::min(pend_c_from, pend_c_to);
+        const std::size_t a1 = pend_a_to, c1 = pend_c_to;
+        pend_a_from = pieces.size(); pend_a_to = 0;
+        pend_c_from = pieces.size(); pend_c_to = 0;
+        if (a0 == a1 && c0 == c1) return;
+        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a0, a1, c0, c1, ckmode, options);
+    };
+    const auto run_optimum = [&](std::vector<unsigned char>& payload, const unsigned char* d,
+                                 std::uint32_t n, bool final) -> bool {
+        if (codec.p0 == 5u)
+            return OptimumEncodeSegment(*codec.co, codec.co_v.get(), codec.exe_enc, codec.feeder,
+                                        codec.co_block, d, n, stream, payload, final,
+                                        &codec.audio, codec.p0);
+        if (codec.p0 == 6u)
+            return OptimumEncodeSegment(*codec.cO, codec.cO_v.get(), codec.exe_enc, codec.feeder,
+                                        codec.co_block, d, n, stream, payload, final,
+                                        &codec.audio, codec.p0);
+        return codec.cc != nullptr &&
+               CmEncodeSegment(codec.cc, codec.exe_enc, codec.feeder, codec.co_block, d, n,
+                               stream, payload, final, &codec.audio);
+    };
+    while (written < total || (total == 0u && written == 0u)) {
+        block.clear();
+        const std::size_t met_start = cur_met;   // the reader's first entry of this piece
+        // The reader is asked for what fits in the codec's staging buffer, not
+        // for a flat megabyte: FUN_0808d0b0 calls it with `0x100000 - held`, and
+        // a file's metadata records are written where the read that finished it
+        // fell. With a flat megabyte the checksum of a 1.5 MB file came out one
+        // block too early.
+        const std::uint64_t room = (chunked && codec.p0 >= 5u)
+                                       ? 0x100000ull - codec.feeder.Held()
+                                       : 0x100000ull;
+        const std::uint64_t want = std::min<std::uint64_t>(chunked ? room : window, total - written);
+        while (block.size() < want && cur_met < met.size()) {
+            if (chunked && !block.empty() && ((cur_off == 0u && ghost_budget == 0u) || budget_end)) {
+                // the reader decides at an entry boundary looking at the next NON-EMPTY
+                // entry (a ghost counts with its size): zero-length entries between a
+                // piece and a piece-breaking file travel with the next piece's table
+                // (oracle cd_multi: `... tiny empty blk3.bin`). A spent ghost budget is
+                // an entry boundary too, with the open file as the one just read.
+                budget_end = false;
+                std::size_t nx = cur_met + (cur_off != 0u ? 1u : 0u);
+                while (nx < met.size() && met[nx].planned == 0u) ++nx;
+                const std::uint64_t next_len = (nx < met.size()) ? met[nx].planned : 0u;
+                const std::uint64_t last_len = (cur_off != 0u) ? met[cur_met].len : (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
+                if (last_len >= piece_bound || next_len > piece_bound) break;
+            }
+            pass_empty();
+            if (cur_met >= met.size()) break;
+            const LegacyStreamPiece& pc = met[cur_met];
+            const EncodeSource& e = src[pc.src];
+            if (cur_off == 0u) {
+                in.close(); in.clear(); in.open(e.fs_path, std::ios::binary); in.seekg(static_cast<std::streamoff>(pc.file_off));
+                ck = LegacyFileChecksum(ckmode);
+                pcrc = nzr::selfcheck::Crc64();
+                status.FileStart(live, e.display);
+            }
+            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size(), ghost_budget != 0u ? ghost_budget : ~std::uint64_t{0}}));
+            const auto t_read = std::chrono::steady_clock::now();
+            in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
+            *read_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_read).count());
+            if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << e.fs_path.string() << '\n'; return false; }
+            ck.Update(iobuf.data(), n);
+            pcrc.Update(iobuf.data(), n);
+            block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
+            cur_off += n;
+            if (cur_off == pc.len) {
+                piece_ck[piece_of[cur_met]] = ck.Final();
+                piece_crc[piece_of[cur_met]] = pcrc.Final();
+                ++cur_met; cur_off = 0;
+            }
+            if (ghost_budget != 0u) { ghost_budget -= n; if (ghost_budget == 0u) budget_end = true; }
+        }
+        budget_end = false;
+        if (!chunked) pass_empty();
+        else if (cur_off == 0u) {
+            // FUN_08065a40 / FUN_0805b020: at a file boundary the reader stops when
+            // the file just read is `bound` bytes or more, or the next non-empty file
+            // is larger than `bound`; otherwise the zero-length entries that follow
+            // join this piece. After a stop they open the next piece (even one with
+            // no data at all). Measured on the original with 22 combinations.
+            std::size_t nx = cur_met;
+            while (nx < met.size() && met[nx].planned == 0u) ++nx;
+            const std::uint64_t next_len = (nx < met.size()) ? met[nx].planned : 0u;
+            const std::uint64_t last_len = (cur_met > 0u) ? met[cur_met - 1u].len : 0u;
+            if (!(last_len >= piece_bound || next_len > piece_bound)) pass_empty();
+        }
+        const std::uint64_t block_end = written + block.size();
+        // pieces that start in this block (list order), and those that end in it
+        std::size_t a_from = pieces.size(), a_to = 0, c_from = pieces.size(), c_to = 0;
+        // which entries this piece's table announces: the store goes by position (a
+        // zero-length file at a block's end belongs to it); the compressing codecs'
+        // reader hands over exactly the entries it consumed for the piece
+        std::size_t consumed_lo = pieces.size(), consumed_hi = 0;
+        if (chunked) for (std::size_t m = met_start; m < cur_met + (cur_off != 0u ? 1u : 0u) && m < met.size(); ++m) {   // (a file cut by the piece boundary is announced where it starts)
+            if (piece_of[m] == static_cast<std::size_t>(-1)) continue;
+            consumed_lo = std::min(consumed_lo, piece_of[m]); consumed_hi = std::max(consumed_hi, piece_of[m] + 1u);
+        }
+        for (std::size_t k = 0; k < pieces.size(); ++k) {
+            const bool starts = !announced[k] && (chunked ? (consumed_lo <= k && k < consumed_hi)
+                                                          : (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && cur_met > 0u)));
+            if (starts) { announced[k] = true; a_from = std::min(a_from, k); a_to = std::max(a_to, k + 1u); }
+            const bool ends = !summed[k] && announced[k] && piece_pos[k] + pieces[k].len <= block_end;
+            if (ends) { summed[k] = true; c_from = std::min(c_from, k); c_to = std::max(c_to, k + 1u); }
+        }
+        if (a_from > a_to) a_from = a_to;
+        if (c_from > c_to) c_from = c_to;
+        // The optimum/CM family reads several times per block, so the records a
+        // read produces WAIT for the next one: two files that end before the
+        // same block are announced in ONE type-5 record of eight bytes, not two
+        // of four. Everything else writes its run per piece as before.
+        if (chunked && codec.p0 >= 5u) {
+            // (an EMPTY range is [0,0) after the normalisation above, so merging
+            // it would drag the run's start back to the first entry)
+            if (a_from < a_to) { pend_a_from = std::min(pend_a_from, a_from); pend_a_to = std::max(pend_a_to, a_to); }
+            if (c_from < c_to) { pend_c_from = std::min(pend_c_from, c_from); pend_c_to = std::max(pend_c_to, c_to); }
+        } else {
+            LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, c_from, c_to, ckmode, options);
+        }
+        std::vector<unsigned char> payload;
+        if (chunked) {
+            // FUN_0805b020: 32 KB blocks, the output buffer restarts per chunk (its
+            // 4-byte alignment matters to the side stream's overflow check only)
+            if (codec.p0 >= 5u) {
+                // writes its own records, one per block
+                if (!run_optimum(payload, block.data(), static_cast<std::uint32_t>(block.size()), false))
+                    return false;
+            } else if (codec.p0 == 3u || codec.p0 == 4u) {
+                nzr::lzhd_enc::CompressPiece(*codec.cd, block.data(), static_cast<std::uint32_t>(block.size()), payload);
+            } else {
+                std::size_t off = 0;
+                while (off < block.size()) {
+                    const std::size_t n = std::min<std::size_t>(0x8000u, block.size() - off);
+                    nzr::lzpf_enc::EncodeBlock(*codec.lz, block.data() + off, n, block.size() - off, payload, payload.size() & 3u, off == 0u);
+                    off += n;
+                }
+            }
+        }
+        if (chunked && codec.p0 >= 5u) {
+            // already framed, one record per block -- and a read that did not
+            // fill the staging buffer writes nothing at all, its metadata run
+            // included
+            if (!payload.empty()) { flush_pending_meta(); out.insert(out.end(), payload.begin(), payload.end()); }
+        } else {
+            const std::vector<unsigned char>& data = chunked ? payload : block;
+            std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, data.size());
+            out.insert(out.end(), hdr.begin(), hdr.end());
+            if (drain != nullptr) {
+                (*drain)(out.data(), out.size()); out.clear();
+                (*drain)(data.data(), data.size());
+            } else {
+                out.insert(out.end(), data.begin(), data.end());
+            }
+        }
+        if (drain != nullptr && !out.empty()) { (*drain)(out.data(), out.size()); out.clear(); }
+        written = block_end;
+        status.BlockDone(live, stream, block.size());
+        if (total == 0u) break;
+    }
+    if (chunked && codec.p0 >= 5u) {
+        // the stream is over: whatever the staging buffer still holds is cut now
+        std::vector<unsigned char> payload;
+        if (!run_optimum(payload, nullptr, 0u, true)) return false;
+        flush_pending_meta();
+        out.insert(out.end(), payload.begin(), payload.end());
+    }
+    if (chunked && cur_met < met.size()) {
+        // the entries left are zero-length (or ghosts) after a boundary stop: the
+        // reader hands them over as one more piece -- its table, metadata and an
+        // empty DATA record (FUN_08065a40 on `b.bin empty`)
+        const std::size_t m0 = cur_met;
+        pass_empty();
+        std::size_t a_from = pieces.size(), a_to = 0;
+        for (std::size_t m = m0; m < cur_met; ++m) {
+            if (piece_of[m] == static_cast<std::size_t>(-1)) continue;
+            a_from = std::min(a_from, piece_of[m]); a_to = std::max(a_to, piece_of[m] + 1u);
+            announced[piece_of[m]] = true; summed[piece_of[m]] = true;
+        }
+        if (a_from > a_to) a_from = a_to;
+        LegacyEmitPieceMetadata(out, stream, src, pieces, piece_ck, a_from, a_to, a_from, a_to, ckmode, options);
+        std::vector<unsigned char> hdr; WriteLegacyRecordHeader(&hdr, 0u, stream, 0u);
+        out.insert(out.end(), hdr.begin(), hdr.end());
+    }
+    for (std::size_t k = 0; k < pieces.size(); ++k)
+        codec.expected.push_back({src[pieces[k].src].archive_name, pieces[k].file_off, pieces[k].len, piece_crc[k], true});
+    return true;
+}
+
+// `a -cn`: the store container. One stream, or -pN worker streams laid out the
+// way the original's single-thread run (-t1) lays them: the last worker's
+// kind+codec records first, then workers 1..N-1 in order (each its header if
+// not yet written, then its body), then worker 0. Other thread counts make the
+// original's interleaving scheduler-dependent (measured: three runs, three
+// different archives), so this order is what we always write.
+// The whole-archive self-check `a` runs on what it has just written, before the
+// archive takes its name. The per-block read-back of -co/-cO proves each block
+// decodes, but never saw the container: a table that re-announced a file
+// (v0.15.2-pre to v0.16.0-pre) and a worker header one byte short (v0.15.0-pre
+// to v0.17.0-pre, quirk 77) both went out as archives nothing could read. So the
+// file is decoded here as `t` would decode it, quietly and strictly, and what
+// every entry decoded to is compared with what was read from disk: the same
+// names, the same sizes, the same CRC-64 of the content. The archive's own
+// checksums are not the reference -- they come from the same read, and under -hn
+// there are none.
+struct SelfCheckOutcome {
+    enum Verdict { kOk, kFailed, kSkipped } verdict = kOk;
+    std::string reason;
+    std::size_t entries = 0;
+    std::uint64_t bytes = 0;
+};
+
+static SelfCheckOutcome SelfCheckWrittenArchive(const fs::path& path, const CliOptions& add_options,
+                                                const std::vector<nzr::selfcheck::Item>& expected) {
+    SelfCheckOutcome out;
+    struct NullBuf : std::streambuf {
+        int overflow(int c) override { return c == EOF ? 0 : c; }
+        std::streamsize xsputn(const char*, std::streamsize n) override { return n; }
+    } null_buf;
+    std::ostream quiet(&null_buf);
+    // A fresh set of options: `a`'s own would filter entries by its file
+    // arguments and -x patterns, and switch the checksums off under -hn.
+    CliOptions o;
+    o.command = Command::kTest;
+    o.archive_path = NativeBytesFromPath(path);
+    o.no_filename_ext = true;
+    o.threads = add_options.threads;
+    o.memory_bytes = add_options.memory_bytes;
+    nzr::selfcheck::Recorder& rec = nzr::selfcheck::Recorder::Get();
+    struct RecStop { nzr::selfcheck::Recorder& r; ~RecStop() { if (r.Active()) (void)r.Stop(); } } rec_stop{rec};
+    std::vector<nzr::selfcheck::Item> got;
+    std::map<std::string, std::uint64_t> entry_bytes;
+    int rc = 0;
+    std::uint32_t code = 0;
+    std::string err;
+    try {
+        // Leftovers of the encode on this thread must not decide the verdict.
+        nzr::derr::Clear();
+        nzr::cd::NzCdExeFilterReset();
+        LegacyCnContext ctx;   // holds the mapping: gone before the file is renamed
+        psink::Configure(o, /*test_mode=*/true, quiet, fs::path("."), /*force=*/true);
+        struct SinkEnd { ~SinkEnd() { psink::Reset(); } } sink_end;
+        rec.Start();
+        if (!TryParseLegacyCnArchive(o.archive_path, &ctx, &err)) {
+            (void)rec.Stop();
+            out.verdict = (err == "Out of memory!") ? SelfCheckOutcome::kSkipped : SelfCheckOutcome::kFailed;
+            out.reason = (out.verdict == SelfCheckOutcome::kSkipped) ? std::string("not enough memory to read it back")
+                                                                      : "it does not open (" + err + ")";
+            return out;
+        }
+        rc = RunLegacyCnExtractOrTest(o, ctx, /*test_mode=*/true, quiet, std::chrono::steady_clock::now());
+        code = nzr::derr::Current().code;
+        for (const LegacyCnEntry& e : ctx.entries) { entry_bytes[e.path] += e.size; ++out.entries; out.bytes += e.size; }
+        got = rec.Stop();
+    } catch (const std::bad_alloc&) {
+        out.verdict = SelfCheckOutcome::kSkipped; out.reason = "not enough memory to read it back"; return out;
+    } catch (const std::length_error&) {
+        out.verdict = SelfCheckOutcome::kSkipped; out.reason = "not enough memory to read it back"; return out;
+    } catch (const std::exception& ex) {
+        out.verdict = SelfCheckOutcome::kFailed; out.reason = std::string("the reader failed: ") + ex.what(); return out;
+    }
+    nzr::derr::Clear();
+    const auto fail = [&](std::string why) { out.verdict = SelfCheckOutcome::kFailed; out.reason = std::move(why); return out; };
+    if (rc == kLegacyNeedCompat || rc != 0) {
+        return fail(code != 0u ? "it does not decode (code " + std::to_string(code) + ")" : std::string("it does not decode"));
+    }
+    for (const nzr::selfcheck::Item& it : got)
+        if (!it.complete) return fail("an entry decodes short: " + it.name);
+    // The entry list: the same names, each with as many bytes as were read.
+    std::map<std::string, std::uint64_t> want_bytes;
+    for (const nzr::selfcheck::Item& it : expected) want_bytes[it.name] += it.len;
+    for (const auto& kv : want_bytes) {
+        const auto g = entry_bytes.find(kv.first);
+        if (g == entry_bytes.end()) return fail("an entry is missing: " + kv.first);
+        if (g->second != kv.second) return fail("an entry has the wrong size: " + kv.first);
+    }
+    for (const auto& kv : entry_bytes)
+        if (want_bytes.find(kv.first) == want_bytes.end()) return fail("an entry was not in the input: " + kv.first);
+    // The content, name by name.
+    const auto want_runs = nzr::selfcheck::Runs(expected);
+    const auto got_runs = nzr::selfcheck::Runs(got);
+    for (const auto& kv : want_runs) {
+        const auto g = got_runs.find(kv.first);
+        if (g == got_runs.end() || g->second != kv.second) return fail("an entry decodes to other bytes: " + kv.first);
+    }
+    if (got_runs.size() != want_runs.size()) return fail("the decoded entries do not match the input");
+    return out;
+}
+
+// NZ_SELFCHECK_FAULT (tests only): damage the finished archive before the check,
+// so the test can prove the check catches it. flip: one byte two thirds in;
+// trunc: the last byte cut; name: one character of the first stored name.
+static void SelfCheckInjectFault(const fs::path& path, const std::vector<nzr::selfcheck::Item>& expected) {
+    const char* const kind = NZ_ENV("NZ_SELFCHECK_FAULT");
+    if (kind == nullptr) return;
+    std::error_code ec;
+    const std::uintmax_t size = fs::file_size(path, ec);
+    if (ec || size < 32u) return;
+    const std::string k(kind);
+    // Two bytes, not one: a -co/-cO/-cc archive cut by ONE byte reads back
+    // whole, in the original too -- the last byte is the last block's dece
+    // flag, read as zero from the record buffer -- so it damages nothing.
+    if (k == "trunc") { fs::resize_file(path, size - 2u, ec); return; }
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!f) return;
+    std::uintmax_t at = 0;
+    if (k == "flip") {
+        at = size - size / 3u;
+    } else if (k == "name" && !expected.empty() && !expected.front().name.empty()) {
+        std::vector<char> all(static_cast<std::size_t>(size));
+        f.read(all.data(), static_cast<std::streamsize>(size));
+        const std::string& nm = expected.front().name;
+        const auto it = std::search(all.begin(), all.end(), nm.begin(), nm.end());
+        if (it == all.end()) return;
+        at = static_cast<std::uintmax_t>(it - all.begin()) + nm.size() - 1u;
+        f.clear();
+    } else {
+        return;
+    }
+    f.seekg(static_cast<std::streamoff>(at));
+    char c = 0;
+    f.read(&c, 1);
+    c = static_cast<char>(c ^ 0x01);
+    f.seekp(static_cast<std::streamoff>(at));
+    f.write(&c, 1);
+}
+
+// The worker streams of a -pN container compressed concurrently (see the call in
+// RunAddStoreContainer), with everything the one-thread run decides by ORDER kept:
+//
+// * The write order is the serial one: worker N-1's header, then workers 1..N-1,
+//   then worker 0. Jobs are handed out in that processing order P = [1..N-1, 0]
+//   and the main thread writes each body as soon as the ones before it in P are
+//   written, so at most the unwritten suffix is held in memory.
+// * Quirk 56: the text detector's word-continuation table is filled the first
+//   time the dictionary transform runs in the process, and the original's serial
+//   order is P (measured: -p3 -t1, text in worker 0 / 1 / 2 / all, 20/20
+//   identical, each input sensitive to the table's state). So the worker at P[i]
+//   inherits "filled" exactly when one of P[0..i-1] runs the transform. Each job
+//   gets its own view of the flag; at its first read (unless it filled the table
+//   itself first) it waits until an earlier job has filled it or all earlier jobs
+//   have finished without doing so. Jobs start in P order, so every job it waits
+//   for is already running: no deadlock, and no work is repeated.
+// * The permanent console lines of a job ("Cannot open:", "Error: cannot read")
+//   go to its own buffer and are replayed, in P order, just before its body is
+//   written; the status redraws go straight to the console under EncodeStatus's
+//   lock (they are timing-dependent in the original too, quirk 58).
+// * A failure is the FIRST in P order, as serially: the lines up to and including
+//   that job's are shown and the caller declines. An exception is rethrown the
+//   same way.
+// * The BWT read-back's own thread pool is held at one thread meanwhile.
+template <class RangeOf, class TimedWrite>
+static bool RunWorkersConcurrently(unsigned workers, unsigned pool, const RangeOf& range_of,
+                                   const std::vector<EncodeSource>& sources, const std::vector<std::uint64_t>& start,
+                                   std::uint64_t window, ChecksumMode ckmode, const CliOptions& options,
+                                   std::ostream& os, EncodeStatus& status, std::uint64_t* read_ms,
+                                   std::vector<EncodeCodec>& codecs, const TimedWrite& timed_write) {
+    {
+        std::vector<unsigned char> hdr_only;
+        LegacyWriteStreamHeader(hdr_only, workers - 1u, window, ckmode, codecs[workers - 1u]);
+        timed_write(hdr_only);
+    }
+    (void)LegacyLocalUtcOffsetSeconds();   // fixed once, before any worker stamps a file
+    std::vector<unsigned> order;
+    for (unsigned k = 1u; k < workers; ++k) order.push_back(k);
+    order.push_back(0u);
+    struct Job {
+        std::vector<unsigned char> body;
+        std::ostringstream lines;
+        std::uint64_t read_ms = 0;
+        bool ok = false;
+        bool finished = false;
+        std::exception_ptr err;
+        nzr::lzhd_enc::DictTableView view;
+    };
+    std::vector<Job> jobs(workers);   // by worker index
+    // quirk 56, by position in P
+    std::mutex chain_mu;
+    std::condition_variable chain_cv;
+    std::vector<char> set_at(order.size(), 0), done_at(order.size(), 0);
+    const bool entry0 = nzr::lzhd_enc::ProcessDictTablesBuilt();
+    // Test only: no job inherits the flag from the jobs before it. The archive
+    // then changes on an input whose later workers depend on the inheritance,
+    // which is how tests/encode/parallel_determinism.sh proves its quirk-56 cases
+    // are sensitive before trusting their "identical".
+    const bool isolated = NZ_ENV("NZ_TEST_Q56_ISOLATED") != nullptr;
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        Job& j = jobs[order[i]];
+        if (i == 0u || entry0 || isolated) {
+            j.view.resolved = true;
+            j.view.built = entry0;
+        } else {
+            j.view.resolved = false;
+            j.view.resolve = [&chain_mu, &chain_cv, &set_at, &done_at, i]() -> bool {
+                std::unique_lock<std::mutex> lk(chain_mu);
+                for (;;) {
+                    bool all_done = true;
+                    for (std::size_t q = 0; q < i; ++q) {
+                        if (set_at[q] != 0) return true;
+                        if (done_at[q] == 0) all_done = false;
+                    }
+                    if (all_done) return false;
+                    chain_cv.wait(lk);
+                }
+            };
+        }
+        j.view.on_set = [&chain_mu, &chain_cv, &set_at, i]() {
+            { std::lock_guard<std::mutex> lk(chain_mu); set_at[i] = 1; }
+            chain_cv.notify_all();
+        };
+    }
+    std::atomic<std::size_t> next{0};
+    std::mutex done_mu;
+    std::condition_variable done_cv;
+    const auto work = [&]() {
+        for (;;) {
+            const std::size_t i = next.fetch_add(1u);
+            if (i >= order.size()) break;
+            const unsigned k = order[i];
+            Job& j = jobs[k];
+            const auto r = range_of(k);
+            nzr::lzhd_enc::SetThreadDictTableView(&j.view);
+            try {
+                j.ok = LegacyWriteStoreStream(j.body, k, sources, start, r.first, r.second, window, ckmode, options,
+                                              k != workers - 1u, k == workers - 1u, j.lines, status, &j.read_ms,
+                                              codecs[k], &os);
+            } catch (...) {
+                j.err = std::current_exception();
+                j.ok = false;
+            }
+            nzr::lzhd_enc::SetThreadDictTableView(nullptr);
+            // The engines are done with once the stream is compressed (issue #2
+            // item 6): released here, by the worker that owns them, and not when
+            // the stream's turn to be written comes -- a stream that finished
+            // early kept its window and tables (the -cF hash alone is 64 MB)
+            // while it waited behind a slower one. Quirk 56's inheritance passes
+            // flags only (set_at/done_at), nothing these hold. `expected`, what
+            // the self-check needs, stays.
+            codecs[k].ReleaseEngines();
+            { std::lock_guard<std::mutex> lk(chain_mu); done_at[i] = 1; }
+            chain_cv.notify_all();
+            { std::lock_guard<std::mutex> lk(done_mu); j.finished = true; }
+            done_cv.notify_all();
+        }
+    };
+    NzBwtSetThreadCount(1u);
+    std::vector<std::thread> threads;
+    bool failed = false;
+    std::exception_ptr fail_err;
+    {
+        // every thread is joined on every way out, a throw included
+        struct Joiner { std::vector<std::thread>& t; ~Joiner() { for (std::thread& x : t) if (x.joinable()) x.join(); } } joiner{threads};
+        for (unsigned t = 0; t < pool; ++t) threads.emplace_back(work);
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            Job& j = jobs[order[i]];
+            { std::unique_lock<std::mutex> lk(done_mu); done_cv.wait(lk, [&j] { return j.finished; }); }
+            const std::string lines = j.lines.str();
+            if (!lines.empty()) status.Line(os, lines);
+            if (j.err) { fail_err = j.err; break; }
+            if (!j.ok) { failed = true; break; }
+            timed_write(j.body);
+            std::vector<unsigned char>().swap(j.body);   // the engines went when the worker finished
+        }
+    }
+    NzBwtSetThreadCount(DecodeThreadCount());
+    bool any_set = entry0;
+    for (std::size_t i = 0; i < order.size(); ++i) any_set = any_set || (set_at[i] != 0);
+    nzr::lzhd_enc::SetProcessDictTablesBuilt(any_set);
+    for (const Job& j : jobs) *read_ms += j.read_ms;
+    if (fail_err) std::rethrow_exception(fail_err);
+    return !failed;
+}
+
+int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
+                         const std::chrono::steady_clock::time_point& add_start, unsigned p0) {
+    // Ghosts count here (the split and the window are sized before anything is
+    // opened), but not in what the footer reports as compressed.
+    std::uint64_t total = 0, stored = 0;
+    for (const EncodeSource& e : sources) { total += e.size; if (!e.ghost) stored += e.size; }
+    const ChecksumMode ckmode = LegacyNormalizeChecksumModeForCompression(options.checksum);
+    // -pN keeps every worker even when the input is smaller than N bytes: a
+    // worker whose range is empty writes its kind+codec records and nothing
+    // else (measured: `-p3 -t1 tiny` -> s2 header, s1 header, s2 body, s0 header).
+    unsigned workers = (options.workers > 1u) ? options.workers : 1u;
+    // The automatic split (FUN_0804f360), from 8 MB of input: when 90 % or more
+    // of the bytes are "media" by extension (aif, bmp, pgm, pnm, ppm, tga, tif,
+    // wav -- FUN_0804de80) and no other file is bigger than a tenth of the total,
+    // min(files, T) workers (T = min(-t, host)), whatever the method, the store
+    // included (measured: three 3 MB .bmp files, `a -cn` -> 3 workers). Otherwise
+    // it switches on the method, through the tables FUN_080ad340 fills it from
+    // (0x8132f40: method, 0x8132f80: the p/P variant): -cf, -cF, -co and plain
+    // -cd/-cD get T workers; -cn, -cO, -cc and -cdp/-cdP/-cDp/-cDP keep ONE
+    // (measured, 20 MB, 16 threads: -cO one nz_optimum2 [160 MB], -cc one nz_cm
+    // [441 MB]). Splitting -cO and -cc anyway wrote sixteen small compressors
+    // where the original writes one.
+    if (options.workers == 0u && total >= 0x800000ull) {
+        const unsigned host = HostThreadCount();
+        unsigned threads = host;
+        if (options.threads > 0u && options.threads < host) threads = options.threads;
+        std::uint64_t media = 0, rest10 = total - total * 90u / 100u;
+        bool big_other = false;
+        for (const EncodeSource& e : sources) {
+            const std::string& n = e.archive_name;
+            bool is_media = false;
+            if (n.size() > 4u && n[n.size() - 4u] == '.') {
+                std::string ext = n.substr(n.size() - 3u);
+                for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                static const char* const kMedia[] = {"aif", "bmp", "pgm", "pnm", "ppm", "tga", "tif", "wav"};
+                for (const char* m : kMedia) if (ext == m) { is_media = true; break; }
+            }
+            if (is_media) { media += e.size; if (media >= total * 90u / 100u) break; }
+            else { if (rest10 < e.size) { big_other = true; break; } rest10 -= e.size; }
+        }
+        const bool media_heavy = !big_other && (media * 100u / (total + 1u) >= 90u);
+        const Compressor c = options.compressor;
+        const bool splits = c == Compressor::kLzpf || c == Compressor::kLzpfLarge || c == Compressor::kLzhd ||
+                            c == Compressor::kLzhds || c == Compressor::kOptimum1;
+        workers = media_heavy ? static_cast<unsigned>(std::min<std::uint64_t>(sources.size(), threads))
+                              : (splits ? threads : 1u);
+        if (workers == 0u) workers = 1u;
+    }
+    const std::uint64_t per = total / workers;
+    // FUN_0804cec0: the window is the byte-float rounding of the smaller of the
+    // input size and the -m budget reduced per codec -- the budget itself for the
+    // store and -cf; minus 64 MB for -cF (0 below it: a 64 KB window under -m64m);
+    // minus a quarter and a sixteenth for -cd (11/16); minus a quarter, an eighth,
+    // a sixteenth and a thirty-second for -cD (17/32); both sides capped at
+    // 0xf0000000. Under 64 KB the window is 64 KB. (Measured: -cd -m1m -> 704 KB,
+    // -cD -m1m -> 576 KB, -cf -m300k -> 320 KB, the rounding being to the nearest.)
+    // FUN_0804cec0 is called once per worker, and BOTH the budget and the input
+    // arrive already divided by the worker count. Measured: the same 48 MB of
+    // bytes at -t4 gets a 64 MB budget under a .wav name (media-heavy, so one
+    // worker) and 16 MB under a non-media name (four workers). Not dividing it
+    // wrote a 8 MB window where the original writes 4 MB at -cf -t2 -m8m.
+    const std::uint64_t budget = options.memory_bytes / (workers ? workers : 1u);
+    std::uint64_t reduced;
+    switch (p0) {
+        case 2u: reduced = (budget > 0x3ffffffull) ? budget - 0x4000000ull : 0ull; break;
+        case 3u: reduced = budget - (budget >> 2u) - (budget >> 4u); break;
+        case 4u: reduced = budget - (budget >> 2u) - (budget >> 3u) - (budget >> 4u) - (budget >> 5u); break;
+        // -co (0x0804d5e9): half of whatever the budget has left over 16 MB.
+        // There is deliberately NO 64 KB floor here: the original applies that
+        // floor to the STORED window at the very end of FUN_0804cec0, after the
+        // block has been computed, and the block rule below consumes the
+        // unfloored value -- which is 0 for any budget at or under 16 MB, and
+        // that zero is what produces the 16/17-unit blocks seen down there.
+        // -cO takes the SAME rule: window and block match -co's at every budget
+        // from 4 MB to 96 MB on the same input, despite the engine being 16 MB
+        // bigger (measured on both, nine budgets).
+        case 5u: case 6u: reduced = (budget > (16ull << 20u)) ? (budget - (16ull << 20u)) >> 1u : 0ull; break;
+        default: reduced = budget; break;
+    }
+    if (reduced > 0xf0000000ull) reduced = 0xf0000000ull;
+    const std::uint64_t cap = std::min<std::uint64_t>(per, 0xf0000000ull);
+    const std::uint64_t basis = std::min(reduced, cap);
+    const std::uint64_t window_raw = LegacyByteFloatDecode(LegacyByteFloatEncode(basis));
+    std::uint64_t window = (window_raw < 0x10000u) ? 0x10000u : window_raw;   // the floor, applied LAST
+
+    // -cc has its own branch of FUN_0804cec0 (0x0804cf96): a flat 26 MB comes off
+    // the budget, never below 5 MB, and a quarter of what is left is the window's
+    // first claim. When the INPUT is smaller than that quarter the window becomes
+    // the input (or 1 MB, whichever is larger) and the two hash tables get the
+    // rest; when it is not, the tables are sized first and the window is whatever
+    // they leave. Their widths are the top bit of what is left, floored at 20 and
+    // 18 and capped at 35 and 33. Validated against the original's own codec
+    // object, read live right after this call, on a 7 x 13 grid of input sizes
+    // (100 KB .. 900 MB) and budgets (1 MB .. 2 GB): 91 of 91, block always 1 MB.
+    int cm_a_bits = 22, cm_b_bits = 18;
+    if (p0 == 7u) {
+        const auto bsr = [](std::uint64_t v) -> unsigned {
+            unsigned e = 0; while (v >>= 1) ++e; return e;
+        };
+        std::uint64_t avail = (budget > 0x1a00000ull) ? (budget - 0x1a00000ull) : 0ull;
+        if (avail < 0x500000ull) avail = 0x500000ull;
+        std::uint64_t w = avail >> 2u;
+        const bool input_bound = (w > per);
+        if (input_bound) w = (per >= 0x100000ull) ? per : 0x100000ull;
+        if (w > 0x80000000ull) w = 0x80000000ull;
+        if (avail < w) w = avail;
+        const std::uint64_t rem = avail - w;
+        unsigned a = bsr(rem);
+        if (a < 20u) a = 20u;
+        if (a > 35u) a = 35u;
+        std::uint64_t sa = 1ull << a;
+        if (sa > rem) sa = rem;
+        const std::uint64_t rem2 = rem - sa;
+        unsigned b = bsr(rem2 >> 2u);
+        if (b < 18u) b = 18u;
+        if (b > 33u) b = 33u;
+        const std::uint64_t sb = 4ull << b;
+        cm_a_bits = static_cast<int>(a);
+        cm_b_bits = static_cast<int>(b);
+        const std::uint64_t chosen = input_bound ? w : (avail - sa - sb);
+        window = LegacyByteFloatDecode(LegacyByteFloatEncode(chosen));
+        if (window < 0x10000u) window = 0x10000u;
+    }
+
+    // `s` (simulate) is `a` with the bytes thrown away: the original runs the
+    // whole compression and reports what it WOULD have produced, so the encoder
+    // below is untouched and only its sink changes. Nothing is created on disk,
+    // not even the parent directory.
+    const bool simulate = (options.command == Command::kSimulate);
+    // It has to COUNT, not just swallow: the footer reports what the archive
+    // would have been, and it reads that off tellp().
+    struct DiscardBuf : std::streambuf {
+        std::streamoff n = 0;
+        int_type overflow(int_type c) override { if (c != traits_type::eof()) ++n; return c; }
+        std::streamsize xsputn(const char*, std::streamsize k) override { n += k; return k; }
+        pos_type seekoff(off_type, std::ios_base::seekdir, std::ios_base::openmode) override {
+            return pos_type(n);
+        }
+    } discard_buf;
+    std::ostream discard(&discard_buf);
+    const fs::path out_path = ResolveArchivePath(options);
+    // An archive that already exists is not touched until its replacement is
+    // complete: the new one is written next to it and renamed over it at the
+    // end. Truncating it first meant that a compressor declining halfway (or a
+    // write error) deleted the old archive and left nothing in its place --
+    // `a -r old.nz folder` lost old.nz whenever -co could not write the folder.
+    // It also keeps the old archive readable when the scan picked it up as an
+    // input (`a -y x.nz` with no file arguments, in x.nz's directory).
+    std::error_code exists_ec;
+    const bool replace_existing = !simulate && fs::exists(out_path, exists_ec);
+    // Over an existing archive the original asks first, the same question `x`
+    // asks per file (quirk 3), right after the `Archive:` line (measured through a
+    // pty): the status line is cleared once, then '\r' and the question; the
+    // answer is a line whose first character must be a lowercase y, n or a
+    // (anything else, uppercase and an empty line included, asks again with just
+    // '\r' and the question); `n` prints `Cannot open archive!` and leaves the
+    // archive alone. End of input counts as No, as in `x` -- the original would
+    // ask forever there. -y skips the question.
+    bool archive_line_printed = false;
+    if (replace_existing && !options.yes_to_all) {
+        os << "Archive: " << options.archive_path << '\n';
+        archive_line_printed = true;
+        ClearStatusLine(os);
+        bool go = false, answered = false;
+        for (;;) {
+            os << '\r' << "Overwrite " << progress::Name40(options.archive_path) << " (Yes/No/Always)? ";
+            os.flush();
+            std::string answer;
+            if (!std::getline(std::cin, answer)) break;
+            answered = true;
+            const char k = answer.empty() ? '\0' : answer[0];
+            if (k == 'y' || k == 'a') { go = true; break; }
+            if (k == 'n') break;
+        }
+        if (!go) {
+            if (!answered) os << '\n';
+            os << "Cannot open archive!\n";
+            return 1;
+        }
+    }
+    const fs::path write_path = replace_existing ? fs::path(out_path.native() + fs::path(".nzre-part").native())
+                                                 : out_path;
+    std::ofstream file_out;
+    if (!simulate) {
+        if (out_path.has_parent_path()) MakeDirs0700(out_path.parent_path());
+        file_out.open(write_path, std::ios::binary | std::ios::trunc);
+        if (!file_out) { os << "Cannot open output archive for writing: " << out_path.string() << '\n'; return 1; }
+    }
+    const auto discard_output = [&]() {
+        if (simulate) return;
+        file_out.close();
+        std::error_code ec;
+        fs::remove(write_path, ec);
+    };
+    std::ostream& out = simulate ? discard : static_cast<std::ostream&>(file_out);
+    // `w32c` writes the Windows self-extractor stub first and the ordinary
+    // archive after it -- measured byte for byte: the original's output is
+    // `nz_w32c.sfx` verbatim followed by exactly the archive `a` would write,
+    // and the footer counts both (22 000 -> 123 002 = 122 880 + 122).
+    if (options.command == Command::kW32c) {
+        const fs::path stub = ExecutableDir() / "nz_w32c.sfx";
+        std::ifstream sfx(stub, std::ios::binary);
+        if (!sfx) {
+            // Measured on the original with the stub removed: this line, nothing
+            // written, and it still exits 0.
+            ClearStatusLine(os);
+            os << "Cannot open: " << stub.string() << '\n';
+            discard_output();
+            return 1;
+        }
+        char buf[1 << 16];
+        while (sfx) {
+            sfx.read(buf, sizeof buf);
+            const std::streamsize got = sfx.gcount();
+            if (got > 0) out.write(buf, got);
+        }
+    }
+    // -co block: FUN_0804cec0, 0x0804d63a .. 0x0804d787. Two reserves are taken
+    // off the budget on top of a flat 1 MB, the rest is split five ways with the
+    // window, and the result is rounded to a byte-float and then stepped once.
+    // Validated against the original on a grid of inputs (0.75 MB .. 48 MB, plus
+    // deliberately non-representable sizes) crossed with budgets of 4 .. 512 MB.
+    // -cc does not share it: 0x0804d173 hands FUN_0804c9f0 a flat 0x100000, so
+    // the CM's block is always 1 MB. It agrees with the formula below on every
+    // input up to a megabyte (the 1 MB floor), which is why only a 1.1 MB file
+    // showed the difference -- one byte of the parameter record.
+    std::uint32_t co_block = 0x100000u;
+    if (p0 == 5u || p0 == 6u) {
+        const std::uint64_t w = window_raw;                      // NOT floored to 64 KB
+        const std::uint32_t wm1 = static_cast<std::uint32_t>(w - 1u);   // w == 0 -> 0xffffffff
+        unsigned e = 31u; while (e != 0u && ((wm1 >> e) & 1u) == 0u) --e;   // bsr
+        const std::uint64_t h1 = 4ull << (e > 3u ? e - 3u : 0u);
+        const std::uint64_t w32 = w >> 5u;
+        const std::uint64_t u2 = (w32 > 0x7ffffull) ? (w32 - 1u) : 0x7ffffull;
+        unsigned e2 = 63u; while (e2 != 0u && ((u2 >> e2) & 1u) == 0u) --e2;
+        const std::uint64_t h2 = 4ull << (e2 + 1u);
+        const std::uint64_t over = (budget > (16ull << 20u)) ? budget - (16ull << 20u) : 0ull;
+        const std::uint64_t sub = (1ull << 20u) + h1 + h2;
+        const std::uint64_t a = (over > sub) ? over - sub : 0ull;     // the sign mask at 0x0804d715
+        // 64-bit UNSIGNED: when the reserves leave less than one window, this
+        // wraps to something astronomical and the input below is what caps it.
+        const std::uint64_t num = a - w;
+        std::uint64_t b = std::min<std::uint64_t>(num / 5ull, per);
+        if (b < (1ull << 20u)) b = 1ull << 20u;                       // 0x0804d769
+        b = LegacyByteFloatDecode(LegacyByteFloatEncode(b));          // 0x0804d778
+        // 0x0804d486: only a block below the input AND below 16 MB is stepped up.
+        if (b < per && b <= 0xffffffull) b = LegacyByteFloatDecode(LegacyByteFloatEncode(b) + 1u);
+        co_block = static_cast<std::uint32_t>(b);
+    }
+    // A compressor that cannot yet write some block shape declines mid-stream.
+    // Leaving the prologue on disk turns a refusal into an archive that reads
+    // as "Data corrupted while reading headers!", so remove the partial file
+    // and say plainly what happened.
+    const auto decline = [&]() -> int {
+        discard_output();
+        os << "This compressor cannot yet write this input; no archive was created.\n";
+        return 1;
+    };
+    EncodeCodec header_codec; header_codec.p0 = p0; header_codec.co_block = co_block;
+    header_codec.cm_a_bits = cm_a_bits; header_codec.cm_b_bits = cm_b_bits;
+    PrintStoreEncodeHeader(os, options, workers, window, header_codec, archive_line_printed);
+    // one codec state per worker stream (the original's workers own their windows)
+    std::vector<EncodeCodec> codecs(workers);
+    for (EncodeCodec& c : codecs) { c.p0 = p0; c.co_block = co_block;
+                                    c.cm_a_bits = cm_a_bits; c.cm_b_bits = cm_b_bits; }
+    EncodeStatus status(workers);
+    std::uint64_t read_ms = 0, write_ms = 0;
+    const auto timed_write = [&](const std::vector<unsigned char>& v) {
+        const auto t0 = std::chrono::steady_clock::now();
+        out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(v.size()));
+        out.flush();
+        write_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+    };
+
+    static const char kSig[] = "NanoZip 0.09 alpha";
+    WriteLegacyRecord(out, 14u, 0u, reinterpret_cast<const unsigned char*>(kSig), sizeof(kSig) - 1u);
+    const unsigned char nine = 0x09u;
+    WriteLegacyRecord(out, 30u, 0u, &nine, 1u);
+
+    std::vector<std::uint64_t> start(sources.size(), 0u);
+    { std::uint64_t pos = 0; for (std::size_t i = 0; i < sources.size(); ++i) { start[i] = pos; pos += sources[i].size; } }
+    auto range_of = [&](unsigned k) -> std::pair<std::uint64_t, std::uint64_t> {
+        const std::uint64_t b = static_cast<std::uint64_t>(k) * per;
+        const std::uint64_t e = (k + 1u == workers) ? total : b + per;
+        return {b, e};
+    };
+    for (unsigned k = 0; k < workers; ++k) { const auto r = range_of(k); status.total[k] = r.second - r.first; }
+    // The worker streams are independent, so with more than one thread they are
+    // compressed concurrently and written in the SAME order as below, which keeps
+    // the archive byte-identical to the one-thread run. The pool is T = min(-t,
+    // host) threads, at most one per worker; NZ_THREADS may set it (tests and
+    // timings). The worker COUNT never follows it -- that changes the archive.
+    // The store gains nothing (it is I/O), and total == 0 has its own order.
+    unsigned pool = 1u;
+    {
+        const unsigned host = HostThreadCount();
+        unsigned T = host;
+        if (options.threads > 0u && options.threads < host) T = options.threads;
+        if (const char* e = NZ_ENV("NZ_THREADS")) { const int v = std::atoi(e); if (v > 0) T = static_cast<unsigned>(v); }
+        pool = std::min<unsigned>(T, workers);
+    }
+    if (workers > 1u && pool > 1u && total != 0u && p0 != 0u) {
+        if (!RunWorkersConcurrently(workers, pool, range_of, sources, start, window, ckmode, options, os, status,
+                                    &read_ms, codecs, timed_write))
+            return decline();
+    } else if (workers == 1u) {
+        std::vector<unsigned char> body;
+        // the per-block writes are timed whole and turned into milliseconds once
+        // (one truncation, as when the stream was written in one piece)
+        std::chrono::steady_clock::duration drained{};
+        const std::function<void(const unsigned char*, std::size_t)> drain = [&](const unsigned char* d, std::size_t n) {
+            const auto t0 = std::chrono::steady_clock::now();
+            out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(n));
+            drained += std::chrono::steady_clock::now() - t0;
+        };
+        if (!LegacyWriteStoreStream(body, 0u, sources, start, 0u, total, window, ckmode, options, true, true, os, status, &read_ms, codecs[0], nullptr, &drain)) return decline();
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+            out.flush();
+            drained += std::chrono::steady_clock::now() - t0;
+            write_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(drained).count());
+        }
+    } else {
+        std::vector<unsigned char> body;
+        // One stream after another (issue #2 item 6): each goes to the file block
+        // by block through `drain`, as the single-stream writer does, instead of
+        // whole; and its engines are released once it is out, as the concurrent
+        // path does -- only `expected` (the self-check's) is kept. With eight
+        // streams of -cF that was eight 64 MB hash tables alive at the end.
+        std::chrono::steady_clock::duration drained{};
+        const std::function<void(const unsigned char*, std::size_t)> drain = [&](const unsigned char* d, std::size_t n) {
+            const auto t0 = std::chrono::steady_clock::now();
+            out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(n));
+            drained += std::chrono::steady_clock::now() - t0;
+        };
+        const auto finish_stream = [&](unsigned k) {
+            drain(body.data(), body.size());
+            body.clear();
+            codecs[k].ReleaseEngines();
+        };
+        // the last worker's header first
+        {
+            const auto r = range_of(workers - 1u);
+            std::vector<unsigned char> h;
+            if (!LegacyWriteStoreStream(h, workers - 1u, sources, start, r.first, r.first, window, ckmode, options, true, false, os, status, &read_ms, codecs[workers - 1u])) return decline();
+            // LegacyWriteStoreStream with an empty range writes header + one empty block; keep the header only
+            std::vector<unsigned char> hdr_only;
+            LegacyWriteStreamHeader(hdr_only, workers - 1u, window, ckmode, codecs[workers - 1u]);
+            timed_write(hdr_only);
+        }
+        for (unsigned k = 1u; k < workers; ++k) {
+            const auto r = range_of(k);
+            body.clear();
+            // With nothing to store at all (only 0-byte files) the last worker's
+            // block -- table, stamps, checksums, an empty DATA -- comes AFTER
+            // every header, worker 0's included (measured with -p2 and -p3).
+            if (k == workers - 1u && total == 0u) continue;
+            if (!LegacyWriteStoreStream(body, k, sources, start, r.first, r.second, window, ckmode, options, k != workers - 1u, k == workers - 1u, os, status, &read_ms, codecs[k], nullptr, &drain)) return decline();
+            finish_stream(k);
+        }
+        {
+            const auto r = range_of(0u);
+            body.clear();
+            if (!LegacyWriteStoreStream(body, 0u, sources, start, r.first, r.second, window, ckmode, options, true, false, os, status, &read_ms, codecs[0], nullptr, &drain)) return decline();
+            finish_stream(0u);
+        }
+        if (total == 0u) {
+            const auto r = range_of(workers - 1u);
+            body.clear();
+            if (!LegacyWriteStoreStream(body, workers - 1u, sources, start, r.first, r.second, window, ckmode, options, false, true, os, status, &read_ms, codecs[workers - 1u], nullptr, &drain)) return decline();
+            finish_stream(workers - 1u);
+        }
+        out.flush();
+        write_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(drained).count());
+    }
+    if (!out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
+    const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
+    out.flush();
+    // The footer reports the compression, as the original's does, so its time is
+    // taken before the self-check.
+    const std::uint64_t total_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - add_start).count());
+    SelfCheckOutcome check;
+    if (!simulate) {
+        file_out.close();
+        if (!file_out) { discard_output(); os << "Error: write failure while building archive.\n"; return 1; }
+        // The engines are done; their memory goes back before the archive is read
+        // (the -cc model alone is the size of the decoder's).
+        std::vector<nzr::selfcheck::Item> expected;
+        for (EncodeCodec& c : codecs) {
+            expected.insert(expected.end(), std::make_move_iterator(c.expected.begin()),
+                            std::make_move_iterator(c.expected.end()));
+            if (c.cc != nullptr) { NzCmDestroy(c.cc); c.cc = nullptr; }
+        }
+        codecs.clear();
+        codecs.shrink_to_fit();
+        // Tests only: the damage is done with the check off too, so a test can
+        // prove the archive really is broken before counting the check's verdict.
+        SelfCheckInjectFault(write_path, expected);
+        // NZ_NO_SELFCHECK=1 skips it (timings against the original, for one).
+        if (NZ_ENV("NZ_NO_SELFCHECK") == nullptr) {
+            const auto t0 = std::chrono::steady_clock::now();
+            check = SelfCheckWrittenArchive(write_path, options, expected);
+            if (NZ_ENV("NZ_TRACE_SELFCHECK")) {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "[selfcheck] %s entries=%zu bytes=%llu items=%zu ms=%lld%s%s\n",
+                             check.verdict == SelfCheckOutcome::kOk ? "ok" : check.verdict == SelfCheckOutcome::kFailed ? "FAILED" : "skipped",
+                             check.entries, static_cast<unsigned long long>(check.bytes), expected.size(),
+                             static_cast<long long>(ms), check.reason.empty() ? "" : ": ", check.reason.c_str());
+            }
+            if (check.verdict == SelfCheckOutcome::kFailed) {
+                // What this port wrote does not read back: nothing is left behind
+                // (an archive it was replacing stays as it was).
+                discard_output();
+                ClearStatusLine(os);
+                os << "Self-check failed: the archive does not read back (" << check.reason << "); no archive was created.\n";
+                return 1;
+            }
+        }
+    }
+    if (replace_existing) {
+        std::error_code ec;
+        fs::rename(write_path, out_path, ec);
+        if (ec) {   // a rename that will not replace an existing file (some Windows runtimes)
+            std::error_code rm;
+            fs::remove(out_path, rm);
+            ec.clear();
+            fs::rename(write_path, out_path, ec);
+        }
+        if (ec) {
+            os << "Cannot write: " << out_path.string() << '\n';
+            return 1;
+        }
+    }
+    PrintStoreEncodeFooter(os, stored, produced, total_ms, read_ms, write_ms, options.verbose);
+    // Too big to read back here (a 32-bit build's address space, for one): the
+    // archive is kept, and the reader is told it was not checked.
+    if (check.verdict == SelfCheckOutcome::kSkipped)
+        os << "Note: the archive was not checked (" << check.reason << ").\n";
+    return 0;
+}
+
+// The original's file scan and sort, for every compressor: patterns matched
+// with readdir + fnmatch, "No files found with <arg>" for an argument that
+// matched nothing, -x exclusions, -sp, then the -s<mode> merge sort.
+std::vector<EncodeSource> CollectEncodeSources(const CliOptions& options, std::ostream& os) {
+    std::vector<EncodeSource> found;
+    for (const std::string& arg : options.positional) {
+        const std::size_t before = found.size();
+        LegacyScanArgument(arg, options.recurse, &found);
+        if (found.size() == before) os << "No files found with " << arg << '\n';
+    }
+    // -x is matched against the path as scanned (`-xb.bin` does not exclude
+    // `./b.bin` under `-r .`; `-x*.dat` does exclude `sub/c.dat`), and an
+    // excluded file is not dropped here: it becomes a ghost the reader reports.
+    for (EncodeSource& e : found) if (IsExcluded(e.display, options.exclude_patterns)) e.ghost = true;
+    if (options.strip_paths) for (EncodeSource& e : found) e.archive_name = NativeBytesFromPath(PathFromNativeBytes(e.archive_name).filename());
+    if (options.sort_mode != 0u) LegacyMergeSort(&found, options.sort_mode);
+    return found;
+}
+
+// Which compressors RunAdd can actually write. `s` shares the dispatch, so it
+// only falls back to the estimate for the ones that cannot encode yet.
+bool RunAddCanEncode(const CliOptions& options) {
+    switch (options.compressor) {
+        case Compressor::kNone: case Compressor::kLzpf: case Compressor::kLzpfLarge:
+        case Compressor::kLzhd: case Compressor::kLzhds: case Compressor::kOptimum1:
+        case Compressor::kOptimum2: case Compressor::kCm:
+            return true;
+        default: return false;
+    }
+}
+
+int RunAdd(const CliOptions& options, std::ostream& os) {
+    const auto add_start = std::chrono::steady_clock::now();
+    std::vector<EncodeSource> found = CollectEncodeSources(options, os);
+    if (found.empty()) { os << "Nothing to do (no files found).\n"; return 1; }
+    if (options.compressor == Compressor::kNone) return RunAddStoreContainer(options, std::move(found), os, add_start, 0u);
+    if (options.compressor == Compressor::kLzpf) return RunAddStoreContainer(options, std::move(found), os, add_start, 1u);
+    if (options.compressor == Compressor::kLzpfLarge) return RunAddStoreContainer(options, std::move(found), os, add_start, 2u);
+    if (options.compressor == Compressor::kLzhd) return RunAddStoreContainer(options, std::move(found), os, add_start, 3u);
+    if (options.compressor == Compressor::kLzhds) return RunAddStoreContainer(options, std::move(found), os, add_start, 4u);
+    // -co at any budget. The window and block rules were read out of
+    // FUN_0804cec0 and validated against the original on a grid of inputs and
+    // budgets; see RunAddStoreContainer. The 16 MB gate that used to sit here
+    // made the plainest invocation a user can type (`nz a out.nz file`, no
+    // switches) refuse outright, which was the most visible 1:1 divergence left.
+    if (options.compressor == Compressor::kOptimum1)
+        return RunAddStoreContainer(options, std::move(found), os, add_start, 5u);
+    // -cO: the same driver with the large engine in the LZ slot -- every other
+    // stage of the block (the detector, the text transforms, param1/2/14/15,
+    // dece, the BWT bucket coder, the framing) is the one the two share.
+    if (options.compressor == Compressor::kOptimum2)
+        return RunAddStoreContainer(options, std::move(found), os, add_start, 6u);
+    // -cc: the same driver again, with the CM in the LZ slot and no BWT at all.
+    if (options.compressor == Compressor::kCm)
+        return RunAddStoreContainer(options, std::move(found), os, add_start, 7u);
+    // Nothing left that can reach here today; kept for a compressor added later. The decode phase's stub
+    // writer labelled raw bytes with the codec's byte, an archive the original
+    // cannot decode ("code 1024" on a -cD one); nothing is better.
+    os << "nanozip-re: this compressor is not implemented yet (decode only); use -cn, -cf, -cF, -cd, -co or -cO.\n";
+    return 1;
+    {
+        std::vector<SourceFile> sources;
+        for (const EncodeSource& e : found) {
+            SourceFile sf;
+            sf.source_path = e.fs_path; sf.archive_name = e.archive_name; sf.size = e.size;
+            sf.permissions = e.mode; sf.mtime_unix = e.mtime;
+            if (options.checksum != ChecksumMode::kNone) ComputeFileChecksum(e.fs_path, options.checksum, &sf.checksum);
+            sources.push_back(std::move(sf));
+        }
+        std::ostringstream native_log;
+        const int native_exit = RunAddNativeLegacyStream(options, sources, native_log);
+        os << native_log.str();
+        return native_exit;
+    }
+    const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
+
+    std::vector<SourceFile> sources;
+    std::vector<std::string> warnings;
+    std::string error;
+
+    const bool need_checksums = (options.checksum != ChecksumMode::kNone);
+    if (!BuildSourceList(options, &sources, &warnings, &error, need_checksums)) {
+        for (const std::string& w : warnings) PrintCollectorLine(os, w);
+        if (error.rfind("Nothing to do", 0) == 0) os << error << '\n';
+        else os << "Error: " << error << '\n';
+        return 1;
+    }
+
+    for (const std::string& w : warnings) PrintCollectorLine(os, w);
+
+    if (native_legacy_stream) {
+        std::ostringstream native_log;
+        const int native_exit = RunAddNativeLegacyStream(options, sources, native_log);
+        if (native_exit == 0) {
+            os << native_log.str();
+            return 0;
+        }
+
+
+        os << native_log.str();
+        return native_exit;
+    }
+
+    if (options.compressor != Compressor::kNone) {
+        os << "Warning: compressor " << CompressorToString(options.compressor)
+           << " is not reconstructed; data will be stored without compression.\n";
+    }
+
+    const fs::path out_path = ResolveArchivePath(options);
+    std::error_code ec;
+    if (out_path.has_parent_path()) {
+        MakeDirs0700(out_path.parent_path());
+    }
+
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        os << "Cannot open output archive for writing: " << out_path.string() << '\n';
+        return 1;
+    }
+
+    // Header: [magic][signature][marker][fmt][flags][checksum][compressor][reserved]
+    out.write(reinterpret_cast<const char*>(kMagicPrefix.data()), static_cast<std::streamsize>(kMagicPrefix.size()));
+    out.write(kKnownSignature, static_cast<std::streamsize>(kKnownSignatureBytes));
+    out.write(kReconMarker.data(), static_cast<std::streamsize>(kReconMarker.size()));
+
+    WriteLE<std::uint8_t>(out, kReconFormatMajor);
+    WriteLE<std::uint8_t>(out, kReconFormatMinor);
+
+    std::uint8_t flags = 0;
+    if (!options.no_timestamps) {
+        flags |= kFlagHasTimestamps;
+    }
+    if (!options.no_permissions) {
+        flags |= kFlagHasPermissions;
+    }
+
+    WriteLE<std::uint8_t>(out, flags);
+    WriteLE<std::uint8_t>(out, static_cast<std::uint8_t>(options.checksum));
+    WriteLE<std::uint8_t>(out, static_cast<std::uint8_t>(options.compressor));
+    WriteLE<std::uint8_t>(out, 0);
+    WriteLE<std::uint16_t>(out, 0);
+    WriteLE<std::uint32_t>(out, static_cast<std::uint32_t>(sources.size()));
+
+    for (const SourceFile& src : sources) {
+        if (src.archive_name.size() > 0xffffu) {
+            os << "Error: file name too long for archive: " << src.archive_name << '\n';
+            return 1;
+        }
+
+        WriteLE<std::uint16_t>(out, static_cast<std::uint16_t>(src.archive_name.size()));
+        out.write(src.archive_name.data(), static_cast<std::streamsize>(src.archive_name.size()));
+
+        WriteLE<std::uint64_t>(out, src.size);
+        WriteLE<std::uint64_t>(out, src.size);
+        WriteLE<std::uint32_t>(out, src.permissions);
+        WriteLE<std::int64_t>(out, src.mtime_unix);
+        WriteLE<std::uint32_t>(out, src.checksum);
+        WriteLE<std::uint8_t>(out, 0);
+
+        static constexpr std::array<char, 7> kEntryReserved = {0, 0, 0, 0, 0, 0, 0};
+        out.write(kEntryReserved.data(), static_cast<std::streamsize>(kEntryReserved.size()));
+    }
+
+    std::vector<char> buffer(kBufferSize);
+    std::uint64_t total_bytes = 0;
+
+    for (const SourceFile& src : sources) {
+        std::ifstream input(src.source_path, std::ios::binary);
+        if (!input) {
+            os << "Error: cannot read input file: " << src.source_path.string() << '\n';
+            return 1;
+        }
+
+        while (input) {
+            input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize got = input.gcount();
+            if (got <= 0) {
+                break;
+            }
+            out.write(buffer.data(), got);
+            if (!out) {
+                os << "Error: write failure while building archive.\n";
+                return 1;
+            }
+            total_bytes += static_cast<std::uint64_t>(got);
+        }
+    }
+
+    PrintEncodeHeader(os, out_path.string(), CompressorToString(options.compressor),
+                      /*engine_bytes=*/0u, /*memory_mb=*/512u, /*read_mb=*/20u,
+                      /*write_mb=*/4u, options.verbose);
+    for (const auto& src : sources) {
+        PrintFileProgress(os, src.archive_name, "100%");
+    }
+    {
+        // Take the produced size from the stream itself and flush first: reading the
+        // path before the ofstream is closed reports 0.
+        const std::uint64_t produced = static_cast<std::uint64_t>(std::max<std::streamoff>(0, out.tellp()));
+        out.flush();
+        PrintEncodeFooter(os, total_bytes, produced, ElapsedSince(add_start), options.verbose);
+    }
+    return 0;
+}
+
+int RunSimulate(const CliOptions& options, std::ostream& os) {
+    // The original's `s` IS `a` with the output discarded -- same banner, same
+    // per-file progress, same "Compressed N into M" footer -- so route it
+    // through the same encoder rather than estimating anything. RunAdd's writer
+    // swaps its sink when options.command is kSimulate.
+    if (RunAddCanEncode(options)) return RunAdd(options, os);
+    const bool native_legacy_stream = IsNativeLegacyCompressionAvailable(options);
+
+    std::vector<SourceFile> sources;
+    std::vector<std::string> warnings;
+    std::string error;
+
+    if (!BuildSourceList(options, &sources, &warnings, &error, false)) {
+        for (const std::string& w : warnings) PrintCollectorLine(os, w);
+        if (error.rfind("Nothing to do", 0) == 0) os << error << '\n';
+        else os << "Error: " << error << '\n';
+        return 1;
+    }
+
+    for (const std::string& w : warnings) PrintCollectorLine(os, w);
+
+    if (native_legacy_stream) {
+        std::ostringstream native_log;
+        const int native_exit = RunSimulateNativeLegacyStream(options, sources, native_log);
+        if (native_exit == 0) {
+            os << native_log.str();
+            return 0;
+        }
+
+
+        os << native_log.str();
+        return native_exit;
+    }
+
+    std::uint64_t total_input = 0;
+    std::uint64_t estimated_overhead = 2 + kKnownSignatureBytes + 4 + 1 + 1 + 1 + 1 + 1 + 2 + 4;
+
+    for (const SourceFile& src : sources) {
+        total_input += src.size;
+        estimated_overhead += 2 + static_cast<std::uint64_t>(src.archive_name.size()) + 8 + 8 + 4 + 8 + 4 + 1 + 7;
+        if (options.verbose) {
+            os << "simulate " << src.archive_name << " (" << src.size << " bytes)\n";
+        }
+    }
+
+    os << "Simulation mode (no output written)\n";
+    os << "Compressor: " << CompressorToString(options.compressor) << '\n';
+    if (options.compressor != Compressor::kNone) {
+        os << "Note: compression engines are not fully reconstructed; ratio estimate uses store-mode baseline.\n";
+    }
+    os << "Files    : " << sources.size() << '\n';
+    os << "Input    : " << total_input << " bytes\n";
+    os << "Estimate : " << (total_input + estimated_overhead) << " bytes\n";
+    return 0;
+}
+
+// The line under "Archive:" when an archive cannot be used: the original's own
+// probe verdict for a file that exists but is not a 0.09 archive, else the
+// opener's message ("Cannot open archive!").
+static std::string LegacyOpenFailureMessage(ArchiveOpenError open_error, const std::string& path,
+                                            const std::string& legacy_error, const std::string& error) {
+    if (open_error == ArchiveOpenError::kCannotOpen) return error;
+    const std::string probe = LegacyProbeMessage(path);
+    if (!probe.empty()) return probe;
+    return legacy_error.empty() ? error : legacy_error;
+}
+
+void SetDecodeThreads(unsigned n) { g_decode_threads = n; NzBwtSetThreadCount(n); }
+
+int RunList(const CliOptions& options, std::ostream& os) {
+    ArchiveContext context;
+    std::string error;
+    const ArchiveOpenError open_error = OpenArchive(options.archive_path, &context, &error);
+    if (open_error != ArchiveOpenError::kNone) {
+        std::string legacy_error;
+        // Anything that exists but is not this port's own container may be a
+        // legacy archive -- including a self-extracting .exe, whose first bytes
+        // are the PE stub's, not the archive magic.
+        if (open_error != ArchiveOpenError::kCannotOpen) {
+            LegacyCnContext legacy_cn;
+            if (TryParseLegacyCnArchive(options.archive_path, &legacy_cn, &legacy_error)) {
+                return RunLegacyCnList(options, legacy_cn, os);
+            }
+
+        }
+        // Measured: `l` on a missing or foreign file prints the archive line, the
+        // reason, and an empty total.
+        os << "Archive: " << options.archive_path << '\n';
+        os << LegacyOpenFailureMessage(open_error, options.archive_path, legacy_error, error) << '\n';
+        os << "Total of 0 files, 0 bytes.\n";
+        return 1;
+    }
+
+    const bool has_checksum = context.header.checksum != ChecksumMode::kNone;
+
+    os << "Archive: " << context.archive_path << '\n';
+    if (has_checksum) {
+        os << "checksum ";
+    }
+    os << "perm yyyy-mmm-dd hh:mm:ss     size  file\n";
+
+    std::uint64_t total_size = 0;
+    std::size_t total_files = 0;
+
+    for (const ArchiveEntry& e : context.entries) {
+        if (!MatchesAnyPattern(e.path, options.positional)) {
+            continue;
+        }
+
+        if (has_checksum) {
+            os << std::setw(8) << std::left << FormatChecksum(context.header.checksum, e.checksum) << ' ';
+        }
+
+        os << std::setw(4) << std::right << FormatMode(e.permissions) << ' '
+           << FormatMtimeStored(e.mtime_unix)
+           << FormatSizeColumn(e.original_size) << "  "
+           << e.path << '\n';
+
+        total_size += e.original_size;
+        ++total_files;
+    }
+
+    os << "Total of " << total_files << " files, " << FormatGrouped(total_size) << " bytes.\n";
+    return 0;
+}
+
+int RunExtractOrTest(const CliOptions& options, bool test_mode, std::ostream& os) {
+    const auto run_start = std::chrono::steady_clock::now();
+    // The inverse BWT's own thread pool follows the same -t / NZ_THREADS / CPU
+    // count rule as the stream workers.
+    NzBwtSetThreadCount(DecodeThreadCount());
+    ArchiveContext context;
+    std::string error;
+    const ArchiveOpenError open_error = OpenArchive(options.archive_path, &context, &error);
+    if (open_error != ArchiveOpenError::kNone) {
+        std::string legacy_error;
+        // Anything that exists but is not this port's own container may be a
+        // legacy archive -- including a self-extracting .exe, whose first bytes
+        // are the PE stub's, not the archive magic.
+        if (open_error != ArchiveOpenError::kCannotOpen) {
+            LegacyCnContext legacy_cn;
+            bool parsed = false;
+            // Header first, decode second -- the original streams, so a failing
+            // archive still shows "Archive:", "Threads:" and the compressor line.
+            // Parts of the decode run inside the parser, so the header printer is
+            // registered with the progress engine and fired by the first progress
+            // tick (from the parser's snapshot) or explicitly after the parse.
+            psink::Configure(options, test_mode, os,
+                             options.output_path.empty() ? fs::current_path() : PathFromNativeBytes(options.output_path));
+            struct SinkEnd { ~SinkEnd() { psink::Reset(); } } sink_end;
+            progress::Begin(&os, [&](std::ostream& o) {
+                const LegacyCnContext& c = parsed ? legacy_cn : progress::Snapshot();
+                progress::SetCompressorLine([&](std::size_t k) {
+                    const LegacyCnContext& cc = parsed ? legacy_cn : progress::Snapshot();
+                    return FormatCompressorLine(cc, k, options.verbose, test_mode);
+                });
+                PrintDecodeHeader(o, c, options, test_mode);
+                progress::HeaderPrinted(!c.parallel_p1.empty(),
+                                        c.entries.empty() ? std::string() : c.entries.front().path);
+            });
+            struct ProgressEnd { ~ProgressEnd() { progress::End(); } } progress_end;
+            if (TryParseLegacyCnArchive(options.archive_path, &legacy_cn, &legacy_error)) {
+                parsed = true;
+                progress::EnsureHeader();
+                const int legacy_rc = RunLegacyCnExtractOrTest(options, legacy_cn, test_mode, os, run_start);
+                if (legacy_rc != kLegacyNeedCompat) {
+                    return legacy_rc;
+                }
+
+                // Measured: an undecodable payload is "Archive corrupted. Error
+                // decoding (code 100)"; one cut off before its end is code 25600.
+                AdoptDecodeError(legacy_cn);
+                const int corrupt_rc = PrintCorruptLine(os, legacy_cn);
+                if (NativeTrace()) {
+                    os << "[native] no native decoder accepted this stream; payload mode: "
+                       << LegacyPayloadModeLabel(legacy_cn.payload_mode) << '\n';
+                }
+                return corrupt_rc;   // 2: damaged / undecodable content; 255: the original's fatal path
+            }
+
+        }
+        os << "Archive: " << options.archive_path << '\n';
+        os << LegacyOpenFailureMessage(open_error, options.archive_path, legacy_error, error) << '\n';
+        return 1;
+    }
+
+    std::ifstream in(context.archive_path, std::ios::binary);
+    if (!in) {
+        os << "Cannot open archive!\n";
+        return 1;
+    }
+    in.seekg(static_cast<std::streamoff>(context.data_offset), std::ios::beg);
+
+    const fs::path output_root = options.output_path.empty() ? fs::current_path() : PathFromNativeBytes(options.output_path);
+
+    std::size_t processed = 0;
+    std::size_t failed = 0;
+    std::uint64_t bytes_ok = 0;
+
+    for (const ArchiveEntry& entry : context.entries) {
+        const bool selected = MatchesAnyPattern(entry.path, options.positional);
+        fs::path safe_rel;
+        fs::path out_path;
+        std::ofstream out;
+
+        if (!selected) {
+            if (!SkipBytes(in, entry.stored_size)) {
+                os << "Data corrupted while reading headers!\n";
+                return 2;
+            }
+            continue;
+        }
+
+        if (!test_mode) {
+            safe_rel = SanitizeExtractPath(entry.path);
+            if (safe_rel.empty()) {
+                os << "Skipping unsafe path in archive: " << entry.path << '\n';
+                ++failed;
+                if (!SkipBytes(in, entry.stored_size)) {
+                    os << "Data corrupted while reading headers!\n";
+                    return 2;
+                }
+                continue;
+            }
+
+            out_path = output_root / safe_rel;
+            std::error_code ec;
+            if (out_path.has_parent_path()) {
+                MakeDirs0700(out_path.parent_path());
+            }
+            out.open(out_path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                os << "Cannot write output file: " << out_path.string() << '\n';
+                ++failed;
+                if (!SkipBytes(in, entry.stored_size)) {
+                    os << "Data corrupted while reading headers!\n";
+                    return 2;
+                }
+                continue;
+            }
+        }
+
+        std::uint32_t calculated = 0;
+        if (!CopyFileData(in,
+                          test_mode ? nullptr : &out,
+                          entry.stored_size,
+                          &calculated,
+                          context.header.checksum)) {
+            os << "Data corrupted while reading file payload: " << entry.path << '\n';
+            ++failed;
+            continue;
+        }
+
+        if (context.header.checksum != ChecksumMode::kNone && calculated != entry.checksum) {
+            os << "Checksum mismatch: " << entry.path << " (expected "
+               << FormatChecksum(context.header.checksum, entry.checksum) << ", got "
+               << FormatChecksum(context.header.checksum, calculated) << ")\n";
+            ++failed;
+            continue;
+        }
+
+        if (!test_mode) {
+            out.close();
+            std::string metadata_warning;
+            const bool metadata_ok = ApplyExtractedMetadata(
+                out_path,
+                context.header.has_permissions,
+                entry.permissions,
+                context.header.has_timestamps,
+                entry.mtime_unix,
+                &metadata_warning);
+            if (!metadata_ok && options.verbose && !metadata_warning.empty()) {
+                os << "Warning: " << metadata_warning << '\n';
+            }
+        }
+
+        ++processed;
+        bytes_ok += entry.original_size;
+
+        if (options.verbose) {
+            os << (test_mode ? "tested " : "extract ") << entry.path << '\n';
+        }
+    }
+
+    if (failed > 0) {
+        ClearStatusLine(os);
+        os << (test_mode ? "Tested " : "Extracted ") << processed << " files, "
+           << FormatGrouped(bytes_ok) << " bytes. Failures: " << failed << ".\n";
+    } else {
+        PrintDecodeFooter(os, bytes_ok, ElapsedSince(run_start));
+    }
+
+    return failed == 0 ? 0 : 2;
+}
+
+int RunInfo(std::ostream& os) {
+    const std::string cpu = ParseProcValue("/proc/cpuinfo", "model name\t:");
+    const std::string mem_total = ParseProcValue("/proc/meminfo", "MemTotal:");
+    const std::string mem_avail = ParseProcValue("/proc/meminfo", "MemAvailable:");
+
+    (void)cpu; (void)mem_total; (void)mem_avail;
+    // `info` in the original prints the banner's host summary line again, then the
+    // CPU identification and its feature list. The identification reads
+    //   CPU "<vendor>" family <f> [ext 0x<extended family>], model <m & 0xf>, stepping <s>
+    // -- measured: this host is family 6, model 79, stepping 1 and the original
+    // prints "family 6 [ext 0x00], model 15, stepping 1", i.e. the model is masked
+    // to its low nibble and the bracketed value is the EXTENDED FAMILY (0 for
+    // family 6), not the extended model.
+    // (the host summary line is already on screen: PrintBanner emits it)
+    // The original reads all of this with CPUID, not /proc (measured: identical
+    // output with /proc/cpuinfo unreadable), so do the same: vendor from leaf 0,
+    // the raw family/model/stepping nibbles and the feature bits from leaf 1,
+    // 3DNow! from extended leaf 0x80000001.
+    std::string vendor; unsigned family = 0, model = 0, step = 0, ext_family = 0; std::string flags;
+    {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (__get_cpuid(0u, &a, &b, &c, &d)) {
+            char v[13]; std::memcpy(v, &b, 4); std::memcpy(v + 4, &d, 4); std::memcpy(v + 8, &c, 4); v[12] = 0; vendor = v;
+        }
+        if (__get_cpuid(1u, &a, &b, &c, &d)) {
+            step = a & 0xfu; model = (a >> 4) & 0xfu; family = (a >> 8) & 0xfu; ext_family = (a >> 20) & 0xffu;
+            if (d & (1u << 23)) flags += " mmx";
+            if (d & (1u << 25)) flags += " sse";
+            if (d & (1u << 26)) flags += " sse2";
+            if (c & (1u << 0))  flags += " pni";
+            if (c & (1u << 9))  flags += " ssse3";
+            if (c & (1u << 19)) flags += " sse4_1";
+            if (c & (1u << 20)) flags += " sse4_2";
+            if (d & (1u << 28)) flags += " ht";
+        }
+        unsigned ea = 0, eb = 0, ec = 0, ed = 0;
+        if (__get_cpuid(0x80000000u, &ea, &eb, &ec, &ed) && ea >= 0x80000001u &&
+            __get_cpuid(0x80000001u, &ea, &eb, &ec, &ed)) {
+            if (ed & (1u << 31)) flags += " 3dnow";
+            if (ed & (1u << 30)) flags += " 3dnowext";
+        }
+        flags += ' ';
+    }
+
+    char idbuf[256];
+    snprintf(idbuf, sizeof(idbuf),
+             "CPU \"%s\" family %u [ext 0x%02x], model %u, stepping %u",
+             vendor.empty() ? "unknown" : vendor.c_str(),
+             family, ext_family, model & 0x0fu, step);
+    os << idbuf << '\n';
+
+    // Feature list, in the original's own order and spelling.
+    static const struct { const char* flag; const char* shown; } kFeat[] = {
+        {"mmx", "MMX"}, {"sse", "SSE1"}, {"sse2", "SSE2"}, {"pni", "SSE3"},
+        {"ssse3", "SSSE3"}, {"sse4_1", "SSE41"}, {"sse4_2", "SSE42"},
+        {"3dnow", "3DNow!"}, {"3dnowext", "3DNow!+"},
+        {"ht", "Hyper-Threading"},
+    };
+    std::string feat;
+    for (const auto& f : kFeat) {
+        const std::string needle = std::string(" ") + f.flag + " ";
+        const std::string hay = std::string(" ") + flags + " ";
+        if (hay.find(needle) != std::string::npos) {
+            if (!feat.empty()) feat += ' ';
+            feat += f.shown;
+        }
+    }
+    os << "CPU-features: " << feat << '\n';
+    return 0;
+}
+
+}  // namespace recon
+}  // namespace nz

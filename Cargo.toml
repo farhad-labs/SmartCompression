@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/smartcomp", "crates/sc-lzma-sys", "crates/sc-zstd-sys", "crates/sc-brotli-sys", "crates/sc-uharc", "crates/sc-nanozip-sys", "crates/sc-precomp-sys"]
+
+# uharc-lifted relies on 32-bit wrapping arithmetic; dependency profiles are
+# ignored, so the workspace root must disable overflow checks everywhere.
+[profile.dev]
+overflow-checks = false
+
+[profile.release]
+overflow-checks = false
+lto = true
+codegen-units = 1

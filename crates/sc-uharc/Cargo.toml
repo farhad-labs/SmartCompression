@@ -1,0 +1,8 @@
+[package]
+name = "sc-uharc"
+version = "0.1.0"
+edition = "2021"
+description = "In-memory block codec over the lifted UHARC 0.6b engine (PPM and ALZ:3 modes)"
+
+[dependencies]
+uharc-lifted = { path = "../../third_party/uharc/lifted" }

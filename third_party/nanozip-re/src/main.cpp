@@ -1,0 +1,123 @@
+#include "nz_sfx/sfx_archive.hpp"
+#include "nz_sfx/sfx_cli.hpp"
+#include "nz_cm.h"
+
+#include <cstdlib>
+#include <iostream>
+#include <new>
+#include <stdexcept>
+
+int main(int argc, char** argv) {
+    using nz::recon::CliOptions;
+    using nz::recon::Command;
+
+    NzCmInitAll();
+
+    nz::recon::PrintBanner(std::cerr);
+    std::cout << std::flush;
+
+    CliOptions options = nz::recon::ParseCli(argc, argv);
+
+    // The original's process exit status is 0 on EVERY path -- unknown command,
+    // missing archive, corrupt data, checksum mismatch (all measured). Scripts
+    // that want a meaningful status can set NZ_STRICT_EXIT=1 to get this port's
+    // own codes instead.
+    const bool strict_exit = (std::getenv("NZ_STRICT_EXIT") != nullptr);
+    const auto finish = [strict_exit](int rc) { return strict_exit ? rc : 0; };
+
+    // Measured messages, each WITHOUT the usage text and without a leading blank
+    // line: "Unknown command q", "Error: Archive name missing...",
+    // "Unknown argument: -zz" (the first unknown switch stops the run).
+    if (options.command == Command::kUnknown && argc >= 2) {
+        // Measured: a one-character token is "Unknown command q" (%c); anything
+        // else, the empty token included (`nz "" archive`), is "Unknown command: qq"
+        // (: %s). No arguments at all prints the usage instead (below).
+        if (options.unknown_command.size() == 1u) std::cout << "Unknown command " << options.unknown_command << '\n';
+        else std::cout << "Unknown command: " << options.unknown_command << '\n';
+        return finish(1);
+    }
+    if (!options.error.empty()) {
+        if (options.error == "archive name missing") {
+            std::cout << "Error: Archive name missing...\n";
+        } else {
+            std::cout << "Error: " << options.error << '\n';
+        }
+        return finish(1);
+    }
+
+    if (options.show_usage) {
+        nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz-re", std::cout);
+        return 0;
+    }
+
+    if (options.show_advanced_help || options.command == Command::kHelp) {
+        nz::recon::PrintAdvancedHelp(std::cout);
+        return 0;
+    }
+
+    if (!options.unknown_switches.empty()) {
+        std::cout << "Unknown argument: " << options.unknown_switches.front() << '\n';
+        return finish(1);
+    }
+
+    // The original's out-of-memory report. The 32-bit builds hold the decoded
+    // stream in memory, so an archive whose content does not fit their address
+    // space ends here instead of in an uncaught std::bad_alloc abort.
+    nz::recon::SetDecodeThreads(options.threads);
+    // Measured: the deprecated switch is reported first, then the run goes on.
+    if (options.deprecated_forcemem) std::cout << "Warning: Ignoring deprecated option -forcemem.\n";
+    int rc = 0;
+    try {
+    switch (options.command) {
+        case Command::kAdd:
+            rc = nz::recon::RunAdd(options, std::cout); break;
+        case Command::kSimulate:
+            rc = nz::recon::RunSimulate(options, std::cout); break;
+        case Command::kList:
+            rc = nz::recon::RunList(options, std::cout); break;
+        case Command::kTest:
+            rc = nz::recon::RunExtractOrTest(options, true, std::cout); break;
+        case Command::kExtract:
+            rc = nz::recon::RunExtractOrTest(options, false, std::cout); break;
+        case Command::kInfo:
+            rc = nz::recon::RunInfo(std::cout); break;
+        case Command::kW32c:
+            rc = nz::recon::RunAdd(options, std::cout); break;
+        case Command::kHelp:
+            nz::recon::PrintAdvancedHelp(std::cout); break;
+        case Command::kUnknown:
+        default:
+            nz::recon::PrintUsage((argc > 0 && argv != nullptr) ? argv[0] : "nz-re", std::cout);
+            rc = 1; break;
+    }
+    } catch (const std::bad_alloc&) {
+        // Like the original's "Internal error", this exit is not laundered to
+        // 0: measured, `Out of memory!` then status 255 in `t` and `x` alike.
+        nz::recon::ClearStatusLine(std::cout);
+        std::cout << "Out of memory!\n";
+        rc = 255;
+    } catch (const std::length_error&) {
+        // A container asked for more than max_size() throws this, not bad_alloc,
+        // and it used to abort the process with a C++ terminate message: a 32-bit
+        // build reading a 3 GB archive it could not map died in vector::resize.
+        nz::recon::ClearStatusLine(std::cout);
+        std::cout << "Out of memory!\n";
+        rc = 255;
+    }
+    // Status 2 = the archive was processed but some content is damaged or
+    // undecodable. The original exits 0 there too, and so does this program by
+    // default; NZ_SAFE=1 (write only verified entries) and NZ_STRICT_EXIT=1
+    // report it.
+    if (options.pause) {
+        // -pause: "Press enter to continue..." (no newline), then one line of input.
+        std::cout << "Press enter to continue...";
+        std::cout.flush();
+        std::string line;
+        std::getline(std::cin, line);
+    }
+    if (rc == 2 && std::getenv("NZ_SAFE") != nullptr) return 2;
+    // The original's fatal "Internal error" path exits with -1 (255) -- the one
+    // status it does not launder to 0 (quirk 1). Reproduced as is.
+    if (rc == 255) return 255;
+    return finish(rc);
+}
