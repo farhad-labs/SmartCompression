@@ -105,6 +105,37 @@ Per-file result at `ultra` (the codec is chosen automatically):
 Already-compressed formats (MP3, JPEG, PNG) are re-compressed losslessly, which is why they shrink at all.
 You can repeat the runs with `tools/bench.sh <level> [input-dir]`.
 
+### Comparison with 7-Zip and WinRAR
+
+Same 8 files (38,258,747 bytes), same machine (Intel Core i5-6500, 4 cores, 8 GB RAM, Windows 10), one run each,
+default thread settings, wall-clock time. Every archive was extracted and compared byte-for-byte (`OK`).
+Versions: 7-Zip 26.05 x64, WinRAR (`Rar.exe`) 7.23 x64 with RAR5 (`-ma5`), SmartCompression v 0.1.
+Speed is original size / time (MB = 10^6 bytes). Lower ratio is better.
+
+| Program / setting | Archive size | Ratio | Compress time | Compress speed | Extract time | Extract speed | Verify |
+|---|---:|---:|---:|---:|---:|---:|:---:|
+| **SmartCompression `medium`** | 19.7 MB | 51.4% | 8.1 s | 4.7 MB/s | 4.1 s | 9.3 MB/s | OK |
+| **SmartCompression `ultra`** | 19.6 MB | 51.2% | 19.0 s | 2.0 MB/s | 17.9 s | 2.1 MB/s | OK |
+| **SmartCompression `highultra`** | **18.3 MB** | **47.9%** | 16.3 s | 2.3 MB/s | 18.0 s | 2.1 MB/s | OK |
+| 7-Zip `-mx1` | 22.5 MB | 58.7% | 1.9 s | 20.1 MB/s | 0.4 s | 95.6 MB/s | OK |
+| 7-Zip `-mx5` (default) | 20.9 MB | 54.6% | 7.6 s | 5.0 MB/s | 0.8 s | 47.8 MB/s | OK |
+| 7-Zip `-mx9` | 20.8 MB | 54.4% | 7.9 s | 4.8 MB/s | 0.8 s | 47.8 MB/s | OK |
+| WinRAR `-m1` | 24.5 MB | 64.1% | 1.0 s | 38.3 MB/s | 0.3 s | 127.5 MB/s | OK |
+| WinRAR `-m3` (default) | 22.0 MB | 57.4% | 3.1 s | 12.3 MB/s | 0.4 s | 95.6 MB/s | OK |
+| WinRAR `-m5` (best) | 21.8 MB | 57.1% | 3.9 s | 9.8 MB/s | 0.3 s | 127.5 MB/s | OK |
+
+What this shows:
+
+- **Smallest archives:** every SmartCompression level beats 7-Zip `-mx9` and WinRAR `-m5` on this set;
+  `highultra` is about 12% smaller than 7-Zip `-mx9` and 16% smaller than WinRAR `-m5`. The gain probably comes
+  mostly from the MP3, JPEG and PNG files (which general-purpose archivers barely shrink) and from
+  PPM/context-mixing on text.
+- **Speed:** at `medium`, compression speed is on par with 7-Zip's default, but SmartCompression is slower
+  than WinRAR, and **extraction is clearly slower than both** (the stronger models must run backwards at
+  extraction time). Pick 7-Zip/WinRAR if speed matters most.
+- This is a small, mixed sample, not the full corpus; results depend heavily on file types (on pure
+  text or already-compressed data the gap changes). Repeat on your own data with `tools/compare.sh`.
+
 ## How it works
 
 1. **Detect**: magic bytes (`formats.toml`) plus content refiners identify each file's format.
